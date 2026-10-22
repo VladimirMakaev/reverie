@@ -95,6 +95,9 @@ use crate::gdbstub::ResumeInferior;
 use crate::gdbstub::StopEvent;
 use crate::gdbstub::StopReason;
 use crate::gdbstub::StoppedInferior;
+use crate::gdbstub::ThreadState;
+use crate::gdbstub::ThreadStateGuard;
+use crate::gdbstub::ThreadView;
 #[cfg(target_arch = "x86_64")]
 use crate::injected_syscall::InjectedSyscallFrame;
 use crate::poll_on_wake::PollOnWake;
@@ -3992,6 +3995,9 @@ pub struct TracedTask<L: Tool> {
     // instead of `Arc<Mutex<..>>`.
     breakpoints: HashMap<u64, u64>,
 
+    /// Where this thread is when another thread is in a gdb stop.
+    gdb_view: ThreadView,
+
     /// Notify gdbserver start accepting incoming packets.
     gdbserver_start_tx: Option<oneshot::Sender<()>>,
 
@@ -4221,6 +4227,7 @@ impl<L: Tool> TracedTask<L> {
             gdb_resume_tx: Some(gdb_resume_tx),
             gdb_resume_rx: Some(gdb_resume_rx),
             breakpoints: HashMap::new(),
+            gdb_view: ThreadView::default(),
             suspended: Arc::new(AtomicBool::new(false)),
             gdb_request_tx: Some(gdb_request_tx),
             gdb_request_rx: Some(gdb_request_rx),
@@ -4321,6 +4328,7 @@ impl<L: Tool> TracedTask<L> {
             gdb_resume_tx: Some(gdb_resume_tx),
             gdb_resume_rx: Some(gdb_resume_rx),
             breakpoints: self.breakpoints.clone(),
+            gdb_view: ThreadView::default(),
             suspended: Arc::new(AtomicBool::new(false)),
             gdb_request_tx: Some(gdb_request_tx),
             gdb_request_rx: Some(gdb_request_rx),
@@ -4440,6 +4448,7 @@ impl<L: Tool> TracedTask<L> {
             gdb_resume_tx: Some(gdb_resume_tx),
             gdb_resume_rx: Some(gdb_resume_rx),
             breakpoints: self.breakpoints.clone(),
+            gdb_view: ThreadView::default(),
             suspended: Arc::new(AtomicBool::new(false)),
             gdb_request_tx: Some(gdb_request_tx),
             gdb_request_rx: Some(gdb_request_rx),
@@ -5510,11 +5519,13 @@ impl<L: Tool + 'static> TracedTask<L> {
     ) -> Result<libc::user_regs_struct, TraceError> {
         let eax = regs.rax as u32;
         let ecx = regs.rcx as u32;
+        let parked = self.park_for_gdb();
         let result = self
             .process_state
             .clone()
             .handle_cpuid_event(self, eax, ecx)
             .await;
+        drop(parked);
         let cpuid = self
             .ordinary_callback_errno("ptrace cpuid callback", result)
             .await?;
@@ -5534,11 +5545,13 @@ impl<L: Tool + 'static> TracedTask<L> {
         mut regs: libc::user_regs_struct,
         request: Rdtsc,
     ) -> Result<libc::user_regs_struct, TraceError> {
+        let parked = self.park_for_gdb();
         let result = self
             .process_state
             .clone()
             .handle_rdtsc_event(self, request)
             .await;
+        drop(parked);
         let retval = self
             .ordinary_callback_errno("ptrace rdtsc callback", result)
             .await?;
@@ -5765,7 +5778,9 @@ impl<L: Tool + 'static> TracedTask<L> {
         } else {
             self.apply_sigtrap_repair(task).await?
         };
+        let parked = self.park_for_gdb();
         self.process_state.clone().handle_timer_event(self).await;
+        drop(parked);
         self.ordinary_trace_continuation()?;
         self.timer.finalize_requests();
         Ok((true, task))
@@ -6010,6 +6025,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.pending_syscall = Some((nr, args));
 
             self.in_syscall_callback = true;
+            let parked = self.park_for_gdb();
             let retval = cancellable(self.cancel_handler.clone(), async {
                 self.process_state
                     .clone()
@@ -6017,6 +6033,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     .await
             })
             .await;
+            drop(parked);
             self.in_syscall_callback = false;
 
             let retval = match retval {
@@ -6185,6 +6202,8 @@ impl<L: Tool + 'static> TracedTask<L> {
             .is_some_and(|action| matches!(action, ResumeAction::Step(_)));
         debug_assert!(!resumed_by_gdb_step);
         if let Some((suspended_flag, stop_tx)) = self.get_stop_tx().await {
+            // Frozen for another thread's gdb stop: let gdb inspect this one.
+            let _parked = self.park_for_gdb();
             let notify_stop_tx = stop_tx
                 .send((
                     task.pid(),
@@ -6810,6 +6829,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         let outer_guest_block =
             std::mem::replace(&mut self.signal_callback_guest_restart_block, false);
         let outer_held = std::mem::replace(&mut self.in_held_signal_callback, held);
+        let parked = self.park_for_gdb();
         let result = if held {
             let outer_execed = std::mem::replace(&mut self.signal_callback_execed, false);
             let result =
@@ -6827,6 +6847,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         } else {
             self.tool_signal_verdict(sig).await
         };
+        drop(parked);
         self.in_signal_callback = outer;
         self.reported_signal = outer_reported;
         let replacement = std::mem::replace(&mut self.replacement_signal_info, outer_replacement);
@@ -7256,7 +7277,9 @@ impl<L: Tool + 'static> TracedTask<L> {
         if initial_command {
             self.timer.finish_initial_exec();
         }
+        let parked = self.park_for_gdb();
         let result = self.process_state.clone().handle_post_exec(self).await;
+        drop(parked);
         self.ordinary_callback_errno("ptrace post-exec callback", result)
             .await?;
         self.ordinary_trace_continuation()?;
@@ -7287,6 +7310,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 ),
                 request_tx: request_tx.ok_or(Errno::EIO)?,
                 resume_tx: resume_tx.ok_or(Errno::EIO)?,
+                view: self.gdb_view.clone(),
             };
 
             // NB: notify initial gdb stop, this is the first time we can
@@ -7539,6 +7563,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.pending_syscall = Some((nr, args));
 
             self.in_syscall_callback = true;
+            let parked = self.park_for_gdb();
             let retval = cancellable(self.cancel_handler.clone(), async {
                 self.process_state
                     .clone()
@@ -7546,6 +7571,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     .await
             })
             .await;
+            drop(parked);
             self.in_syscall_callback = false;
 
             let retval = match retval {
@@ -7988,6 +8014,7 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         let (child_stop_tx, child_stop_rx) = mpsc::channel(1);
         child_task.gdb_stop_tx = Some(child_stop_tx);
+        let child_view = child_task.gdb_view.clone();
 
         let daemonizer_rx = child_task.daemonizer_rx.take();
         let child_resume_tx = child_task.gdb_resume_tx.clone();
@@ -8121,6 +8148,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 child_request_tx,
                 child_resume_tx,
                 Some(child_stop_rx),
+                child_view,
             ))
             .await?;
             // We just reported a new event, wait for gdb resume.
@@ -8331,11 +8359,13 @@ impl<L: Tool + 'static> TracedTask<L> {
     async fn run_loop_internal(&mut self, task: Stopped) -> Result<ExitStatus, Error> {
         // This is the beginning of the life of the guest. Allow the tool to
         // inject syscalls as soon as the thread starts.
-        match cancellable(self.cancel_handler.clone(), async {
+        let parked = self.park_for_gdb();
+        let started = cancellable(self.cancel_handler.clone(), async {
             self.process_state.clone().handle_thread_start(self).await
         })
-        .await
-        {
+        .await;
+        drop(parked);
+        match started {
             Some(Ok(())) => self.observe_ready_thread_state()?,
             Some(Err(err)) => {
                 if !matches!(err, reverie::Error::Errno(_)) {
@@ -12668,6 +12698,19 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
+    /// Publishes this thread's registers to gdb while a tool callback holds the
+    /// thread, until the returned guard drops. A tool that sequentializes threads
+    /// keeps them in callbacks while another thread is in a gdb stop, where they
+    /// cannot answer gdb themselves. Costs nothing unless gdb is attached.
+    fn park_for_gdb(&self) -> Option<ThreadStateGuard> {
+        if !self.attached_by_gdb {
+            return None;
+        }
+        // A thread whose registers cannot be read shows gdb as running.
+        let regs = self.read_registers().ok()?;
+        Some(self.gdb_view.enter(ThreadState::Parked(Box::new(regs))))
+    }
+
     async fn notify_gdb_stop(&self, reason: StopReason) -> Result<(), TraceError> {
         if !self.attached_by_gdb {
             return Ok(());
@@ -12680,6 +12723,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 reason,
                 request_tx: request_tx.ok_or(Errno::EIO)?,
                 resume_tx: resume_tx.ok_or(Errno::EIO)?,
+                view: self.gdb_view.clone(),
             };
             if stop_tx.send(stop).await.is_err() {
                 tracing::warn!(
@@ -12778,6 +12822,7 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         let mut resume_rx = self.gdb_resume_rx.take().ok_or(Errno::EIO)?;
         let mut gdb_request_rx = self.gdb_request_rx.take().ok_or(Errno::EIO)?;
+        let answering = self.gdb_view.enter(ThreadState::InGdbStop);
 
         let mut resume_future = Box::pin(resume_rx.recv());
 
@@ -12797,6 +12842,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             }
         };
 
+        drop(answering);
         self.gdb_request_rx = Some(gdb_request_rx);
         self.gdb_resume_rx = Some(resume_rx);
 
