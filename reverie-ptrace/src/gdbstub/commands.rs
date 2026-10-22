@@ -46,6 +46,7 @@ use crate::gdbstub::Inferior;
 use crate::gdbstub::InferiorThreadId;
 use crate::gdbstub::ResumeInferior;
 use crate::gdbstub::StoppedInferior;
+use crate::gdbstub::ThreadView;
 use crate::gdbstub::hex::*;
 use crate::gdbstub::request::*;
 use crate::gdbstub::response::*;
@@ -456,6 +457,8 @@ pub struct NewTask {
     pub resume_tx: Option<mpsc::Sender<ResumeInferior>>,
     /// channel to receive new gdb stop event
     pub stop_rx: Option<mpsc::Receiver<StoppedInferior>>,
+    /// Where the new child is when another thread is in a gdb stop.
+    pub view: ThreadView,
 }
 
 /// Reasons why inferior has stopped, reported to gdb (client).
@@ -491,6 +494,7 @@ impl StopReason {
         request_tx: Option<mpsc::Sender<GdbRequest>>,
         resume_tx: Option<mpsc::Sender<ResumeInferior>>,
         stop_rx: Option<mpsc::Receiver<StoppedInferior>>,
+        view: ThreadView,
     ) -> Self {
         StopReason::NewTask(NewTask {
             pid,
@@ -501,6 +505,7 @@ impl StopReason {
             request_tx,
             resume_tx,
             stop_rx,
+            view,
         })
     }
 
