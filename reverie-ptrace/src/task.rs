@@ -12812,23 +12812,47 @@ impl<L: Tool + 'static> TracedTask<L> {
         let answering = self.gdb_view.enter(ThreadState::InGdbStop);
 
         let mut resume_future = Box::pin(resume_rx.recv());
+        // The session drops this thread's stop channel once gdb has let the
+        // thread go: at a detach or a kill, which send a resume only to the
+        // threads whose stops gdb has seen, and when gdb disconnects. No
+        // resume comes after that, so the thread resumes as a detach resumes
+        // it, whether it was waiting here already or arrives later.
+        let stop_tx = self.gdb_stop_tx.clone();
+        let mut released = Box::pin(async move {
+            match stop_tx {
+                Some(stop_tx) => stop_tx.closed().await,
+                None => future::pending().await,
+            }
+        });
+        let mut released_by_session = false;
 
         let (running, resumed) = loop {
             let request_future = Box::pin(gdb_request_rx.recv());
+            let resume_or_release = future::select(&mut resume_future, &mut released);
 
-            match future::select(request_future, resume_future).await {
-                Either::Left((gdb_request, pending_resume_future)) => {
+            match future::select(request_future, resume_or_release).await {
+                Either::Left((gdb_request, _)) => {
                     self.handle_gdb_request(gdb_request).await;
-                    resume_future = pending_resume_future;
                 }
-                Either::Right((resume_request, _)) => {
+                Either::Right((Either::Left((resume_request, _)), _)) => {
                     break self
                         .handle_gdb_resume(resume_request, task, resume_action)
+                        .await?;
+                }
+                Either::Right((Either::Right(((), _)), _)) => {
+                    released_by_session = true;
+                    let detach = ResumeInferior {
+                        action: ResumeAction::Continue(None),
+                        detach: true,
+                    };
+                    break self
+                        .handle_gdb_resume(Some(detach), task, resume_action)
                         .await?;
                 }
             }
         };
 
+        drop(resume_future);
         drop(answering);
         self.gdb_request_rx = Some(gdb_request_rx);
         self.gdb_resume_rx = Some(resume_rx);
@@ -12841,7 +12865,11 @@ impl<L: Tool + 'static> TracedTask<L> {
                         target: "reverie_ptrace::lifecycle",
                         "tracee.detach",
                         tid = %self.tid(),
-                        reason = "GDB detach"
+                        reason = if released_by_session {
+                            "GDB session released the tracee"
+                        } else {
+                            "GDB detach"
+                        }
                     ),
                     "GDB detached from tracee"
                 );
