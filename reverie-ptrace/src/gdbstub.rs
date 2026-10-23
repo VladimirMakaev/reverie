@@ -22,6 +22,7 @@ mod packet;
 mod request;
 mod server;
 mod session;
+mod signals;
 
 mod regs;
 

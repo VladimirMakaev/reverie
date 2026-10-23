@@ -50,6 +50,7 @@ use crate::gdbstub::ThreadView;
 use crate::gdbstub::hex::*;
 use crate::gdbstub::request::*;
 use crate::gdbstub::response::*;
+use crate::gdbstub::signals;
 use crate::regs::RegAccess;
 
 mod base;
@@ -604,13 +605,15 @@ impl WriteResponse for StopReason {
                         writer.put_str("W");
                         writer.put_hex_encoded(&[*code as u8]);
                     }
+                    // `X` takes gdb's number for the signal, not the wait
+                    // status, whose 0x80 bit flags a core dump.
                     ExitStatus::Signaled(sig, _) => {
                         writer.put_str("X");
-                        writer.put_hex_encoded(&[(*sig as u8) | 0x80]);
+                        writer.put_hex_encoded(&[signals::to_gdb(*sig as i32)]);
                     }
                     ExitStatus::SignaledRaw(sig, _) => {
                         writer.put_str("X");
-                        writer.put_hex_encoded(&[(*sig as u8) | 0x80]);
+                        writer.put_hex_encoded(&[signals::to_gdb(*sig)]);
                     }
                 }
                 writer.put_str(";process:");
@@ -635,6 +638,74 @@ impl WriteResponse for StopReason {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// The reply `reason` writes, as `ResponseWriter` frames it.
+    fn reply(reason: StopReason) -> ResponseWriter {
+        let mut writer = ResponseWriter::new(BytesMut::new(), true);
+        reason.write_response(&mut writer);
+        writer
+    }
+
+    /// `expected`, framed the same way.
+    fn framed(expected: &str) -> ResponseWriter {
+        let mut writer = ResponseWriter::new(BytesMut::new(), true);
+        writer.put_str(expected);
+        writer
+    }
+
+    #[test]
+    fn exit_by_a_signal_names_it_by_gdbs_number() {
+        let pid = Pid::from_raw(3);
+        assert_eq!(
+            reply(StopReason::exit(
+                pid,
+                ExitStatus::Signaled(Signal::SIGABRT, true)
+            )),
+            framed("X06;process:03"),
+            "the core-dump bit is not part of the signal"
+        );
+        assert_eq!(
+            reply(StopReason::exit(
+                pid,
+                ExitStatus::Signaled(Signal::SIGUSR1, false)
+            )),
+            framed("X1e;process:03"),
+            "gdb numbers SIGUSR1 30"
+        );
+        assert_eq!(
+            reply(StopReason::exit(pid, ExitStatus::SignaledRaw(34, false))),
+            framed("X2e;process:03"),
+            "gdb numbers real-time signal 34 46"
+        );
+        assert_eq!(
+            reply(StopReason::exit(pid, ExitStatus::Exited(7))),
+            framed("W07;process:03")
+        );
+    }
+
+    #[test]
+    fn vcont_signals_are_gdbs_numbers() {
+        assert_eq!(
+            vCont::parse(BytesMut::from("$vCont;C1e:p3.3")),
+            Some(vCont::Actions(vec![(
+                ResumeAction::Continue(Some(Signal::SIGUSR1)),
+                ThreadId::pid_tid(3, 3)
+            )])),
+            "gdb's 30 is SIGUSR1, not Linux's 30, SIGPWR"
+        );
+        assert_eq!(
+            vCont::parse(BytesMut::from("$vCont;S0a:p3.3")),
+            Some(vCont::Actions(vec![(
+                ResumeAction::Step(Some(Signal::SIGBUS)),
+                ThreadId::pid_tid(3, 3)
+            )]))
+        );
+        assert_eq!(
+            vCont::parse(BytesMut::from("$vCont;C07:p3.3")),
+            None,
+            "gdb's SIGEMT has no Linux signal"
+        );
+    }
 
     #[test]
     fn decode_vcont_test() {
