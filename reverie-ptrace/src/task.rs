@@ -7322,9 +7322,10 @@ impl<L: Tool + 'static> TracedTask<L> {
             if let Some(attach_tx) = self.gdb_stop_tx.as_ref()
                 && attach_tx.send(stopped).await.is_err()
             {
-                tracing::warn!(
+                // gdb let this tracee go before it exec'd (`notify_gdb_stop`).
+                tracing::debug!(
                     tid = %self.tid(),
-                    "GDB stop channel closed while reporting exec"
+                    "GDB no longer follows this tracee; exec not reported"
                 );
                 self.attached_by_gdb = false;
                 return self
@@ -12727,10 +12728,14 @@ impl<L: Tool + 'static> TracedTask<L> {
                 resume_tx: resume_tx.ok_or(Errno::EIO)?,
                 view: self.gdb_view.clone(),
             };
+            // The session closes a thread's stop channel when gdb lets the
+            // thread go: at a detach or kill, at the thread's exit, and when
+            // gdb disconnects. That is how a debugging session ends, not a
+            // fault; the thread is resumed without gdb (`await_gdb_resume`).
             if stop_tx.send(stop).await.is_err() {
-                tracing::warn!(
+                tracing::debug!(
                     tid = %self.tid(),
-                    "GDB stop channel closed while reporting tracee stop"
+                    "GDB no longer follows this tracee; stop not reported"
                 );
             }
         }
