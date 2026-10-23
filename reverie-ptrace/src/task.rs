@@ -7421,6 +7421,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 request_tx: request_tx.ok_or(Errno::EIO)?,
                 resume_tx: resume_tx.ok_or(Errno::EIO)?,
                 view: self.gdb_view.clone(),
+                replied: None,
             };
 
             // NB: notify initial gdb stop, this is the first time we can
@@ -12836,11 +12837,21 @@ impl<L: Tool + 'static> TracedTask<L> {
         if let Some(stop_tx) = self.gdb_stop_tx.as_ref() {
             let request_tx = self.gdb_request_tx.clone();
             let resume_tx = self.gdb_resume_tx.clone();
+            // The run can end as soon as a process exit is reported, which
+            // would drop gdb's connection with the reply unwritten: wait until
+            // the session has written it, or gone away.
+            let (replied, written) = if matches!(reason, StopReason::Exited(..)) {
+                let (replied, written) = oneshot::channel();
+                (Some(replied), Some(written))
+            } else {
+                (None, None)
+            };
             let stop = StoppedInferior {
                 reason,
                 request_tx: request_tx.ok_or(Errno::EIO)?,
                 resume_tx: resume_tx.ok_or(Errno::EIO)?,
                 view: self.gdb_view.clone(),
+                replied,
             };
             // The session closes a thread's stop channel when gdb lets the
             // thread go: at a detach or kill, at the thread's exit, and when
@@ -12851,6 +12862,8 @@ impl<L: Tool + 'static> TracedTask<L> {
                     tid = %self.tid(),
                     "GDB no longer follows this tracee; stop not reported"
                 );
+            } else if let Some(written) = written {
+                let _ = written.await;
             }
         }
         Ok(())
