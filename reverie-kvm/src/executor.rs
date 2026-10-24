@@ -32706,6 +32706,48 @@ mod tests {
 
     #[test]
     fn positioned_vectored_io_handles_pipes_partial_writes_and_sigpipe() {
+        // Run the body in a fresh single-test process, under the contract of
+        // reverie-process's `test_runs_in_own_process`. A host process that a
+        // neighboring libtest thread spawns gets a copy of every descriptor of
+        // this process at its fork, close-on-exec ones included, and keeps it
+        // until its exec; meanwhile it holds this fixture's pipe read end open,
+        // so the write below that must fail with EPIPE succeeds.
+        const ISOLATED_TEST_MARKER: &str = "REVERIE_KVM_ISOLATED_TEST";
+        let name = std::thread::current()
+            .name()
+            .expect("libtest names each test thread after its test")
+            .to_owned();
+        match std::env::var_os(ISOLATED_TEST_MARKER) {
+            Some(marker) => assert_eq!(
+                marker.to_str(),
+                Some(name.as_str()),
+                "the isolated test process ran a test other than the one it was started for"
+            ),
+            None => {
+                let output = std::process::Command::new("timeout")
+                    .args(["--kill-after=2s", "10s"])
+                    .arg(std::env::current_exe().unwrap())
+                    .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+                    .env(ISOLATED_TEST_MARKER, &name)
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                print!("{stdout}");
+                eprint!("{}", String::from_utf8_lossy(&output.stderr));
+                assert!(
+                    output.status.success(),
+                    "the isolated process for {name} failed: {:?}",
+                    output.status
+                );
+                assert!(
+                    stdout.contains(&format!("test {name} ... ok\n"))
+                        && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+                    "the isolated process for {name} did not run exactly that one test"
+                );
+                return;
+            }
+        }
         const PIPE_FDS: u64 = 0x100;
         const WRITE: u64 = 0x1000;
         const WRITE_IOV: u64 = 0x4000;
