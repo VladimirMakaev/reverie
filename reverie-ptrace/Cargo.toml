@@ -23,6 +23,9 @@ rcb-observation = []
 # Normal subprocess execution and descriptor-based capture use stable Rust.
 nightly = []
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(reverie_asan)'] }
+
 [dependencies]
 anyhow = "1.0.103"
 async-trait = "0.1.86"
