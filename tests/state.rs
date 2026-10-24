@@ -23,11 +23,13 @@ use reverie::syscalls::Syscall;
 use serde::Deserialize;
 use serde::Serialize;
 
+type ProcessTree = Vec<(i32, Vec<(i32, usize, usize)>)>;
+
 #[derive(Debug, Default)]
 struct GlobalState {
     // Map of pids to parent pids and syscall counts. This is only updated when
     // a process exits.
-    tree: Mutex<Vec<(i32, Vec<(i32, usize, usize)>)>>,
+    tree: Mutex<ProcessTree>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]

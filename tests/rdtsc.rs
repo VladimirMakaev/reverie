@@ -89,8 +89,8 @@ mod tests {
     #[inline(never)]
     unsafe fn rdtscp() -> (u64, u32) {
         let mut aux_val = core::mem::MaybeUninit::uninit();
-        let tsc = core::arch::x86_64::__rdtscp(aux_val.as_mut_ptr());
-        (tsc, aux_val.assume_init())
+        let tsc = unsafe { core::arch::x86_64::__rdtscp(aux_val.as_mut_ptr()) };
+        (tsc, unsafe { aux_val.assume_init() })
     }
 
     #[test]

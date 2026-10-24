@@ -73,7 +73,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[allow(unused_mut)]
     unsafe fn open_syscall_sanity_check() -> i32 {
-        let path = b"/dev/null\0".as_ptr() as usize;
+        let path = c"/dev/null".as_ptr() as usize;
         let flags: usize = 0x8000; // O_LARGEFILE
         let mode: usize = 0o644;
 
@@ -86,41 +86,43 @@ mod tests {
         // if %rsi != 0x8000 { exit_group(1) }
         // if %rdx != 0644 { exit_roup(1) }
         // return fd
-        core::arch::asm!(
-            "mov r8, rdi",
-            // Set syscall to `SYS_open`
-            "mov rax, 2",
-            "syscall",
-            // if (ret >= -4095 as u64) goto 1
-            "cmp rax, 0xfffffffffffff001",
-            "jae 2f",
-            // if (rax != r8) goto label1;
-            "cmp r8, rdi",
-            "jne 2f",
-            // if (rsi != 0x8000) goto label1;
-            "cmp rsi, 0x8000",
-            "jne 2f",
-            // if (rdx != 0644) goto label1;
-            "cmp rdx, 0x1a4",
-            "jne 2f",
-            // Otherwise, we're successful.
-            "jmp 3f",
-            "2:",
-            // Set syscall arg1 to label1
-            "mov rdi, 0x1",
-            // Set syscall to SYS_exit_group
-            "mov rax, 231",
-            // Do the syscall
-            "syscall",
-            "3:",
-            lateout("rax") ret,
-            in("rdi") path,
-            in("rsi") flags,
-            in("rdx") mode,
-            out("r8") _, // Clobbered
-            out("rcx") _, // rcx is used to store old rip
-            out("r11") _, // r11 is used to store old rflags
-        );
+        unsafe {
+            core::arch::asm!(
+                "mov r8, rdi",
+                // Set syscall to `SYS_open`
+                "mov rax, 2",
+                "syscall",
+                // if (ret >= -4095 as u64) goto 1
+                "cmp rax, 0xfffffffffffff001",
+                "jae 2f",
+                // if (rax != r8) goto label1;
+                "cmp r8, rdi",
+                "jne 2f",
+                // if (rsi != 0x8000) goto label1;
+                "cmp rsi, 0x8000",
+                "jne 2f",
+                // if (rdx != 0644) goto label1;
+                "cmp rdx, 0x1a4",
+                "jne 2f",
+                // Otherwise, we're successful.
+                "jmp 3f",
+                "2:",
+                // Set syscall arg1 to label1
+                "mov rdi, 0x1",
+                // Set syscall to SYS_exit_group
+                "mov rax, 231",
+                // Do the syscall
+                "syscall",
+                "3:",
+                lateout("rax") ret,
+                in("rdi") path,
+                in("rsi") flags,
+                in("rdx") mode,
+                out("r8") _, // Clobbered
+                out("rcx") _, // rcx is used to store old rip
+                out("r11") _, // r11 is used to store old rflags
+            )
+        };
 
         ret as i32
     }

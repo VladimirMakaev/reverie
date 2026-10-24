@@ -278,7 +278,6 @@ mod tests {
     //! into the tracee, otherwise underflow or overflow checks will break the
     //! tests.
 
-    use reverie_ptrace::regs::RegAccess;
     use reverie_ptrace::ret_without_perf;
     use reverie_ptrace::testing::check_fn;
     use reverie_ptrace::testing::check_fn_with_config;
@@ -342,9 +341,7 @@ mod tests {
 
     fn cpuid() {
         #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::x86_64::__cpuid(0);
-        }
+        core::arch::x86_64::__cpuid(0);
     }
 
     fn rdtsc() {
@@ -450,43 +447,55 @@ mod tests {
         // Final value is 2 because do_branches adds 1
         [rcbs / 2, 1000, 100, 10, 2]
             .iter()
-            .map(|x| *x)
+            .copied()
             .filter(|x| *x < rcbs)
             .collect()
     }
     const LET_PASS_STOP_RCBS: u64 = 1;
 
-    #[test_case(MANY_RCBS, do_syscall, sched_precise, 0)]
-    #[test_case(MANY_RCBS, do_syscall, sched_imprecise, 0)]
-    #[test_case(MANY_RCBS, cpuid, sched_precise, 0)]
-    #[test_case(MANY_RCBS, cpuid, sched_imprecise, 0)]
-    #[test_case(MANY_RCBS, rdtsc, sched_precise, 0)]
-    #[test_case(MANY_RCBS, rdtsc, sched_imprecise, 0)]
-    #[test_case(MANY_RCBS, rdtscp, sched_precise, 0)]
-    #[test_case(MANY_RCBS, rdtscp, sched_imprecise, 0)]
-    #[test_case(MANY_RCBS, sched_precise, sched_precise, 1)]
-    #[test_case(MANY_RCBS, sched_imprecise, sched_precise, 1)]
-    #[test_case(MANY_RCBS, sched_imprecise, sched_imprecise, 1)]
-    #[test_case(MANY_RCBS, sched_precise, sched_imprecise, 1)]
-    #[test_case(LESS_RCBS, do_syscall, sched_precise, 0)]
-    #[test_case(LESS_RCBS, do_syscall, sched_imprecise, 0)]
-    #[test_case(LESS_RCBS, cpuid, sched_precise, 0)]
-    #[test_case(LESS_RCBS, cpuid, sched_imprecise, 0)]
-    #[test_case(LESS_RCBS, rdtsc, sched_precise, 0)]
-    #[test_case(LESS_RCBS, rdtsc, sched_imprecise, 0)]
-    #[test_case(LESS_RCBS, rdtscp, sched_precise, 0)]
-    #[test_case(LESS_RCBS, rdtscp, sched_imprecise, 0)]
-    #[test_case(LESS_RCBS, sched_precise, sched_precise, 1)]
-    #[test_case(LESS_RCBS, sched_imprecise, sched_precise, 1)]
-    #[test_case(LESS_RCBS, sched_imprecise, sched_imprecise, 1)]
-    #[test_case(LESS_RCBS, sched_precise, sched_imprecise, 1)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TimerKind {
+        Precise,
+        Imprecise,
+    }
+
+    #[test_case(MANY_RCBS, do_syscall, TimerKind::Precise, 0)]
+    #[test_case(MANY_RCBS, do_syscall, TimerKind::Imprecise, 0)]
+    #[test_case(MANY_RCBS, cpuid, TimerKind::Precise, 0)]
+    #[test_case(MANY_RCBS, cpuid, TimerKind::Imprecise, 0)]
+    #[test_case(MANY_RCBS, rdtsc, TimerKind::Precise, 0)]
+    #[test_case(MANY_RCBS, rdtsc, TimerKind::Imprecise, 0)]
+    #[test_case(MANY_RCBS, rdtscp, TimerKind::Precise, 0)]
+    #[test_case(MANY_RCBS, rdtscp, TimerKind::Imprecise, 0)]
+    #[test_case(MANY_RCBS, sched_precise, TimerKind::Precise, 1)]
+    #[test_case(MANY_RCBS, sched_imprecise, TimerKind::Precise, 1)]
+    #[test_case(MANY_RCBS, sched_imprecise, TimerKind::Imprecise, 1)]
+    #[test_case(MANY_RCBS, sched_precise, TimerKind::Imprecise, 1)]
+    #[test_case(LESS_RCBS, do_syscall, TimerKind::Precise, 0)]
+    #[test_case(LESS_RCBS, do_syscall, TimerKind::Imprecise, 0)]
+    #[test_case(LESS_RCBS, cpuid, TimerKind::Precise, 0)]
+    #[test_case(LESS_RCBS, cpuid, TimerKind::Imprecise, 0)]
+    #[test_case(LESS_RCBS, rdtsc, TimerKind::Precise, 0)]
+    #[test_case(LESS_RCBS, rdtsc, TimerKind::Imprecise, 0)]
+    #[test_case(LESS_RCBS, rdtscp, TimerKind::Precise, 0)]
+    #[test_case(LESS_RCBS, rdtscp, TimerKind::Imprecise, 0)]
+    #[test_case(LESS_RCBS, sched_precise, TimerKind::Precise, 1)]
+    #[test_case(LESS_RCBS, sched_imprecise, TimerKind::Precise, 1)]
+    #[test_case(LESS_RCBS, sched_imprecise, TimerKind::Imprecise, 1)]
+    #[test_case(LESS_RCBS, sched_precise, TimerKind::Imprecise, 1)]
     fn assert_cancels_timers(
         rcbs: u64,
         fun: fn() -> (),
-        schedule_timer: fn() -> (),
+        timer_kind: TimerKind,
         additional_evts: u64,
     ) {
         ret_without_perf!();
+        // Select in the tracer so the guest executes the same timer function
+        // without adding branches to its measured work.
+        let schedule_timer: fn() = match timer_kind {
+            TimerKind::Precise => sched_precise,
+            TimerKind::Imprecise => sched_imprecise,
+        };
         let rcbx2 = rcbs * 2;
         for e in early_stop_rcbs(rcbs) {
             // Precompute to avoid underflow checks in the guest
@@ -499,14 +508,14 @@ mod tests {
             });
             assert_eq!(
                 gs.num_timer_evts.into_inner(),
-                0 + additional_evts,
+                additional_evts,
                 "iter: {}",
                 e
             );
         }
         // Imprecise events can be delayed, in which case nothing fires, so only
         // test this if precise:
-        if schedule_timer == sched_precise {
+        if timer_kind == TimerKind::Precise {
             // Precompute to avoid underflow checks in the guest
             let branch_ct = rcbs - LET_PASS_STOP_RCBS;
             let gs = ts_check_fn(rcbs, move || {
@@ -789,7 +798,6 @@ mod tests {
             },
             InstructionTracingConfig {
                 set_timer_after_syscall: Some((rcb_1, instr_1)),
-                ..Default::default()
             },
             true,
         );
@@ -801,7 +809,6 @@ mod tests {
             },
             InstructionTracingConfig {
                 set_timer_after_syscall: Some((rcb_2, instr_2)),
-                ..Default::default()
             },
             true,
         );

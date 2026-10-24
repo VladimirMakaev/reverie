@@ -82,17 +82,19 @@ mod tests {
         let set = KernelSigset::from(signals);
         let mut oldset: MaybeUninit<u64> = MaybeUninit::uninit();
 
-        if libc::syscall(
-            libc::SYS_rt_sigprocmask,
-            libc::SIG_UNBLOCK,
-            &set as *const _,
-            oldset.as_mut_ptr(),
-            8,
-        ) != 0
+        if unsafe {
+            libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                libc::SIG_UNBLOCK,
+                &set as *const _,
+                oldset.as_mut_ptr(),
+                8,
+            )
+        } != 0
         {
             Err(io::Error::last_os_error())
         } else {
-            Ok(KernelSigset(oldset.assume_init()))
+            Ok(KernelSigset(unsafe { oldset.assume_init() }))
         }
     }
 
