@@ -31,6 +31,7 @@ mod net;
 mod pid;
 mod pinned_mount;
 mod pty;
+pub mod sanitizer;
 pub mod seccomp;
 mod spawn;
 mod stdio;
