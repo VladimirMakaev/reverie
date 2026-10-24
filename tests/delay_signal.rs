@@ -14,26 +14,43 @@
 //! NB: restarted syscalls should not count, as syscall
 //! returning ERESTARTSYS could be automatically restarted
 
+#[cfg(all(not(sanitized), test))]
 use nix::sys::signal;
+#[cfg(all(not(sanitized), test))]
 use nix::sys::signal::Signal;
+#[cfg(all(not(sanitized), test))]
 use reverie::Error;
+#[cfg(all(not(sanitized), test))]
 use reverie::Guest;
+#[cfg(all(not(sanitized), test))]
 use reverie::Tool;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Errno;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Syscall;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::SyscallInfo;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Sysno;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Tgkill;
+#[cfg(all(not(sanitized), test))]
 use serde::Deserialize;
+#[cfg(all(not(sanitized), test))]
 use serde::Serialize;
+#[cfg(all(not(sanitized), test))]
 use tokio::time::Duration;
+#[cfg(all(not(sanitized), test))]
 use tokio::time::sleep;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct LocalState;
 
+#[cfg(all(not(sanitized), test))]
 const GAP_MS: u64 = 500;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct ThreadState {
     sigpending: Option<i32>,
@@ -41,6 +58,7 @@ struct ThreadState {
 }
 
 // syscall is interrupted and may restart
+#[cfg(all(not(sanitized), test))]
 fn is_syscall_restarted(errno: Errno) -> bool {
     [
         Errno::ERESTARTSYS,
@@ -51,6 +69,7 @@ fn is_syscall_restarted(errno: Errno) -> bool {
     .contains(&errno)
 }
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::tool]
 impl Tool for LocalState {
     type GlobalState = ();

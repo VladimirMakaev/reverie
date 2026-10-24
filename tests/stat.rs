@@ -8,11 +8,14 @@
 
 // reinject stat* as fstatat unittest
 
+#[cfg(all(not(sanitized), test))]
 use reverie::Tool;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct LocalState;
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::tool]
 impl Tool for LocalState {
     type GlobalState = ();

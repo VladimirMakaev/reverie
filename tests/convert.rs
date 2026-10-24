@@ -12,17 +12,24 @@
 // when we convert syscall, such as open -> openat, the old syscall
 // args should not be clobbered, even with the conversion.
 
+#[cfg(all(not(sanitized), test))]
 use reverie::Error;
+#[cfg(all(not(sanitized), test))]
 use reverie::Guest;
+#[cfg(all(not(sanitized), test))]
 use reverie::Tool;
+#[cfg(all(not(sanitized), test))]
 use reverie::syscalls::Syscall;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct LocalStateTailInject;
 
+#[cfg(all(not(sanitized), test))]
 #[derive(Debug, Default, Clone)]
 struct LocalStateInject;
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::tool]
 impl Tool for LocalStateTailInject {
     type GlobalState = ();
@@ -44,6 +51,7 @@ impl Tool for LocalStateTailInject {
     }
 }
 
+#[cfg(all(not(sanitized), test))]
 #[reverie::tool]
 impl Tool for LocalStateInject {
     type GlobalState = ();

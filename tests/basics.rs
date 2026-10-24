@@ -17,6 +17,7 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+#[cfg(all(not(sanitized), test))]
 use close_err::Closable;
 #[allow(unused_imports)]
 use nix::sys::wait;
