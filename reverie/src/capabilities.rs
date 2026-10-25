@@ -39,7 +39,7 @@
 //! # What every backend does
 //!
 //! A fact that holds on every backend is part of the backend contract, not a
-//! field here. Two that used to be fields:
+//! field here. Three that used to be fields:
 //!
 //! - **Registers a `syscall` instruction clobbers.** On x86-64, when a guest
 //!   resumes at the instruction after its `syscall`, `%rcx` holds that
@@ -91,6 +91,21 @@
 //!     does not act on, with Linux's result for the range. Linux may refuse
 //!     some of those for a mapping of the wrong kind, which reverie-kvm does
 //!     not model.
+//!
+//! - **When a `vfork` child registers.** When the tool injects a `clone`,
+//!   `clone3` or `vfork` with `CLONE_VFORK`, a failed call's child never
+//!   registers with the tool, and a successful call's child may register
+//!   before or after the parent's call returns to the tool. A missing child at
+//!   the parent's return is therefore not a failed call. A successful call's
+//!   child can also be torn down before it starts (killed before its first
+//!   stop), and then never registers: the tool learns of that only through
+//!   the child's own teardown, so a tool that waits for the child waits for
+//!   its registration, the call's failure, or that teardown.
+//!   - reverie-ptrace: the kernel keeps the parent inside the call until the
+//!     child execs or exits, so the child has registered before the parent's
+//!     call returns.
+//!   - reverie-kvm starts the child only after the parent's call has returned
+//!     to the tool, so the child registers after it.
 //!
 //! # Adding a field
 //!
@@ -171,12 +186,6 @@ pub struct BackendCapabilities {
     /// parked when another task signals the writer, preserving Linux's signal
     /// mask, disposition and syscall-restart behavior.
     pub supports_parked_write_signal_interruption: bool,
-
-    /// The backend starts a `CLONE_VFORK` child only after the parent's clone
-    /// call has returned to the tool, so the child registers after the parent
-    /// asks to continue. The tool must keep waiting for the late child rather
-    /// than treat its absence as a failed clone.
-    pub defers_vfork_child_registration: bool,
 
     /// The backend reports, through
     /// [`GlobalTool::on_backend_process_exited`](crate::GlobalTool::on_backend_process_exited),
@@ -360,7 +369,6 @@ impl BackendCapabilities {
         runs_exit_robust_list: true,
         requires_thread_directed_process_signals: false,
         supports_parked_write_signal_interruption: true,
-        defers_vfork_child_registration: false,
         reports_child_exit_publication: true,
         reports_kernel_child_exit_signals: true,
         provides_process_signal_control: false,
@@ -464,7 +472,6 @@ impl BackendCapabilities {
     pub const KVM: Self = Self {
         needs_killed_thread_rpc_cancellation: true,
         runs_exit_robust_list: false,
-        defers_vfork_child_registration: true,
         provides_process_signal_control: true,
         emulates_child_waits: true,
         reports_child_exit_publication: false,
@@ -506,7 +513,6 @@ mod tests {
             "runs_exit_robust_list": true,
             "requires_thread_directed_process_signals": false,
             "supports_parked_write_signal_interruption": true,
-            "defers_vfork_child_registration": false,
             "reports_child_exit_publication": true,
             "reports_kernel_child_exit_signals": true,
             "provides_process_signal_control": false,
@@ -646,7 +652,6 @@ mod tests {
             ptrace_with(serde_json::json!({
                 "needs_killed_thread_rpc_cancellation": true,
                 "runs_exit_robust_list": false,
-                "defers_vfork_child_registration": true,
                 "provides_process_signal_control": true,
                 "emulates_child_waits": true,
                 "reports_child_exit_publication": false,
