@@ -39,7 +39,7 @@
 //! # What every backend does
 //!
 //! A fact that holds on every backend is part of the backend contract, not a
-//! field here. One that used to be a field:
+//! field here. Two that used to be fields:
 //!
 //! - **Registers a `syscall` instruction clobbers.** On x86-64, when a guest
 //!   resumes at the instruction after its `syscall`, `%rcx` holds that
@@ -71,6 +71,26 @@
 //!     no post-syscall event to it, so the client's correction does not reach
 //!     it. The child of a shared-memory clone takes the same path and has not
 //!     been measured.
+//!
+//! - **`madvise`.** A tool may forward any advice to the backend. A backend
+//!   that does not implement an advice whose effect, or whose possible
+//!   failure, a program can observe (what a fork copies, what a core dump
+//!   holds, a punched hole) answers it with ENOSYS and the typed refusal
+//!   [`UnsupportedOperation::MemoryAdvice`](crate::UnsupportedOperation::MemoryAdvice),
+//!   which names the advice. Every backend implements `MADV_DONTNEED` over
+//!   anonymous memory: private pages then read as zeros, and shared contents
+//!   survive.
+//!   - reverie-ptrace, e9patch preprocessing, reverie-dbt, the in-guest
+//!     backends (LiteInst) and SaBRe let the host kernel perform the call.
+//!   - reverie-kvm implements `MADV_DONTNEED` over anonymous memory; refuses
+//!     it over a private file mapping, and refuses the fork, core-dump,
+//!     locked-page, hole-punching, population, collapse, memory-failure and
+//!     guard-region advice; answers an advice Linux does not know with EINVAL;
+//!     and answers the rest (the access-pattern hints, `MADV_FREE`,
+//!     `MADV_COLD`, `MADV_PAGEOUT`, the KSM and huge-page advice) as hints it
+//!     does not act on, with Linux's result for the range. Linux may refuse
+//!     some of those for a mapping of the wrong kind, which reverie-kvm does
+//!     not model.
 //!
 //! # Adding a field
 //!
@@ -157,13 +177,6 @@ pub struct BackendCapabilities {
     /// asks to continue. The tool must keep waiting for the late child rather
     /// than treat its absence as a failed clone.
     pub defers_vfork_child_registration: bool,
-
-    /// The backend implements guest-visible `madvise` semantics, so the tool
-    /// may forward an `madvise` call to it. Every backend implements
-    /// `MADV_DONTNEED` (private anonymous pages then read as zeros; shared
-    /// contents survive), so the tool may forward that advice whatever this
-    /// field says.
-    pub supports_madvise: bool,
 
     /// The backend reports, through
     /// [`GlobalTool::on_backend_process_exited`](crate::GlobalTool::on_backend_process_exited),
@@ -348,7 +361,6 @@ impl BackendCapabilities {
         requires_thread_directed_process_signals: false,
         supports_parked_write_signal_interruption: true,
         defers_vfork_child_registration: false,
-        supports_madvise: true,
         reports_child_exit_publication: true,
         reports_kernel_child_exit_signals: true,
         provides_process_signal_control: false,
@@ -453,7 +465,6 @@ impl BackendCapabilities {
         needs_killed_thread_rpc_cancellation: true,
         runs_exit_robust_list: false,
         defers_vfork_child_registration: true,
-        supports_madvise: false,
         provides_process_signal_control: true,
         emulates_child_waits: true,
         reports_child_exit_publication: false,
@@ -496,7 +507,6 @@ mod tests {
             "requires_thread_directed_process_signals": false,
             "supports_parked_write_signal_interruption": true,
             "defers_vfork_child_registration": false,
-            "supports_madvise": true,
             "reports_child_exit_publication": true,
             "reports_kernel_child_exit_signals": true,
             "provides_process_signal_control": false,
@@ -637,7 +647,6 @@ mod tests {
                 "needs_killed_thread_rpc_cancellation": true,
                 "runs_exit_robust_list": false,
                 "defers_vfork_child_registration": true,
-                "supports_madvise": false,
                 "provides_process_signal_control": true,
                 "emulates_child_waits": true,
                 "reports_child_exit_publication": false,

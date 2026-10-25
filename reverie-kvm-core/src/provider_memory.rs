@@ -153,8 +153,8 @@ impl GuestMemoryAccess for ProviderMemory<'_> {
 /// - [`AddressSpace::protect`]'s `Unsupported` (`PROT_EXEC` on an ordinary
 ///   shared-file mapping) is recorded as the arena's typed shared-file
 ///   capability failure, but [`AddressSpace::discard`]'s `Unsupported` (a
-///   private file mapping) is not recorded anywhere: `madvise` returns
-///   `ENOSYS` with no typed refusal.
+///   private file mapping) is not recorded in the arena: `madvise` returns
+///   `ENOSYS` with the executor's typed refusal alone.
 /// - [`AddressSpace::unmap`] zeroes the range before it removes the mappings,
 ///   so a failure in the second step leaves the range mapped with zeroed
 ///   contents.

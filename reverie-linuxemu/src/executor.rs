@@ -274,6 +274,49 @@ fn process_group_refusal(
     })
 }
 
+/// The diagnostic for this backend's refusal of madvise `advice`, naming it.
+fn madvise_refusal_diagnostic(advice: libc::c_int) -> &'static str {
+    match advice {
+        libc::MADV_DONTNEED => {
+            "KVM does not implement madvise MADV_DONTNEED on a private file mapping: \
+             it cannot read the file again"
+        }
+        libc::MADV_DONTFORK => "KVM does not implement madvise MADV_DONTFORK",
+        libc::MADV_DOFORK => "KVM does not implement madvise MADV_DOFORK",
+        libc::MADV_DONTDUMP => "KVM does not implement madvise MADV_DONTDUMP",
+        libc::MADV_DODUMP => "KVM does not implement madvise MADV_DODUMP",
+        libc::MADV_WIPEONFORK => "KVM does not implement madvise MADV_WIPEONFORK",
+        libc::MADV_KEEPONFORK => "KVM does not implement madvise MADV_KEEPONFORK",
+        libc::MADV_DONTNEED_LOCKED => "KVM does not implement madvise MADV_DONTNEED_LOCKED",
+        libc::MADV_REMOVE => "KVM does not implement madvise MADV_REMOVE",
+        libc::MADV_POPULATE_READ => "KVM does not implement madvise MADV_POPULATE_READ",
+        libc::MADV_POPULATE_WRITE => "KVM does not implement madvise MADV_POPULATE_WRITE",
+        25 => "KVM does not implement madvise MADV_COLLAPSE",
+        libc::MADV_HWPOISON => "KVM does not implement madvise MADV_HWPOISON",
+        libc::MADV_SOFT_OFFLINE => "KVM does not implement madvise MADV_SOFT_OFFLINE",
+        102 => "KVM does not implement madvise MADV_GUARD_INSTALL",
+        103 => "KVM does not implement madvise MADV_GUARD_REMOVE",
+        _ => "KVM does not implement this madvise advice",
+    }
+}
+
+/// The typed refusal, if any, that a `madvise` result carries. Linux's
+/// madvise fails with ENOSYS only where the whole syscall is configured out
+/// (`CONFIG_ADVISE_SYSCALLS`), which this executor does not model, so every
+/// ENOSYS answer is this backend's own refusal of the advice (see `madvise`);
+/// every other result carries none.
+fn madvise_refusal(request: &SyscallRequest, result: i64) -> Option<reverie::UnsupportedRefusal> {
+    (request.number() == libc::SYS_madvise as u64 && result == negative_errno(libc::ENOSYS)).then(
+        || {
+            reverie::UnsupportedRefusal::new(
+                reverie::UnsupportedOperation::MemoryAdvice,
+                reverie::Errno::ENOSYS,
+                madvise_refusal_diagnostic(request.args()[2] as libc::c_int),
+            )
+        },
+    )
+}
+
 const GUEST_NOFILE_LIMIT: libc::c_int = 1 << 20;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-235): Review the single virtual network namespace identity.
@@ -8330,6 +8373,7 @@ impl ElfExecutor {
                 if let Some(refusal) = flock_refusal(request, result)
                     .or_else(|| process_group_refusal(request, result))
                     .or_else(|| tool_decided_refusal(request, result))
+                    .or_else(|| madvise_refusal(request, result))
                 {
                     self.unsupported_refusal = Some(refusal);
                 }
@@ -20581,17 +20625,82 @@ fn mremap(memory: &mut GuestMemory, state: &mut LoadedStaticElf, args: &[u64; 6]
     memory.physical_to_user(destination).unwrap_or(destination) as i64
 }
 
+/// Advice whose effect, or whose possible failure, a program can observe and
+/// this backend does not implement: what a fork copies or wipes, what a core
+/// dump holds, locked-page discards, hole punching, page population and
+/// collapse, injected memory failures, and guard regions. madvise(2) answers
+/// it with ENOSYS.
+const MADVISE_UNIMPLEMENTED: [libc::c_int; 15] = [
+    libc::MADV_DONTFORK,
+    libc::MADV_DOFORK,
+    libc::MADV_DONTDUMP,
+    libc::MADV_DODUMP,
+    libc::MADV_WIPEONFORK,
+    libc::MADV_KEEPONFORK,
+    libc::MADV_DONTNEED_LOCKED,
+    libc::MADV_REMOVE,
+    libc::MADV_POPULATE_READ,
+    libc::MADV_POPULATE_WRITE,
+    25, // MADV_COLLAPSE
+    libc::MADV_HWPOISON,
+    libc::MADV_SOFT_OFFLINE,
+    102, // MADV_GUARD_INSTALL
+    103, // MADV_GUARD_REMOVE
+];
+
+/// Every advice Linux accepts (`madvise_behavior_valid`, mm/madvise.c, v6.9,
+/// with every optional advice configured), and the guard-region advice Linux
+/// 6.13 added. madvise(2) answers any other value with EINVAL.
+const MADVISE_KNOWN: [libc::c_int; 27] = [
+    libc::MADV_NORMAL,
+    libc::MADV_RANDOM,
+    libc::MADV_SEQUENTIAL,
+    libc::MADV_WILLNEED,
+    libc::MADV_DONTNEED,
+    libc::MADV_FREE,
+    libc::MADV_REMOVE,
+    libc::MADV_DONTFORK,
+    libc::MADV_DOFORK,
+    libc::MADV_MERGEABLE,
+    libc::MADV_UNMERGEABLE,
+    libc::MADV_HUGEPAGE,
+    libc::MADV_NOHUGEPAGE,
+    libc::MADV_DONTDUMP,
+    libc::MADV_DODUMP,
+    libc::MADV_WIPEONFORK,
+    libc::MADV_KEEPONFORK,
+    libc::MADV_COLD,
+    libc::MADV_PAGEOUT,
+    libc::MADV_POPULATE_READ,
+    libc::MADV_POPULATE_WRITE,
+    libc::MADV_DONTNEED_LOCKED,
+    25, // MADV_COLLAPSE
+    libc::MADV_HWPOISON,
+    libc::MADV_SOFT_OFFLINE,
+    102, // MADV_GUARD_INSTALL
+    103, // MADV_GUARD_REMOVE
+];
+
 /// madvise(2). `MADV_DONTNEED` drops the range's private anonymous pages,
 /// which then read as zeros, and leaves shared pages (shared anonymous memory
 /// and shared file views) as they are, as Linux keeps their contents. A private
 /// copy of a regular file would have to read the file again, which this backend
 /// cannot do, so a range holding one is refused with ENOSYS before any page
-/// changes. As in Linux (mm/madvise.c), the advice applies to the mapped parts
-/// of a range with holes, which then reports ENOMEM. Other advice only
-/// validates the range.
+/// changes. Advice in [`MADVISE_UNIMPLEMENTED`] is refused with ENOSYS. Other
+/// advice (the access-pattern hints, `MADV_FREE`, `MADV_COLD`, `MADV_PAGEOUT`,
+/// the KSM and huge-page advice) is answered as a hint, which this backend does
+/// not act on: success for a mapped range and ENOMEM for one with holes,
+/// Linux's answer for advice it applies. Linux may instead refuse some of it
+/// for a mapping of the wrong kind (for example `MADV_FREE` on a shared
+/// mapping, EINVAL), which this backend does not model. Every advice first gets
+/// Linux's argument checks (mm/madvise.c):
+/// an advice outside [`MADVISE_KNOWN`] is EINVAL, the start must be page
+/// aligned, the length is rounded up to whole pages, and a zero length
+/// succeeds.
 fn madvise<M: AddressSpace>(memory: &M, args: &[u64; 6]) -> i64 {
-    if args[2] as libc::c_int != libc::MADV_DONTNEED {
-        return validate_range(memory, args[0], args[1]);
+    let advice = args[2] as libc::c_int;
+    if !MADVISE_KNOWN.contains(&advice) {
+        return negative_errno(libc::EINVAL);
     }
     let start = args[0];
     if !start.is_multiple_of(PAGE_SIZE) {
@@ -20609,6 +20718,16 @@ fn madvise<M: AddressSpace>(memory: &M, args: &[u64; 6]) -> i64 {
     if length == 0 {
         return 0;
     }
+    if MADVISE_UNIMPLEMENTED.contains(&advice) {
+        return negative_errno(libc::ENOSYS);
+    }
+    if advice != libc::MADV_DONTNEED {
+        // A hint: Linux applies it to the mapped parts and reports a hole.
+        return match memory.query(start, length) {
+            RangeState::Mapped => 0,
+            _ => negative_errno(libc::ENOMEM),
+        };
+    }
     // Linux drops private anonymous pages, which then read as zeros.
     match memory.discard(start, length) {
         Ok(Discarded { had_holes: true }) => negative_errno(libc::ENOMEM),
@@ -20616,14 +20735,6 @@ fn madvise<M: AddressSpace>(memory: &M, args: &[u64; 6]) -> i64 {
         // A private copy of a regular file would have to be read again.
         Err(MapError::Unsupported) => negative_errno(libc::ENOSYS),
         Err(_) => negative_errno(libc::EFAULT),
-    }
-}
-
-fn validate_range<M: AddressSpace>(memory: &M, address: u64, length: u64) -> i64 {
-    if length == 0 || !range_is_valid(memory, address, length) {
-        negative_errno(libc::EINVAL)
-    } else {
-        0
     }
 }
 
@@ -55635,6 +55746,185 @@ mod tests {
         assert_eq!(dontneed(&mut memory, &mut state, first, 1), 0);
         assert_eq!(page_bytes(&memory, first), [0; 8]);
         assert_eq!(&page_bytes(&memory, first + PAGE_SIZE), b"untouchd");
+    }
+
+    /// A hint (the access-pattern advice, and the reclaim, KSM and huge-page
+    /// advice this backend does not act on) gets Linux's answers
+    /// (mm/madvise.c): success over a mapped range, ENOMEM over a range with a
+    /// hole or no mapping at all, EINVAL for an unaligned start and success for
+    /// a zero length. No page changes.
+    #[test]
+    fn madvise_hints_get_linux_answers_and_change_no_page() {
+        let (_root, mut state, mut memory) = madvise_memory(8);
+        let first = madvise_map(
+            &mut memory,
+            &mut state,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            3,
+        );
+        for page in 0..3 {
+            memory.write(first + page * PAGE_SIZE, b"occupied").unwrap();
+        }
+        assert_eq!(
+            syscall_result(
+                &mut memory,
+                &mut state,
+                libc::SYS_munmap,
+                [first + 2 * PAGE_SIZE, PAGE_SIZE, 0, 0, 0, 0],
+            ),
+            0
+        );
+        let unmapped = first + 2 * PAGE_SIZE;
+        for advice in [
+            libc::MADV_NORMAL,
+            libc::MADV_RANDOM,
+            libc::MADV_SEQUENTIAL,
+            libc::MADV_WILLNEED,
+            libc::MADV_FREE,
+            libc::MADV_MERGEABLE,
+            libc::MADV_UNMERGEABLE,
+            libc::MADV_HUGEPAGE,
+            libc::MADV_NOHUGEPAGE,
+            libc::MADV_COLD,
+            libc::MADV_PAGEOUT,
+        ] {
+            for (address, length, expected) in [
+                (first, 2 * PAGE_SIZE, 0),
+                (first, 3 * PAGE_SIZE, negative_errno(libc::ENOMEM)),
+                (unmapped, PAGE_SIZE, negative_errno(libc::ENOMEM)),
+                (first + 1, PAGE_SIZE, negative_errno(libc::EINVAL)),
+                (unmapped, 0, 0),
+            ] {
+                assert_eq!(
+                    syscall_result(
+                        &mut memory,
+                        &mut state,
+                        libc::SYS_madvise,
+                        [address, length, advice as u64, 0, 0, 0],
+                    ),
+                    expected,
+                    "madvise({address:#x}, {length:#x}, {advice})"
+                );
+            }
+        }
+        assert_eq!(&page_bytes(&memory, first), b"occupied");
+        assert_eq!(&page_bytes(&memory, first + PAGE_SIZE), b"occupied");
+    }
+
+    /// Advice in `MADVISE_UNIMPLEMENTED` answers ENOSYS with the typed refusal
+    /// `UnsupportedOperation::MemoryAdvice`, whose diagnostic names the advice,
+    /// after the argument checks Linux makes first. A hint, a call the
+    /// argument checks answer, and an advice Linux does not know (EINVAL)
+    /// carry no refusal.
+    #[test]
+    fn madvise_refuses_unimplemented_advice_with_a_typed_refusal() {
+        let (root, mut state, mut memory) = madvise_memory(2);
+        let mapped = madvise_map(
+            &mut memory,
+            &mut state,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            1,
+        );
+        memory.write(mapped, b"occupied").unwrap();
+        let mut executor = ElfExecutor::new(state, false);
+        let mut madvise = |address: u64, length: u64, advice: libc::c_int| {
+            let result = executor.execute(
+                &SyscallRequest::new(
+                    libc::SYS_madvise as u64,
+                    [address, length, advice as u64, 0, 0, 0],
+                ),
+                &memory,
+            );
+            (result, executor.take_unsupported_refusal())
+        };
+        for advice in MADVISE_UNIMPLEMENTED {
+            let (result, refusal) = madvise(mapped, PAGE_SIZE, advice);
+            assert_eq!(result, negative_errno(libc::ENOSYS), "advice {advice}");
+            let refusal = refusal.unwrap_or_else(|| panic!("advice {advice} carried no refusal"));
+            assert_eq!(
+                (refusal.operation, refusal.errno),
+                (
+                    reverie::UnsupportedOperation::MemoryAdvice,
+                    reverie::Errno::ENOSYS
+                ),
+                "advice {advice}"
+            );
+            assert_eq!(
+                refusal.diagnostic,
+                madvise_refusal_diagnostic(advice),
+                "advice {advice}"
+            );
+            assert!(
+                refusal.diagnostic.contains("MADV_"),
+                "advice {advice}: {}",
+                refusal.diagnostic
+            );
+            assert_eq!(
+                madvise(mapped + 1, PAGE_SIZE, advice),
+                (negative_errno(libc::EINVAL), None)
+            );
+            assert_eq!(madvise(mapped, 0, advice), (0, None));
+        }
+        assert_eq!(madvise(mapped, PAGE_SIZE, libc::MADV_WILLNEED), (0, None));
+        // An advice Linux does not know is EINVAL before any other check, a
+        // zero length included.
+        for advice in [-1, 5, 26, 99, 104] {
+            assert_eq!(
+                madvise(mapped, PAGE_SIZE, advice),
+                (negative_errno(libc::EINVAL), None),
+                "advice {advice}"
+            );
+            assert_eq!(
+                madvise(mapped, 0, advice),
+                (negative_errno(libc::EINVAL), None),
+                "advice {advice}"
+            );
+        }
+        assert_eq!(&page_bytes(&memory, mapped), b"occupied");
+        drop(root);
+    }
+
+    /// A madvise ENOSYS carries the typed refusal naming its advice,
+    /// `MADV_DONTNEED` over a private file mapping included; any other result,
+    /// and any other syscall's ENOSYS, carries none.
+    #[test]
+    fn madvise_refusal_names_the_advice_of_every_enosys() {
+        let request = |number: libc::c_long, advice: libc::c_int| {
+            SyscallRequest::new(number as u64, [0, PAGE_SIZE, advice as u64, 0, 0, 0])
+        };
+        let refusal = madvise_refusal(
+            &request(libc::SYS_madvise, libc::MADV_DONTNEED),
+            negative_errno(libc::ENOSYS),
+        )
+        .unwrap();
+        assert_eq!(
+            refusal.operation,
+            reverie::UnsupportedOperation::MemoryAdvice
+        );
+        assert!(
+            refusal
+                .diagnostic
+                .contains("MADV_DONTNEED on a private file mapping")
+        );
+        for result in [
+            0,
+            negative_errno(libc::ENOMEM),
+            negative_errno(libc::EINVAL),
+        ] {
+            assert_eq!(
+                madvise_refusal(&request(libc::SYS_madvise, libc::MADV_DONTFORK), result),
+                None
+            );
+        }
+        assert_eq!(
+            madvise_refusal(
+                &request(libc::SYS_mprotect, libc::MADV_DONTFORK),
+                negative_errno(libc::ENOSYS)
+            ),
+            None
+        );
     }
 
     #[test]
