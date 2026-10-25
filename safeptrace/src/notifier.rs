@@ -68,7 +68,6 @@
 //! in a tool's `handle_syscall_event`, without shuffling each report through
 //! Tokio's blocking thread pool. The cost is one worker per guest thread.
 
-#[cfg(test)]
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -531,11 +530,36 @@ const PTRACE_EVENT_EXIT_STOP: i32 = (libc::PTRACE_EVENT_EXIT << 16) | (libc::SIG
 /// The number we get when in a PTRACE_EVENT_EXEC stop.
 const PTRACE_EVENT_EXEC_STOP: i32 = (libc::PTRACE_EVENT_EXEC << 16) | (libc::SIGTRAP << 8) | 0x7f;
 
+thread_local! {
+    /// Whether this thread may have run a `Waker` callback (clone, wake or
+    /// drop) since its last successful [`PtracerThreadGuard::check_current`].
+    /// The code that runs such callbacks sets it before and after them: a
+    /// callback may fork, and the child returns through it as a new task.
+    static WAKER_CALLBACKS_MAY_HAVE_RUN: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Records, on this thread, that `Waker` callbacks are about to run or have
+/// just run, so the next [`PtracerThreadGuard::recheck_after_waker_callbacks`]
+/// checks the host again.
+pub(super) fn note_waker_callbacks() {
+    let _ = WAKER_CALLBACKS_MAY_HAVE_RUN.try_with(|flag| flag.set(true));
+}
+
 #[derive(Debug, Default)]
 struct WakerSlot {
     waker: Mutex<Option<Waker>>,
     data: AtomicPtr<()>,
     vtable: AtomicPtr<RawWakerVTable>,
+}
+
+impl Drop for WakerSlot {
+    fn drop(&mut self) {
+        if let Some(waker) = self.waker.get_mut().take() {
+            note_waker_callbacks();
+            drop(waker);
+            note_waker_callbacks();
+        }
+    }
 }
 
 impl WakerSlot {
@@ -560,7 +584,10 @@ impl WakerSlot {
             return false;
         }
 
+        // Cloning the new waker and dropping the old one run their callbacks.
+        note_waker_callbacks();
         *slot = Some(waker.clone());
+        note_waker_callbacks();
         self.vtable.store(vtable, Ordering::Relaxed);
         // Publish data last so an Acquire match also observes the vtable.
         self.data.store(data, Ordering::Release);
@@ -568,10 +595,12 @@ impl WakerSlot {
     }
 
     fn wake(&self) {
+        note_waker_callbacks();
         let waker = self.waker.lock().as_ref().cloned();
         if let Some(waker) = waker {
             waker.wake();
         }
+        note_waker_callbacks();
     }
 }
 
@@ -817,6 +846,7 @@ thread_local! {
     static ATTACHMENT_CAPTURE_HOOK: std::cell::RefCell<Option<AttachmentCaptureHook>> = const { std::cell::RefCell::new(None) };
     static PTRACER_OWNER_CAPTURES: Cell<usize> = const { Cell::new(0) };
     static PTRACER_HOST_PROOFS: Cell<usize> = const { Cell::new(0) };
+    static WAKER_CALLBACK_RECHECKS: Cell<usize> = const { Cell::new(0) };
     static PTRACER_ATTACHMENT_STATUS_READS: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -1854,7 +1884,7 @@ impl Event {
         // Register may run arbitrary RawWaker clone/drop callbacks. A managed
         // controller must still be its original host before reserving a front.
         if let Some(guard) = guard
-            && let Err(error) = guard.check_current()
+            && let Err(error) = guard.recheck_after_waker_callbacks()
         {
             return Poll::Ready(Err(error));
         }
@@ -2129,9 +2159,10 @@ impl Event {
         };
         let decoded = decode(reservation.status);
         // Child Event adoption can notify an already registered waker. Check
-        // again before this transaction can remove its original FIFO front.
+        // again, if a callback may have run, before this transaction can
+        // remove its original FIFO front.
         if let Some(guard) = guard {
-            guard.check_current()?;
+            guard.recheck_after_waker_callbacks()?;
         }
         let decoded = match decoded {
             Ok(decoded) => decoded,
@@ -6843,9 +6874,11 @@ impl OwnedWaitFuture {
 
     /// Polls the Native wait for one retained execution-controller host.
     ///
-    /// The first admitted call retains this same guard. Waker callbacks are
-    /// followed by a new host check before reserving or decoding a FIFO front,
-    /// and decoding is checked before removal. A refusal leaves the original
+    /// The first admitted call retains this same guard, and every poll checks
+    /// the host when it starts. A `Waker` callback run during the poll (a
+    /// different waker's registration, a wake, a child Event's adoption) is
+    /// followed by a new host check before the FIFO front is reserved, and
+    /// before it is removed after decoding. A refusal leaves the original
     /// input and FIFO front available to that host. Completed results also
     /// require that same controller. The ordinary [`Future`] implementation
     /// keeps its generic Native polling contract.
@@ -7079,9 +7112,35 @@ impl PtracerThreadGuard {
     /// nor changes the original task's capabilities.
     pub fn check_current(&self) -> Result<(), Errno> {
         if self.owner.is_current()? {
+            let _ = WAKER_CALLBACKS_MAY_HAVE_RUN.try_with(|flag| flag.set(false));
             Ok(())
         } else {
             Err(Errno::EPERM)
+        }
+    }
+
+    /// [`Self::check_current`] again only if this thread may have run a
+    /// `Waker` callback since its last successful check.
+    ///
+    /// Valid only after an unconditional `check_current` of this guard
+    /// earlier in the same synchronous call on this thread: the flag is per
+    /// thread, not per guard. Within such a call the executing task changes
+    /// only if code that runs in between forks, and the only foreign code the
+    /// managed wait calls is `Waker` callbacks, each of which sets the flag
+    /// (`note_waker_callbacks`). Signal handlers and process-wide hooks can
+    /// run user code at any point, here as right after any check, and are
+    /// outside this argument. The proof compares no number, so a reused TID
+    /// cannot satisfy a skipped check.
+    fn recheck_after_waker_callbacks(&self) -> Result<(), Errno> {
+        if WAKER_CALLBACKS_MAY_HAVE_RUN
+            .try_with(Cell::get)
+            .unwrap_or(true)
+        {
+            #[cfg(test)]
+            WAKER_CALLBACK_RECHECKS.with(|rechecks| rechecks.set(rechecks.get() + 1));
+            self.check_current()
+        } else {
+            Ok(())
         }
     }
 
