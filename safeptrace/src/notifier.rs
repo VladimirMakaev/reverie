@@ -2475,7 +2475,11 @@ impl Event {
         self.exit_waiters.register(waiter, waker);
         // Serialize epoch validation with claim and kernel exec rearming.
         // A half-published status must yield Pending, never block the executor.
+        // The holder may be another poller whose own poll stays Pending; its
+        // release wakes nobody. A contended poll therefore asks to be polled
+        // again rather than wait for the next exit-state publication.
         let Some(publication) = self.exit_publication.try_lock() else {
+            waker.wake_by_ref();
             return Poll::Pending;
         };
         let result = self.poll_exit_epoch(waiter);
@@ -7009,7 +7013,10 @@ impl ExitFuture {
         if let Err(error) = guard.check_current() {
             return Poll::Ready(Err(error.into()));
         }
+        // As in `Event::poll_exit`: a contending poller whose own poll stays
+        // Pending releases without a wake, so ask to be polled again.
         let Some(publication) = event.exit_publication.try_lock() else {
+            cx.waker().wake_by_ref();
             return Poll::Pending;
         };
         let result = event.poll_exit_epoch(&self.waiter);
@@ -9171,6 +9178,53 @@ mod test {
     }
 
     #[test]
+    fn a_contended_exit_poll_wakes_its_waiter() {
+        let counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&counter));
+        let event = Event::new();
+        let waiter = Arc::new(ExitWaiter::default());
+        event.update(PTRACE_EVENT_EXIT_STOP);
+
+        // Mechanism test: holding the lock stands in for any contender, and
+        // the only wake counted is the contended poll's own.
+        let contender = event.exit_publication.lock();
+        assert_eq!(event.poll_exit(&waiter, &waker), Poll::Pending);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            event.exit_capability.load(Ordering::Acquire),
+            EXIT_CAP_AVAILABLE
+        );
+        drop(contender);
+
+        assert_eq!(event.poll_exit(&waiter, &waker), Poll::Ready(Ok(())));
+    }
+
+    #[test]
+    fn a_stale_exit_waiter_contending_with_a_current_poller_is_woken() {
+        let counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&counter));
+        let event = Event::new();
+        let stale = Arc::new(ExitWaiter::default());
+        event.update(PTRACE_EVENT_EXIT_STOP);
+        // The exec report advances the exit epoch and wakes the old waiters.
+        event.update(PTRACE_EVENT_EXEC_STOP);
+        assert_eq!(event.exit_status.load(Ordering::Acquire), EXIT_PENDING);
+
+        // A current-epoch poller finds the new epoch pending: its poll stays
+        // Pending, so its release wakes nobody. The stale waiter, which
+        // should see EALREADY, contends with it.
+        let current_poller = event.exit_publication.lock();
+        assert_eq!(event.poll_exit(&stale, &waker), Poll::Pending);
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        drop(current_poller);
+
+        assert_eq!(
+            event.poll_exit(&stale, &waker),
+            Poll::Ready(Err(Errno::EALREADY))
+        );
+    }
+
+    #[test]
     fn held_unclaimed_exit_waiter_expires_before_terminal_publication() {
         let counter = Arc::new(WakeCounter::default());
         let waker = Waker::from(Arc::clone(&counter));
@@ -10913,10 +10967,13 @@ mod test {
             EXIT_CAP_PENDING
         );
         assert_eq!(event.poll_exit(&waiter, &waker), Poll::Pending);
+        // The contended poll asks to be polled again.
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
 
         resume_tx.send(()).expect("release exit publication");
         publisher.join().expect("join exit publisher");
-        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        // The publication wakes the registered waiter too.
+        assert_eq!(counter.0.load(Ordering::SeqCst), 2);
         assert_eq!(event.poll_exit(&waiter, &waker), Poll::Ready(Ok(())));
     }
 
