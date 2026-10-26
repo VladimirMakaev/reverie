@@ -12,6 +12,7 @@ use futures::Future;
 use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalTool;
+use reverie::Pid;
 use reverie::Tool;
 use reverie::process::Command;
 use reverie::process::Output;
@@ -432,6 +433,34 @@ pub fn rerun_at_skid_margin(
 /// count.
 pub fn unclaimed_sigtraps_suppressed() -> u64 {
     crate::task::UNCLAIMED_SIGTRAPS_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The SIGTRAP stops this process took as hardware watchpoint hits and
+/// nothing else, suppressing the signal. Concurrent tests in one process
+/// share the count.
+pub fn watch_traps_claimed() -> u64 {
+    crate::task::WATCH_TRAPS_CLAIMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The precise timer's step stops, of a single step or a block step, at
+/// which this process found that a hardware watchpoint fired too: a stepped
+/// instruction made the access. Concurrent tests in one process share the
+/// count.
+pub fn watch_hits_in_timer_steps() -> u64 {
+    crate::task::WATCH_HITS_IN_TIMER_STEPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The stops at which this process read thread `tid`'s debug status for
+/// hardware watchpoint hits: its SIGTRAP stops while it has a watch armed.
+/// A thread with none pays nothing, so the count is the cost of keeping
+/// its watches.
+pub fn watch_status_reads(tid: Pid) -> u64 {
+    crate::task::WATCH_STATUS_READS
+        .lock()
+        .unwrap()
+        .get(&tid)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// For some tests, its nice to show what was printed.

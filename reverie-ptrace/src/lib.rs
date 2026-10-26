@@ -68,6 +68,7 @@ mod tool_memory;
 mod tracer;
 mod validation;
 mod vdso;
+mod watch;
 
 // Shared with the transient opens in reverie-core and safeptrace.
 pub use backend::PtraceBackend;
