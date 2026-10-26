@@ -779,6 +779,86 @@ fn interrupt_guest() -> &'static InterruptGuest {
     &GUEST
 }
 
+/// Arms, as the guest's image starts, a write watch on the word at the
+/// configured address, and keeps every hit.
+#[derive(Default)]
+struct WatchStoreTool;
+
+#[derive(Debug, Default)]
+struct WatchHits(std::sync::Mutex<Vec<reverie::WatchHit>>);
+
+#[reverie::global_tool]
+impl reverie::GlobalTool for WatchHits {
+    type Request = ();
+    type Response = ();
+    /// The watched word's address.
+    type Config = u64;
+
+    async fn receive_rpc(&self, _from: reverie::Pid, _request: ()) {}
+
+    fn on_watchpoint_hit(&self, hit: &reverie::WatchHit) {
+        self.0.lock().unwrap().push(hit.clone());
+    }
+}
+
+#[reverie::tool]
+impl Tool for WatchStoreTool {
+    type GlobalState = WatchHits;
+    type ThreadState = ();
+
+    async fn handle_post_exec<G: reverie::Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<(), reverie::Errno> {
+        let addr = *guest.config();
+        guest
+            .set_watchpoints(&[reverie::WatchSpec {
+                addr,
+                len: 8,
+                kind: reverie::WatchKind::Write,
+                backtraces: 0,
+            }])
+            .expect("arm the watch");
+        Ok(())
+    }
+}
+
+/// The guest with one store to a watched word, and the addresses around it.
+struct WatchedStoreGuest {
+    path: PathBuf,
+    /// `reverie_before_store`, a nop.
+    before: u64,
+    /// `reverie_store`, the store.
+    store: u64,
+    /// `reverie_after_store`, the instruction after it.
+    after: u64,
+    /// `reverie_watched`, the word.
+    word: u64,
+}
+
+fn watched_store_guest() -> &'static WatchedStoreGuest {
+    static GUEST: LazyLock<WatchedStoreGuest> = LazyLock::new(|| {
+        let (path, addresses) = build_guest(
+            "gdbstub_watched_store",
+            &[],
+            &[
+                "reverie_before_store",
+                "reverie_store",
+                "reverie_after_store",
+                "reverie_watched",
+            ],
+        );
+        WatchedStoreGuest {
+            path,
+            before: addresses[0],
+            store: addresses[1],
+            after: addresses[2],
+            word: addresses[3],
+        }
+    });
+    &GUEST
+}
+
 /// Waits until process `pid` has one thread left.
 async fn wait_for_one_thread(pid: u32) {
     for _ in 0..3000 {
@@ -1239,4 +1319,94 @@ async fn a_breakpoint_inserted_while_a_vfork_child_lives_is_the_childs_too() {
         ExitStatus::Exited(0),
         "every child exited as expected"
     );
+}
+
+/// Runs the watched-store guest under Reverie's GDB server with a write watch
+/// on its word, with `client` as GDB; checks that it exits 0 and returns the
+/// hits.
+async fn debug_watched<F, Fut>(name: &str, client: F) -> Vec<reverie::WatchHit>
+where
+    F: FnOnce(Remote) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let guest = watched_store_guest();
+    let socket = std::env::temp_dir().join(format!(
+        "reverie-gdbstub-{name}-{}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let command = Command::new(&guest.path);
+    let tracer = async {
+        TracerBuilder::<WatchStoreTool>::new(command)
+            .config(guest.word)
+            .gdbserver(socket.clone())
+            .spawn()
+            .await
+            .expect("spawn the guest under the GDB server")
+            .wait()
+            .await
+            .expect("wait for the guest")
+    };
+    let gdb = async {
+        let remote = Remote::connect(&socket).await;
+        client(remote).await;
+    };
+    let ((status, hits), ()) = tokio::time::timeout(Duration::from_secs(120), async {
+        tokio::join!(tracer, gdb)
+    })
+    .await
+    .expect("the guest and the GDB session finish");
+    let _ = std::fs::remove_file(&socket);
+    assert_eq!(status, ExitStatus::Exited(0));
+    hits.0.into_inner().unwrap()
+}
+
+/// GDB's step over a breakpoint on a store to a watched word: the server
+/// removes nothing itself, GDB removes the breakpoint, and the server's
+/// step-over runs the store. Its hit comes with the step's trap, and is
+/// reported once, at the instruction after the store.
+#[tokio::test]
+async fn a_step_over_a_breakpoint_on_a_watched_store_reports_the_hit() {
+    let WatchedStoreGuest { store, after, .. } = *watched_store_guest();
+    let hits = debug_watched("watched-step-over", |mut remote| async move {
+        remote.insert(store).await;
+        let stop = remote.resume().await;
+        assert!(stop.starts_with("T05swbreak:"), "{stop:?}");
+        assert_eq!(stop_rip(&stop), store);
+        remote.remove(store).await;
+        let stop = remote.step().await;
+        assert_eq!(stop_rip(&stop), after, "the step did not run the store");
+        assert_exited_zero(&remote.resume().await, "after the step");
+    })
+    .await;
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    assert_eq!(hits[0].ip, after);
+    assert_eq!(hits[0].sigtrap, reverie::SigtrapAtHit::Unchanged);
+}
+
+/// A plain GDB single step, not over a breakpoint, that runs a store to a
+/// watched word: the step's stop is handled as any SIGTRAP of a stepped
+/// thread, and the hit is reported once.
+#[tokio::test]
+async fn a_debugger_step_over_a_watched_store_reports_the_hit() {
+    let WatchedStoreGuest {
+        before,
+        store,
+        after,
+        ..
+    } = *watched_store_guest();
+    let hits = debug_watched("watched-step", |mut remote| async move {
+        remote.insert(before).await;
+        let stop = remote.resume().await;
+        assert_eq!(stop_rip(&stop), before);
+        remote.remove(before).await;
+        // Over the breakpoint's nop, then over the store.
+        assert_eq!(stop_rip(&remote.step().await), store);
+        assert_eq!(stop_rip(&remote.step().await), after);
+        assert_exited_zero(&remote.resume().await, "after the steps");
+    })
+    .await;
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    assert_eq!(hits[0].ip, after);
+    assert_eq!(hits[0].sigtrap, reverie::SigtrapAtHit::Unchanged);
 }
