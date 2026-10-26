@@ -1428,6 +1428,46 @@ impl ClockCounter {
     }
 }
 
+/// Where the guest stands in the controller's PID namespaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuestPidNamespace {
+    /// The guest shares the controller's PID namespace.
+    Same,
+    /// The guest is in a descendant of the controller's PID namespace.
+    Descendant,
+    /// The kernel has no PID namespaces, so both are in its only one.
+    Single,
+}
+
+/// Whether a marker `SI_TKILL` whose sender reads as `sender` came from the
+/// controller `controller`. Linux reports a sender from an ancestor PID
+/// namespace as 0, so with the guest in a descendant namespace only 0 matches.
+fn sent_by_controller(
+    sender: libc::pid_t,
+    controller: libc::pid_t,
+    guest: GuestPidNamespace,
+) -> bool {
+    match guest {
+        GuestPidNamespace::Descendant => sender == 0,
+        GuestPidNamespace::Same | GuestPidNamespace::Single => sender == controller,
+    }
+}
+
+/// The PID namespace that `ns_dir`, a `/proc/<task>/ns` directory, names, or
+/// `None` on a kernel without PID namespaces: there the directory lists `mnt`,
+/// as it always does, but no `pid` (`ns_entries`, fs/proc/namespaces.c). Any
+/// other failure, such as a procfs in which this task has no PID, keeps the
+/// error of the `pid` lookup.
+fn pid_namespace_of(ns_dir: &std::path::Path) -> nix::Result<Option<nix::sys::stat::FileStat>> {
+    match nix::sys::stat::stat(&ns_dir.join("pid")) {
+        Ok(namespace) => Ok(Some(namespace)),
+        Err(nix::errno::Errno::ENOENT) => nix::sys::stat::stat(&ns_dir.join("mnt"))
+            .map(|_| None)
+            .map_err(|_| nix::errno::Errno::ENOENT),
+        Err(error) => Err(error),
+    }
+}
+
 impl TimerImpl {
     pub fn new(guest_pid: Pid, guest_tid: Tid, initial_command: bool) -> Result<Self, Errno> {
         // A CPU with no profile has no event to count; refuse it as the
@@ -2463,7 +2503,13 @@ impl TimerImpl {
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or(guest_path)
         });
-        let ours = nix::sys::stat::stat("/proc/thread-self/ns/pid")?;
+        let Some(ours) = pid_namespace_of(std::path::Path::new("/proc/thread-self/ns"))? else {
+            return Ok(sent_by_controller(
+                sender,
+                controller,
+                GuestPidNamespace::Single,
+            ));
+        };
         let theirs = nix::sys::stat::stat(guest_path.as_str());
         #[cfg(test)]
         CONTROLLER_QUERY_LOG.with(|slot| {
@@ -2476,14 +2522,20 @@ impl TimerImpl {
             }
         });
         let theirs = theirs?;
-        let same_namespace = (ours.st_dev, ours.st_ino) == (theirs.st_dev, theirs.st_ino);
-        // Namespace lookup failure propagates through the held-stop error
-        // path; it neither accepts an unknown sender nor makes construction
-        // newly fallible. This discriminates accidental guest markers under
-        // the existing reserved-signal convention, not hostile forgery:
-        // another ancestor also maps to zero and self rt_tgsigqueueinfo can
-        // supply SI_TKILL with a forged sender in either namespace.
-        Ok(sender == if same_namespace { controller } else { 0 })
+        let guest = if (ours.st_dev, ours.st_ino) == (theirs.st_dev, theirs.st_ino) {
+            GuestPidNamespace::Same
+        } else {
+            GuestPidNamespace::Descendant
+        };
+        // Namespace lookup failure propagates through the held-stop error path;
+        // it neither accepts an unknown sender nor makes construction newly
+        // fallible. Only positive evidence of a kernel without PID namespaces
+        // (`pid_namespace_of`) skips the comparison above. This discriminates
+        // accidental guest markers under the existing reserved-signal
+        // convention, not hostile forgery: another ancestor also maps to zero
+        // and self rt_tgsigqueueinfo can supply SI_TKILL with a forged sender
+        // in either namespace.
+        Ok(sent_by_controller(sender, controller, guest))
     }
 
     fn generated_signal(&self, signal: &libc::siginfo_t, controller: bool) -> bool {
@@ -3666,6 +3718,43 @@ mod tests {
     use super::ClockCounter;
     #[cfg(target_arch = "x86_64")]
     use super::PmuConfig;
+
+    /// The controller's marker reads as its own PID in a shared PID
+    /// namespace, as 0 from a descendant one, and as its own PID on a kernel
+    /// without PID namespaces, which has only one.
+    #[test]
+    fn controller_sender_by_namespace() {
+        use super::GuestPidNamespace::*;
+        use super::sent_by_controller;
+        assert!(sent_by_controller(77, 77, Same));
+        assert!(!sent_by_controller(0, 77, Same));
+        assert!(sent_by_controller(0, 77, Descendant));
+        assert!(!sent_by_controller(77, 77, Descendant));
+        assert!(sent_by_controller(77, 77, Single));
+        assert!(!sent_by_controller(0, 77, Single));
+    }
+
+    /// Only an `ns` directory that lists `mnt` but not `pid` means a kernel
+    /// without PID namespaces; a directory that lists neither keeps the
+    /// `pid` lookup's ENOENT.
+    #[test]
+    fn pid_namespace_needs_positive_evidence_of_its_absence() {
+        use super::pid_namespace_of;
+        let dir = std::env::temp_dir().join(format!("reverie-ns-{}", std::process::id()));
+        // A panicked run with the same PID may have left `mnt` behind.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            pid_namespace_of(&dir).err(),
+            Some(nix::errno::Errno::ENOENT)
+        );
+        std::fs::write(dir.join("mnt"), b"").unwrap();
+        assert!(matches!(pid_namespace_of(&dir), Ok(None)));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let listed = std::fs::symlink_metadata("/proc/thread-self/ns/pid").is_ok();
+        let this_task = pid_namespace_of(std::path::Path::new("/proc/thread-self/ns")).unwrap();
+        assert_eq!(this_task.is_some(), listed);
+    }
 
     #[test]
     fn terminal_close_attempts_both_counters_after_cancellation_error() {

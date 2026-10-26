@@ -3790,8 +3790,27 @@ impl AlignedProcfs {
         let mut bounded = io::Read::take(fs::File::from(fd), 1024 * 1024);
         let mut bytes = Vec::new();
         io::Read::read_to_end(&mut bounded, &mut bytes).map_err(io_errno)?;
-        aligned_proc_pid_namespace(&bytes, Pid::from(nix::unistd::gettid()))?;
+        aligned_proc_pid_namespace(&bytes, Pid::from(nix::unistd::gettid()), || {
+            root.pid_namespaces()
+        })?;
         Ok(root)
+    }
+
+    /// Whether the kernel has PID namespaces, from what this procfs lists
+    /// for the calling thread. `ns/pid` exists exactly when the kernel was
+    /// built with CONFIG_PID_NS, while `ns/mnt` always exists (`ns_entries`,
+    /// fs/proc/namespaces.c). Any other failure, such as a procfs in which
+    /// this thread has no PID (`proc_thread_self_get_link`,
+    /// fs/proc/thread_self.c), is an error.
+    fn pid_namespaces(&self) -> Result<bool, Errno> {
+        match self.entry_key(c"thread-self/ns/pid", libc::AT_SYMLINK_NOFOLLOW) {
+            Ok(_) => Ok(true),
+            Err(Errno::ENOENT) => self
+                .entry_key(c"thread-self/ns/mnt", libc::AT_SYMLINK_NOFOLLOW)
+                .map(|_| false)
+                .map_err(|_| Errno::ENOENT),
+            Err(error) => Err(error),
+        }
     }
 
     fn open_pid(&self, pid: Pid, flags: i32) -> Result<OwnedFd, Errno> {
@@ -3835,13 +3854,19 @@ impl AlignedProcfs {
     }
 
     fn directory_key(&self, name: &std::ffi::CStr) -> Result<ProcDirectoryKey, Errno> {
+        self.entry_key(name, 0)
+    }
+
+    /// The identity of `name` under this procfs, looked up with `fstatat`
+    /// `flags`.
+    fn entry_key(&self, name: &std::ffi::CStr, flags: i32) -> Result<ProcDirectoryKey, Errno> {
         let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
         if unsafe {
             libc::fstatat(
                 self.root.as_raw_fd(),
                 name.as_ptr(),
                 metadata.as_mut_ptr(),
-                0,
+                flags,
             )
         } < 0
         {
@@ -3859,15 +3884,29 @@ fn require_aligned_proc_pid_namespace() -> Result<(), Errno> {
     AlignedProcfs::open().map(|_| ())
 }
 
-fn aligned_proc_pid_namespace(status: &[u8], caller: Pid) -> Result<(), Errno> {
-    // Decode only the genuine kernel ASCII field. comm need not be UTF-8;
-    // proc_task_name escapes its embedded newlines before this field.
-    let line = status
-        .split_inclusive(|byte| *byte == b'\n')
-        .find(|line| line.starts_with(b"NSpid:") && line.last() == Some(&b'\n'))
-        .ok_or(Errno::EOPNOTSUPP)?;
-    let line = std::str::from_utf8(&line[b"NSpid:".len()..]).map_err(|_| Errno::EIO)?;
-    let mut levels = line.split_ascii_whitespace();
+/// Whether `status`, the calling thread's `/proc/thread-self/status`, comes
+/// from a procfs mounted in the caller's PID namespace: its one NSpid level is
+/// the caller's TID. Without an NSpid line, `pid_namespaces` is asked whether
+/// the kernel has PID namespaces; only one built without them omits the line
+/// (`proc_pid_status`, fs/proc/array.c), and it has a single namespace, which
+/// every procfs shows, so there the `Pid:` line must be the caller's TID.
+fn aligned_proc_pid_namespace(
+    status: &[u8],
+    caller: Pid,
+    pid_namespaces: impl FnOnce() -> Result<bool, Errno>,
+) -> Result<(), Errno> {
+    let Some(levels) = status_field(status, b"NSpid:")? else {
+        if pid_namespaces()? {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let pid = status_field(status, b"Pid:")?.ok_or(Errno::EIO)?;
+        return match pid.trim().parse::<i32>() {
+            Ok(pid) if pid == caller.as_raw() => Ok(()),
+            Ok(_) => Err(Errno::EXDEV),
+            Err(_) => Err(Errno::EIO),
+        };
+    };
+    let mut levels = levels.split_ascii_whitespace();
     let mounted_tid = levels
         .next()
         .ok_or(Errno::EIO)?
@@ -3877,6 +3916,17 @@ fn aligned_proc_pid_namespace(status: &[u8], caller: Pid) -> Result<(), Errno> {
         return Err(Errno::EXDEV);
     }
     Ok(())
+}
+
+/// The text after `name` on the complete line of `status` that starts with
+/// it. Decode only the genuine kernel ASCII field: comm need not be UTF-8,
+/// and proc_task_name escapes its embedded newlines before these fields.
+fn status_field<'a>(status: &'a [u8], name: &[u8]) -> Result<Option<&'a str>, Errno> {
+    status
+        .split_inclusive(|byte| *byte == b'\n')
+        .find(|line| line.starts_with(name) && line.last() == Some(&b'\n'))
+        .map(|line| std::str::from_utf8(&line[name.len()..]).map_err(|_| Errno::EIO))
+        .transpose()
 }
 
 #[cfg(test)]
@@ -8892,6 +8942,49 @@ mod test {
         fn drop(&mut self) {
             let _ = self.cleanup();
         }
+    }
+
+    /// The NSpid check proves that a procfs mount is the caller's: one
+    /// level, the caller's TID. Without the line, it asks whether the kernel
+    /// has PID namespaces, refuses where it does, and checks `Pid:` where it
+    /// does not.
+    #[test]
+    fn nspid_alignment_needs_the_line_only_where_pid_namespaces_exist() {
+        let caller = super::Pid::from_raw(4242);
+        let unasked = || -> Result<bool, Errno> { panic!("NSpid is present") };
+        let aligned = b"Name:\tx\nPid:\t4242\nNSpid:\t4242\n";
+        let outer_mount = b"Name:\tx\nPid:\t17\nNSpid:\t17\t4242\n";
+        let no_nspid = b"Name:\tx\nPid:\t4242\nPPid:\t1\n";
+        let other_pid = b"Name:\tx\nPid:\t17\nPPid:\t1\n";
+        assert_eq!(aligned_proc_pid_namespace(aligned, caller, unasked), Ok(()));
+        assert_eq!(
+            aligned_proc_pid_namespace(outer_mount, caller, unasked),
+            Err(Errno::EXDEV)
+        );
+        assert_eq!(
+            aligned_proc_pid_namespace(no_nspid, caller, || Ok(true)),
+            Err(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(
+            aligned_proc_pid_namespace(no_nspid, caller, || Ok(false)),
+            Ok(())
+        );
+        assert_eq!(
+            aligned_proc_pid_namespace(other_pid, caller, || Ok(false)),
+            Err(Errno::EXDEV)
+        );
+        assert_eq!(
+            aligned_proc_pid_namespace(no_nspid, caller, || Err(Errno::EACCES)),
+            Err(Errno::EACCES)
+        );
+    }
+
+    /// The probe agrees with this kernel: procfs lists `ns/pid` exactly
+    /// where the kernel has PID namespaces.
+    #[test]
+    fn procfs_reports_whether_the_kernel_has_pid_namespaces() {
+        let listed = fs::symlink_metadata("/proc/thread-self/ns/pid").is_ok();
+        assert_eq!(AlignedProcfs::open().unwrap().pid_namespaces(), Ok(listed));
     }
 
     #[test]
