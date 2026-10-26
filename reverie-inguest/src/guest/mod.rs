@@ -46,7 +46,6 @@ pub mod protect;
 pub mod restorer;
 #[cfg(feature = "coordinator-rpc")]
 pub mod rpc;
-pub mod runtime_mask;
 #[cfg(feature = "coordinator-rpc")]
 pub mod runtime_seam;
 pub mod sigalrm;
