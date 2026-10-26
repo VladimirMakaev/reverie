@@ -461,6 +461,38 @@ fn managed_native_exit_preserves_claim_across_waker_callbacks() {
 
 #[test]
 #[cfg(not(sanitized))]
+fn managed_native_exit_wakes_after_a_contended_poll() {
+    const NAME: &str = "managed_native_exit_wakes_after_a_contended_poll";
+    const MARKER: &str = "ACTUAL_MANAGED_NATIVE_CONTENDED_EXIT_EXERCISED";
+    const UNAVAILABLE: &str = "NATIVE_THREAD_PIDFD_UNAVAILABLE_FOR_MANAGED_CONTENDED_EXIT";
+    if run_managed_native_outer(NAME, MARKER, UNAVAILABLE) {
+        return;
+    }
+    let Some(mut guest) = managed_native_guest(false, UNAVAILABLE) else {
+        return;
+    };
+    let handle = guest.running.as_ref().unwrap().1.event().clone();
+    let counter = Arc::new(WakeCounter::default());
+    let waker = Waker::from(Arc::clone(&counter));
+    // Mechanism test: holding the lock stands in for any contender. The exit
+    // stop is already published, so the only wake counted is the contended
+    // poll's own.
+    let contender = handle.event().exit_publication.lock();
+    assert!(
+        guest
+            .exit
+            .poll_with_ptracer_guard(&mut Context::from_waker(&waker), &guest.guard)
+            .is_pending()
+    );
+    assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+    assert!(guest.exit.managed_delivery.is_none());
+    drop(contender);
+    finish_managed_native_guest(guest, None);
+    emit_completion_marker(MARKER);
+}
+
+#[test]
+#[cfg(not(sanitized))]
 fn managed_native_reservation_preserves_front_on_foreign_refusal() {
     const NAME: &str = "managed_native_reservation_preserves_front_on_foreign_refusal";
     const MARKER: &str = "ACTUAL_MANAGED_NATIVE_RESERVATION_RECOVERY_EXERCISED";
