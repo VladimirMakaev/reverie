@@ -530,6 +530,16 @@ impl Timer {
         }
     }
 
+    /// Whether a stop the Tool does not observe ([`Timer::disregard_stop`])
+    /// always leaves this thread's timer events as they were: true when the
+    /// thread's precise timer maps its overflow records, or when it has no
+    /// timer at all. Without the records such a stop within the keep margin
+    /// of a precise event's target cancels the event.
+    pub(crate) fn keeps_events_across_disregarded_stops(&self) -> bool {
+        self.inner_noinit()
+            .is_none_or(|timer| timer.timer.has_sample_records())
+    }
+
     /// Read the thread-local deterministic clock. Represents total elapsed RCBs
     /// on this thread since the timer was constructed, which should be at or
     /// near thread creation time.

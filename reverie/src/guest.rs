@@ -1055,6 +1055,66 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
         None
     }
 
+    /// Arms this thread's hardware watchpoints with `specs`, replacing the
+    /// ones it had: an empty slice disarms them. Every access a watch catches
+    /// is reported to [`GlobalTool::on_watchpoint_hit`] as a
+    /// [`WatchHit`](crate::WatchHit) whose `slot` is the watch's index in
+    /// `specs`. Only the thread's own instructions are watched: an access the
+    /// kernel makes for one of its syscalls (a `read` into the watched
+    /// bytes) is not reported, as Linux excludes the kernel from a
+    /// debugger's watchpoints.
+    ///
+    /// The watches are this thread's own. A thread or process it starts has
+    /// none, and a successful `execve` disarms them, as Linux does. The
+    /// backend refuses, changing nothing, more watches than
+    /// [`BackendCapabilities::hardware_watchpoints`](crate::BackendCapabilities::hardware_watchpoints),
+    /// a length or alignment the hardware cannot watch, and, with any watch,
+    /// a thread that blocks or ignores SIGTRAP: Linux reports a hit by
+    /// forcing a SIGTRAP on the thread, which unblocks it and resets its
+    /// action to the default (`force_sig_info_to_task`). A thread can still
+    /// block or ignore SIGTRAP after its watches are armed; what its next hit
+    /// then changes, and what the backend puts back, is
+    /// [`WatchHit::sigtrap`](crate::WatchHit::sigtrap). A backend puts back
+    /// only what it knows, so a Tool that must not change the guest checks
+    /// each hit.
+    ///
+    /// A thread that glibc's `pthread_create` starts runs with every signal
+    /// blocked until its start code restores its mask with an
+    /// `rt_sigprocmask`, before the program's start routine: arming it in
+    /// [`Tool::handle_thread_start`](crate::Tool::handle_thread_start) is
+    /// refused ([`WatchError::SigtrapBlocked`](crate::WatchError::SigtrapBlocked)),
+    /// and the first stop at which it can be armed is the end of that
+    /// syscall. The thread's accesses before then, in glibc's start code,
+    /// are not watched.
+    ///
+    /// A hit stops the thread briefly and makes no Tool callback other than
+    /// `on_watchpoint_hit`: it does not count as an event the Tool observes.
+    /// Whether it can still change when a timer event
+    /// ([`Guest::set_timer_precise`]) is delivered is
+    /// [`Guest::watch_hits_keep_timer_events`].
+    ///
+    /// The default refuses ([`WatchError::Unsupported`](crate::WatchError::Unsupported)).
+    fn set_watchpoints(&mut self, _specs: &[crate::WatchSpec]) -> Result<(), crate::WatchError> {
+        Err(crate::WatchError::Unsupported)
+    }
+
+    /// Whether a watch hit on this thread ([`Guest::set_watchpoints`]) leaves
+    /// every timer event of the thread as it would have been without the
+    /// hit: delivered at the same clock and instruction, or not at all. A
+    /// backend that cannot tell whether a hit's stop came before the timer's
+    /// notification answers `false`, and so does the default.
+    ///
+    /// On reverie-ptrace this holds when the thread's precise timer maps its
+    /// overflow records, or when the thread has no timer at all. Without the
+    /// records (a `PREEMPT_RT` kernel, or a host whose perf locked-memory
+    /// budget ran out), a hit's stop within the keep margin of a precise
+    /// event's target cancels the event, as Reverie's other traps without a
+    /// Tool callback do. A Tool that must not let a hit move a timer event
+    /// checks this on every thread it arms.
+    fn watch_hits_keep_timer_events(&self) -> bool {
+        false
+    }
+
     /// Returns true if all of the following conditions are true:
     ///  1. [`Tool::subscriptions`] returns an interest in intercepting CPUID.
     ///  2. We're able to trap and intercept the CPUID instruction. We may not
@@ -1532,6 +1592,14 @@ where
 
     fn backtrace(&mut self) -> Option<Backtrace> {
         self.inner.backtrace()
+    }
+
+    fn set_watchpoints(&mut self, specs: &[crate::WatchSpec]) -> Result<(), crate::WatchError> {
+        self.inner.set_watchpoints(specs)
+    }
+
+    fn watch_hits_keep_timer_events(&self) -> bool {
+        self.inner.watch_hits_keep_timer_events()
     }
 
     fn has_cpuid_interception(&self) -> bool {
