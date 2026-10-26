@@ -4202,7 +4202,20 @@ impl<T: Tool + 'static> TracerBuilder<T> {
     }
 
     /// Spawns the tracer.
+    ///
+    /// Fails without starting the guest if an injected-syscall trap is
+    /// configured on an architecture other than x86_64: the trap's ABI is
+    /// x86_64's (`injected_syscall_trap`), nothing else handles it, and the
+    /// guest's traps would otherwise run as ordinary signals.
     pub async fn spawn(self) -> Result<Tracer<T::GlobalState>, Error> {
+        #[cfg(not(target_arch = "x86_64"))]
+        if self.injected_syscall_trap.is_some() {
+            return Err(anyhow::anyhow!(
+                "an injected-syscall trap is supported only on x86_64, not on {}",
+                std::env::consts::ARCH
+            )
+            .into());
+        }
         // A retained failed tree must not acquire peers through another mode.
         let _ordinary_admission = OrdinaryAdmission::acquire()?;
         let backend_stats = PtraceBackendStatsSource::from_request(self.backend_stats_request);
@@ -4586,6 +4599,25 @@ mod tests {
     include!("tracer/fatal_dead_exec_tests.rs");
     include!("tracer/signal_sets_session_tests.rs");
     include!("tracer/link_path_session_tests.rs");
+
+    #[cfg(not(target_arch = "x86_64"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_injected_syscall_trap_is_refused_off_x86_64() {
+        let error = TracerBuilder::<()>::new(Command::new("/bin/true"))
+            .injected_syscall_trap(u64::MAX, u64::MAX)
+            .spawn()
+            .await
+            .err()
+            .expect("an injected-syscall trap must be refused off x86_64");
+        assert!(
+            error.to_string().contains("supported only on x86_64"),
+            "{error}"
+        );
+    }
+
+    // The injected-syscall trap exists only on x86_64; elsewhere `spawn`
+    // refuses it (`an_injected_syscall_trap_is_refused_off_x86_64`).
+    #[cfg(target_arch = "x86_64")]
     #[tokio::test(flavor = "current_thread")]
     async fn unsupported_injected_completion_returns_original_pipes_and_usable_tracer() {
         let mut command = Command::new("/bin/sh");
