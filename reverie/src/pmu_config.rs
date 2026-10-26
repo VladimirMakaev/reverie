@@ -540,9 +540,10 @@ impl PmuConfig {
     /// then return `true`. A non-overshoot (`rcb_actual <= rcb_target`) records
     /// nothing and returns `false`.
     ///
-    /// `TimerImpl::attempt_single_step`'s late-delivery guard is the sole runtime
-    /// caller, so a unit test that drives real `(actual, target)` pairs through
-    /// this method exercises exactly the behaviour the supervisor runs — a
+    /// `TimerImpl::record_late_delivery`, the late-delivery guard of
+    /// `TimerImpl::attempt_single_step`, is the sole runtime caller, so a
+    /// unit test that drives real `(actual, target)` pairs through this
+    /// method exercises exactly the behaviour the supervisor runs — a
     /// genuine overshoot causes exactly one witness record — without needing a
     /// live guest or PMU. The boolean return is what makes that behaviour
     /// (not merely the marker arithmetic) observable in a test.
