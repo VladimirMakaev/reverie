@@ -4786,11 +4786,26 @@ fn restore_context(
     retval: Option<Reg>,
     restore_stack: bool,
 ) -> Result<(), TraceError> {
-    let mut regs = task.getregs()?;
+    let regs = restored_regs(task.getregs()?, &context, retval, restore_stack);
+    task.setregs(&regs)
+}
 
-    if let Some(ret) = retval {
-        *regs.ret_mut() = ret;
-    }
+/// The registers [`restore_context`] gives a task whose registers are now
+/// `regs`: the syscall's original arguments, number and instruction pointer
+/// from `context`, and its result, `retval` or else the one in `regs`.
+///
+/// The result is written last. On aarch64 the first argument and the result
+/// share `x0`, so restoring the arguments after the result would replace it
+/// with the guest's first argument: a clone child would resume with that
+/// argument instead of 0, and a guest whose syscall a Tool replaced by tail
+/// injection would see it as the result.
+fn restored_regs(
+    mut regs: libc::user_regs_struct,
+    context: &libc::user_regs_struct,
+    retval: Option<Reg>,
+    restore_stack: bool,
+) -> libc::user_regs_struct {
+    let ret = retval.unwrap_or(regs.ret());
     // TODO-HUMAN-REVIEW(PR-103): Review injected parent-stack restoration.
     if restore_stack {
         *regs.stack_ptr_mut() = context.stack_ptr();
@@ -4816,9 +4831,10 @@ fn restore_context(
     // address in %rcx would leak a tracer-internal (and potentially
     // nondeterministic) pointer to the guest. Restore them from the guest's own
     // pre-syscall snapshot. (No-op on aarch64.)
-    regs.restore_syscall_clobbers(&context);
+    regs.restore_syscall_clobbers(context);
 
-    task.setregs(&regs)
+    *regs.ret_mut() = ret;
+    regs
 }
 
 impl<L: Tool + 'static> TracedTask<L> {
@@ -13786,6 +13802,94 @@ mod breakpoint_word_tests {
         bytes[6] = 0x66;
         let with_a = word(bytes);
         assert_eq!(breakpoint_removed(with_a, saved_a), code);
+    }
+}
+
+#[cfg(test)]
+mod restored_regs_tests {
+    use reverie::syscalls::Sysno;
+
+    use super::restored_regs;
+    use crate::cp;
+    use crate::regs::Reg;
+    use crate::regs::RegAccess;
+
+    /// The guest's clone flags, its first argument.
+    const FLAGS: Reg =
+        (libc::CLONE_CHILD_SETTID | libc::CLONE_CHILD_CLEARTID | libc::SIGCHLD) as Reg;
+    const GUEST_ARGS: (Reg, Reg, Reg, Reg, Reg, Reg) = (FLAGS, 0, 0x5000, 0x6000, 0x7000, 0);
+    const GUEST_IP: Reg = 0x4000_1000;
+    const GUEST_SP: Reg = 0x7ffe_0000;
+    const INJECTED_SP: Reg = 0x7ffd_0000;
+    const CHILD_PID: Reg = 4321;
+
+    fn zeroed() -> libc::user_regs_struct {
+        unsafe { std::mem::zeroed() }
+    }
+
+    /// The guest's registers at its `clone`, which a Tool ran as a `clone3`.
+    fn guest_clone() -> libc::user_regs_struct {
+        let mut regs = zeroed();
+        regs.set_args(GUEST_ARGS);
+        *regs.orig_syscall_mut() = Sysno::clone as Reg;
+        *regs.ip_mut() = GUEST_IP;
+        *regs.stack_ptr_mut() = GUEST_SP;
+        regs
+    }
+
+    /// A task's registers at the injected `clone3`, before the kernel writes
+    /// its result: a parent's at its clone event stop. On aarch64 the result
+    /// register still holds `clone3`'s first argument there.
+    fn injected_clone3() -> libc::user_regs_struct {
+        let mut regs = zeroed();
+        regs.set_args((0x8000, 88, 0, 0, 0, 0));
+        *regs.orig_syscall_mut() = Sysno::clone3 as Reg;
+        *regs.ip_mut() = (cp::PRIVATE_PAGE_OFFSET + cp::SYSCALL_INSTR_SIZE) as Reg;
+        *regs.stack_ptr_mut() = INJECTED_SP;
+        regs
+    }
+
+    /// A child's registers at its first stop: the kernel gave it 0, on
+    /// aarch64 in place of `clone3`'s first argument.
+    fn clone3_child() -> libc::user_regs_struct {
+        let mut regs = injected_clone3();
+        *regs.ret_mut() = 0;
+        regs
+    }
+
+    /// `regs` resume the guest's `clone` with result `ret` on stack `sp`.
+    fn assert_restored(regs: &libc::user_regs_struct, ret: Reg, sp: Reg) {
+        assert_eq!(regs.ret(), ret, "result");
+        assert_eq!(regs.ip(), GUEST_IP, "instruction pointer");
+        assert_eq!(regs.orig_syscall(), Sysno::clone as Reg, "syscall number");
+        assert_eq!(regs.stack_ptr(), sp, "stack pointer");
+        let (_, a1, a2, a3, a4, a5) = regs.args();
+        let (_, g1, g2, g3, g4, g5) = GUEST_ARGS;
+        assert_eq!([a1, a2, a3, a4, a5], [g1, g2, g3, g4, g5], "arguments");
+        // The first argument has its own register on x86_64 (rdi); on aarch64
+        // it is x0, which holds the result.
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(regs.args().0, GUEST_ARGS.0, "first argument");
+    }
+
+    // On aarch64 the next two tests fail if the result is written before the
+    // arguments: the result would be the guest's flags, which share x0 with
+    // it. On x86_64 the result (rax) and the arguments are different
+    // registers, so they pass either way.
+
+    #[test]
+    fn a_child_of_a_clone_run_as_another_resumes_with_zero() {
+        let regs = restored_regs(clone3_child(), &guest_clone(), None, false);
+        assert_restored(&regs, 0, INJECTED_SP);
+    }
+
+    #[test]
+    fn a_parent_of_a_clone_run_as_another_resumes_with_the_child_pid() {
+        let regs = restored_regs(injected_clone3(), &guest_clone(), Some(CHILD_PID), false);
+        assert_restored(&regs, CHILD_PID, INJECTED_SP);
+        // The guest's own stack comes back when asked for.
+        let regs = restored_regs(injected_clone3(), &guest_clone(), Some(CHILD_PID), true);
+        assert_restored(&regs, CHILD_PID, GUEST_SP);
     }
 }
 
