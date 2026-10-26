@@ -127,6 +127,19 @@ fn spawn_legacy_thread_tracee_with_method(
     options: Options,
     method: LegacyAttachMethod,
 ) -> (Pid, Stopped, TraceeCleanupGuard, LegacyThreadGroup) {
+    spawn_legacy_threads(if pause_thread { &[0] } else { &[17, 23] }, options, method)
+}
+
+/// A traced process whose main thread runs one pthread per entry of
+/// `modes`, each joined before the next starts: 0 pauses forever, 1 spins
+/// for about 300 µs between getppid calls forever, 17 raises SIGTRAP and
+/// exits 17, any other value exits with it.
+#[cfg(not(sanitized))]
+fn spawn_legacy_threads(
+    modes: &'static [usize],
+    options: Options,
+    method: LegacyAttachMethod,
+) -> (Pid, Stopped, TraceeCleanupGuard, LegacyThreadGroup) {
     let mut start = [-1, -1];
     if method != LegacyAttachMethod::Traceme {
         assert_eq!(
@@ -156,21 +169,36 @@ fn spawn_legacy_thread_tracee_with_method(
                         unsafe { libc::pause() };
                     }
                 }
+                if mode == 1 {
+                    let now = || {
+                        let mut now = libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 0,
+                        };
+                        // The vDSO answers without a syscall stop.
+                        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+                        now.tv_sec * 1_000_000_000 + now.tv_nsec
+                    };
+                    loop {
+                        let start = now();
+                        while now() - start < 300_000 {}
+                        unsafe { libc::syscall(libc::SYS_getppid) };
+                    }
+                }
                 if mode == 17 {
                     unsafe { libc::raise(libc::SIGTRAP) };
                 }
                 unsafe { libc::syscall(libc::SYS_exit, mode as i32) };
                 std::ptr::null_mut()
             }
-            let exits: &[usize] = if pause_thread { &[0] } else { &[17, 23] };
-            for exit in exits {
+            for mode in modes {
                 let mut thread = mem::MaybeUninit::<libc::pthread_t>::uninit();
                 let created = unsafe {
                     libc::pthread_create(
                         thread.as_mut_ptr(),
                         std::ptr::null(),
                         guest_thread,
-                        *exit as *mut libc::c_void,
+                        *mode as *mut libc::c_void,
                     )
                 };
                 if created != 0 {
@@ -1514,6 +1542,7 @@ async fn forced_legacy_nonleader_steps_are_not_paced_by_the_poll_period() {
         2 * BUSY_SYSCALLS
     );
 }
+
 /// Counts this thread's retained status reads during each legacy consuming
 /// attempt until `done`, asserting that no attempt reads more than once, and
 /// returns how many attempts read.

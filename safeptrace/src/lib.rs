@@ -1238,7 +1238,10 @@ impl Stopped {
     /// ptrace request moved the tracee out of its stop.
     fn into_running(self) -> Running {
         #[cfg(feature = "notifier")]
-        self.1.event().invalidate_numeric_auth();
+        {
+            self.1.event().invalidate_numeric_auth();
+            self.1.event().expect_stop();
+        }
         self.retire_statuses_before_exit_stop();
         Running::from_token(self.0, self.1)
     }
@@ -2265,7 +2268,10 @@ impl Running {
                 )
             })
             .map(drop)
-        })
+        })?;
+        #[cfg(feature = "notifier")]
+        self.1.event().expect_stop();
+        Ok(())
     }
 
     /// Returns the pid of the running process.

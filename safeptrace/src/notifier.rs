@@ -699,6 +699,17 @@ struct Event {
     /// hands their raw statuses to this generation's one publisher. A hint
     /// never enters `status` or creates an exit-stop capability.
     legacy_wait: Mutex<LegacyWaitProgress>,
+    /// Whether this generation's legacy observation worker has a reason to
+    /// take its next turn before it is due ([`Event::wake_legacy_worker`]).
+    /// It has its own lock, never held across a poll, so that the actual
+    /// ptracer does not wait for one; the worker clears it.
+    legacy_wakeup: Mutex<bool>,
+    /// Wakes the legacy observation worker waiting on `legacy_wakeup`.
+    legacy_wake: Condvar,
+    /// Turns of the legacy worker that, right after waiting out the whole
+    /// poll period with no wakeup, published a status or first observed one.
+    #[cfg(test)]
+    legacy_late_turns: AtomicUsize,
     /// The actual host ptracer's immutable lifetime, bound only by that live
     /// thread after retained-generation attachment authentication.
     legacy_wait_owner: OnceLock<LegacyWaitOwner>,
@@ -1372,6 +1383,10 @@ impl Event {
             #[cfg(test)]
             notifier_registration_pause: Mutex::new(None),
             legacy_wait: Mutex::new(LegacyWaitProgress::default()),
+            legacy_wakeup: Mutex::new(false),
+            legacy_wake: Condvar::new(),
+            #[cfg(test)]
+            legacy_late_turns: AtomicUsize::new(0),
             legacy_wait_owner: OnceLock::new(),
             native_wait_identity: OnceLock::new(),
             exit_status: AtomicI32::new(EXIT_PENDING),
@@ -1425,6 +1440,17 @@ impl Event {
 
     fn invalidate_numeric_auth(&self) {
         self.numeric_auth_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Runs this generation's legacy observation worker now instead of when
+    /// its next poll is due: the actual ptracer consumed a status for it to
+    /// publish, or resumed or interrupted the tracee, whose next stop it then
+    /// polls for from the shortest wait up (see [`legacy_worker_thread`]). A wakeup
+    /// only moves the worker's next turn earlier; the turn checks and
+    /// observes what it would have at its due time.
+    fn wake_legacy_worker(&self) {
+        *self.legacy_wakeup.lock() = true;
+        self.legacy_wake.notify_one();
     }
 
     fn hold_tid(&self) -> Option<TidHold<'_>> {
@@ -2752,6 +2778,21 @@ impl EventHandle {
         self.event().invalidate_numeric_auth();
     }
 
+    /// After a request that makes a stop likely soon (a resumption or an
+    /// interrupt): a legacy (Procfs) generation's observation worker polls
+    /// for it from the shortest wait up ([`Event::wake_legacy_worker`]).
+    /// Nothing for a native generation, whose worker the kernel wakes.
+    pub(super) fn expect_stop(&self) {
+        let handle = self.resolved();
+        if handle
+            .identity()
+            .is_some_and(|identity| matches!(identity.pidfd, ThreadHandle::Procfs { .. }))
+            && handle.event().native_wait_identity.get().is_none()
+        {
+            handle.event().wake_legacy_worker();
+        }
+    }
+
     pub(super) fn initial_capture_error(&self) -> Option<Errno> {
         self.resolved().0.initial_capture_refusal.get().copied()
     }
@@ -2914,6 +2955,8 @@ impl EventHandle {
             progress.consumed.push_back(status);
             progress.observed = None;
             progress.error = None;
+            // The worker publishes it on its next turn: run that turn now.
+            event.wake_legacy_worker();
         }
         Ok(())
     }
@@ -4384,7 +4427,6 @@ const LEGACY_WORKER_TIMER_SLACK_NS: libc::c_ulong = 1_000;
 const LEGACY_CHECK_PERIOD: Duration = Duration::from_millis(10);
 
 <<<<<<< HEAD
-=======
 
 /// How long a legacy observation worker waits between turns while the
 /// ptracer holds its tracee in a stop the worker published, when nothing
@@ -4489,11 +4531,23 @@ fn legacy_held_period(event: &Event) -> Duration {
     LEGACY_HELD_PERIOD
 }
 
->>>>>>> 192afdf8d5 (fixup! Read a legacy tracee's procfs status once per wait attempt)
+=======
+
+
+
+>>>>>>> 98f2d9bf29 (Wake the legacy thread-wait worker instead of polling it every 1 ms)
 /// A Procfs worker never consumes a numeric wait. It supplies bounded hints
 /// until the live actual ptracer assists, and publishes only that caller's
 /// consumed FIFO. In particular, host ptracer exit cannot make it steal a
 /// replacement's stop or terminal report.
+///
+/// Its turns are at most [`LEGACY_POLL_PERIOD`] apart. A turn that finds
+/// nothing waits twice as long as the last, from [`LEGACY_FIRST_WAIT`]; one
+/// that hints at a status waits the whole period, as the ptracer's consume
+/// wakes it ([`Event::wake_legacy_worker`]); one that publishes takes the
+/// next turn at once. A wakeup (a consume, or a resumption or interrupt of
+/// the tracee) starts the next turn at once and the waits over from the
+/// first.
 fn legacy_worker_thread(
     _pid: Pid,
     event: &Arc<Event>,
@@ -4536,6 +4590,10 @@ fn legacy_worker_thread(
                 let _ = pause.captured.send(());
                 let _ = pause.resume.recv_timeout(Duration::from_secs(2));
             }
+            #[cfg(test)]
+            if std::mem::take(&mut late) {
+                event.legacy_late_turns.fetch_add(1, Ordering::Relaxed);
+            }
             // Never acquire status/publication locks while holding progress.
             event.update(status);
             if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
@@ -4545,6 +4603,7 @@ fn legacy_worker_thread(
                 progress.observed = None;
                 break;
             }
+            wait = LEGACY_FIRST_WAIT;
             continue;
         }
         // Promotion is installed under this same progress lock. Every
@@ -4553,6 +4612,10 @@ fn legacy_worker_thread(
         if !progress.retiring
             && let Some(native) = event.native_wait_identity.get()
         {
+            // The native loop blocks in waitid: restore the default slack.
+            // SAFETY: PR_SET_TIMERSLACK takes integer arguments and touches
+            // no memory; 0 resets this thread's slack to its default.
+            unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, 0 as libc::c_ulong, 0, 0, 0) };
             return Some(native.clone());
         }
         // Observe first. The attachment check below then reads the target's
@@ -4619,6 +4682,8 @@ fn legacy_worker_thread(
             Ok(status) if !postchecked => identity.pidfd.wait_id().map(|_| status),
             observed => observed,
         };
+        #[cfg(test)]
+        let hinted_before = progress.observed.is_some();
         match observed {
             Ok(status) => {
                 progress.observed = status;
@@ -4643,6 +4708,10 @@ fn legacy_worker_thread(
         // the caller never polls: its OS thread can exit outside any gate.
         let wake = progress.observed.is_some() || progress.error.is_some();
         #[cfg(test)]
+        if std::mem::take(&mut late) && !hinted_before && progress.observed.is_some() {
+            event.legacy_late_turns.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(test)]
         if progress.observed.is_some() {
             pause_retirement_for_test(&event.legacy_observation_pause);
         }
@@ -4652,7 +4721,24 @@ fn legacy_worker_thread(
             event.status_waker.wake();
             event.exit_waiters.wake_all();
         }
-        thread::sleep(Duration::from_millis(1));
+        // A turn that hinted waits the whole period: the ptracer's consume of
+        // that status wakes it.
+        let timeout = if wake { LEGACY_POLL_PERIOD } else { wait };
+        let mut pending = event.legacy_wakeup.lock();
+        if !*pending {
+            event.legacy_wake.wait_for(&mut pending, timeout);
+        }
+        if std::mem::take(&mut *pending) {
+            wait = LEGACY_FIRST_WAIT;
+        } else {
+            #[cfg(test)]
+            {
+                late = timeout == LEGACY_POLL_PERIOD;
+            }
+            if !wake {
+                wait = wait.saturating_mul(2).min(LEGACY_POLL_PERIOD);
+            }
+        }
     }
     None
 }
