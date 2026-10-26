@@ -74,7 +74,9 @@ use std::sync::OnceLock;
 
 use reverie::Errno;
 use reverie::Pid;
+#[cfg(target_arch = "x86_64")]
 use reverie::RegDisplay;
+#[cfg(target_arch = "x86_64")]
 use reverie::RegDisplayOptions;
 use reverie::Signal;
 use reverie::SkidOvershootDetail;
@@ -96,6 +98,7 @@ use safeptrace::Stopped;
 use safeptrace::Wait;
 use thiserror::Error;
 use tracing::debug;
+#[cfg(target_arch = "x86_64")]
 use tracing::trace;
 use tracing::warn;
 
@@ -163,11 +166,14 @@ pub(crate) static BLOCK_BOUND_MISSES: std::sync::atomic::AtomicU64 =
 /// When set to `0`, every step toward a precise event's target is a single
 /// instruction step, as before block steps existed. Any other value, or none,
 /// leaves block steps on. For measurement and as an escape hatch.
+// Block steps (`PTRACE_SINGLEBLOCK`) exist only on x86_64.
+#[cfg(target_arch = "x86_64")]
 pub const BLOCK_STEP_ENV: &str = "REVERIE_BLOCK_STEP";
 
 /// When set (to anything), every hit in the block bound cache re-reads the
 /// guest's code and decodes it again, and panics if the result differs from
 /// the cached one. A debug mode: a wrong entry would be a determinism bug.
+#[cfg(target_arch = "x86_64")]
 pub const BLOCK_STEP_VERIFY_CACHE_ENV: &str = "REVERIE_BLOCK_STEP_VERIFY_CACHE";
 
 /// Timers single step every step toward a precise target while this is set,
@@ -180,6 +186,7 @@ pub(crate) static BLOCK_STEPS_OFF_FOR_TESTS: std::sync::atomic::AtomicBool =
 pub(crate) static VERIFY_BLOCK_BOUNDS_FOR_TESTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(target_arch = "x86_64")]
 fn block_steps_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var(BLOCK_STEP_ENV).map_or(true, |v| v.trim() != "0"))
@@ -610,6 +617,8 @@ impl Timer {
     /// Hands on the active event whose live notification
     /// [`Timer::take_overflow_signal`] took, to be finished with
     /// [`Timer::continue_stepping`] before the guest is resumed.
+    // Only the x86_64 injected-syscall trap hands a taken notification on.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn take_notification(&mut self) -> Option<Unfinished> {
         self.inner_mut_noinit()
             .and_then(|timer| timer.take_notification())
@@ -624,6 +633,8 @@ impl Timer {
     /// overshoot, as a stop that cancels it is. An event already delivered,
     /// or already decided by a stop, is not recorded again, whatever the
     /// guest's clock.
+    // Only the x86_64 injected-syscall trap retires an event this way.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn retire(&mut self) -> Result<(), Errno> {
         match self.inner_mut_noinit() {
             Some(timer) => timer.retire(),
@@ -769,6 +780,9 @@ impl Timer {
     /// places the decision at or before every processor's period, so the
     /// guest's clock alone gives the stop its outcome. A kept event's
     /// programming is checked as [`Timer::disregard_stop`] describes.
+    // Only the x86_64 injected-syscall trap's rt_sigreturn disregards a stop
+    // this way.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn disregard_stop_before_period(&mut self) -> Result<(), Errno> {
         match self.inner_mut_noinit() {
             Some(timer) => {
@@ -824,6 +838,10 @@ impl Timer {
     /// [`Timer::disregard_stop_before_period`] does: a request whose
     /// notification stays blocked would also leave an event whose single
     /// steps the stop ended with nothing to drive it.
+    // ptrace reports rt_sigreturn only on x86_64 (see
+    // `BackendCapabilities::reports_sigreturns`); reports on aarch64 would
+    // need this too.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn disregard_sigreturn_stop(
         &mut self,
         notified_after_return: bool,
@@ -1058,7 +1076,7 @@ pub(crate) struct HostTimedTimerEvents {
     pub preempted_overflow: u64,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 impl HostTimedTimerEvents {
     /// The number of host-timed outcomes of every kind.
     pub fn total(&self) -> u64 {
@@ -1068,7 +1086,7 @@ impl HostTimedTimerEvents {
 
 /// Takes, and resets to zero, the host-timed timer outcomes counted on this
 /// thread.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) fn take_host_timed_timer_events() -> HostTimedTimerEvents {
     HOST_TIMED_TIMER_EVENTS.with(|events| events.take())
 }
@@ -1239,6 +1257,7 @@ enum Interruption {
 
 /// A precise event that a reported `rt_sigreturn` found undelivered (see
 /// [`Timer::disregard_sigreturn_stop`]).
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug, Copy, Clone)]
 struct UndeliveredEvent {
     clock_target: u64,
@@ -2272,6 +2291,7 @@ impl TimerImpl {
         self.timer_status = EventStatus::Cancelled;
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn disregard_stop_before_period(&mut self) -> Result<(), Errno> {
         // Read before the stop is disregarded, which leaves the programming
         // as it is, like every step of the decision.
@@ -2285,6 +2305,7 @@ impl TimerImpl {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn disregard_sigreturn_stop(&mut self, notified_after_return: bool) -> Result<(), Errno> {
         // Both read before the stop is disregarded, which consumes what the
         // stop observed.
@@ -2309,6 +2330,7 @@ impl TimerImpl {
     /// single steps toward it under way, or with their cleanup failed. An
     /// Armed event the stop did not interrupt was delivered. `None` too for
     /// an imprecise event, and for a held initial-command request.
+    #[cfg(target_arch = "x86_64")]
     fn undelivered_precise_event(&self) -> Option<UndeliveredEvent> {
         if self.initial_command != InitialCommand::Ordinary {
             return None;
@@ -2350,6 +2372,7 @@ impl TimerImpl {
     /// neither is requested past it. Nor is an event at its clock target
     /// whose instruction offset is still ahead: a request needs at least one
     /// conditional branch, and no in-tree Tool asks for instruction offsets.
+    #[cfg(target_arch = "x86_64")]
     fn request_again(&mut self, undelivered: UndeliveredEvent) -> Result<(), Errno> {
         let UndeliveredEvent {
             clock_target,
@@ -2497,10 +2520,19 @@ impl TimerImpl {
             .then_some(OwnNotification::Late))
     }
 
+    #[cfg_attr(
+        not(target_arch = "x86_64"),
+        allow(
+            dead_code,
+            reason = "only the x86_64 injected-syscall trap hands a taken notification on; \
+                      the unit tests read it on every architecture"
+        )
+    )]
     fn take_notification(&mut self) -> Option<Unfinished> {
         std::mem::take(&mut self.notification_taken).then_some(Unfinished::Notification)
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn retire(&mut self) -> Result<(), Errno> {
         self.recheck_kept_programming();
         // Only an event that no stop has decided is recorded here, as at the
@@ -4740,6 +4772,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_stop_that_nothing_continues_keeps_the_event_only_before_the_period() {
         use reverie::Pid;
@@ -5028,6 +5061,7 @@ mod tests {
     /// A thread of this process that retires the conditional branches it is
     /// asked for, and otherwise waits blocked in a `read`, where its counters
     /// hold still, as a stopped guest thread's do.
+    #[cfg(target_arch = "x86_64")]
     struct BranchThread {
         tid: reverie::Tid,
         requests: libc::c_int,
@@ -5035,6 +5069,7 @@ mod tests {
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
+    #[cfg(target_arch = "x86_64")]
     impl BranchThread {
         /// Starts the thread, which inherits the caller's signal mask.
         fn spawn() -> Self {
@@ -5111,6 +5146,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     impl Drop for BranchThread {
         fn drop(&mut self) {
             let stop = 0u64.to_ne_bytes();
@@ -5140,6 +5176,7 @@ mod tests {
     // guest is a thread of this process blocked in a read between steps, so
     // its counters hold still whenever they are read, and every clock here
     // is exact.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_kept_event_keeps_the_overflow_point_its_request_programmed() {
         use reverie::Pid;

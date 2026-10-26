@@ -3947,12 +3947,12 @@ async fn postspawn<L: Tool + 'static>(
     ordinary_session.capture_root(&child);
     if !ordinary_session.is_failed() {
         child = match tracer.postspawn_preinit(child).await? {
+            PostspawnPreinit::Outcome(PreinitOutcome::Ready(child)) => child,
             // A refused initialization has published its named primary
             // failure. The ordinary driver must still consume the owned tree;
             // returning a bare spawn errno here would bypass that cleanup.
-            PostspawnPreinit::Outcome(
-                PreinitOutcome::Ready(child) | PreinitOutcome::Refused(child),
-            ) => child,
+            #[cfg(target_arch = "x86_64")]
+            PostspawnPreinit::Outcome(PreinitOutcome::Refused(child)) => child,
             PostspawnPreinit::Outcome(PreinitOutcome::Exited(pid, exit_status)) => {
                 return Err(PostspawnError::Exited { pid, exit_status });
             }
@@ -4138,7 +4138,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
 
     /// Shows `hook` the registers at the final resume of each Tool-visible
     /// seccomp stop, and leaves the signal it picks pending for that resume.
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     fn final_resume_signal_for_test(mut self, hook: crate::task::FinalResumeSignalForTest) -> Self {
         self.final_resume_signal_for_test = Some(hook);
         self
@@ -4146,7 +4146,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
 
     /// Awaits `hook` immediately before each Tool-visible syscall runs (see
     /// [`crate::task::PreSyscallForTest`]).
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     fn pre_syscall_for_test(mut self, hook: crate::task::PreSyscallForTest) -> Self {
         self.pre_syscall_for_test = Some(hook);
         self
@@ -4958,6 +4958,11 @@ mod tests {
                 // The real root runs an unsubscribed pause syscall while the
                 // failing member holds this genuine seccomp callback stop.
                 // Its cleanup therefore needs a descriptor stop request.
+                // aarch64 has no pause syscall; its libc pauses with ppoll.
+                #[cfg(target_arch = "x86_64")]
+                let pause = libc::SYS_pause;
+                #[cfg(not(target_arch = "x86_64"))]
+                let pause = libc::SYS_ppoll;
                 loop {
                     let ready = unsafe { &*(address as *const std::sync::atomic::AtomicUsize) }
                         .load(Ordering::SeqCst)
@@ -4966,7 +4971,7 @@ mod tests {
                         .ok()
                         .and_then(|text| text.split_whitespace().next().map(str::to_owned))
                         .and_then(|value| value.parse::<i64>().ok())
-                        == Some(libc::SYS_pause);
+                        == Some(pause);
                     if ready && paused {
                         break;
                     }
@@ -9765,6 +9770,7 @@ mod tests {
         }
 
         /// Hands the child to an owner that reaps it itself.
+        #[cfg(target_arch = "x86_64")]
         fn into_pid(self) -> Pid {
             let mut this = std::mem::ManuallyDrop::new(self);
             drop(this.pidfd.take());
