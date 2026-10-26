@@ -1322,10 +1322,17 @@ impl ActiveEvent {
         match self {
             ActiveEvent::Precise {
                 clock_target,
-                offset: _,
+                offset,
             } => {
                 if clock_target.saturating_sub(curr_clock) > max_single_step_count {
-                    Some(TimerEventRequest::Precise(*clock_target - curr_clock))
+                    // The same event, its instruction offset included:
+                    // without the offset it would be delivered at the target
+                    // branch.
+                    let rcbs = *clock_target - curr_clock;
+                    Some(match *offset {
+                        0 => TimerEventRequest::Precise(rcbs),
+                        offset => TimerEventRequest::PreciseInstruction(rcbs, offset),
+                    })
                 } else {
                     None
                 }
@@ -1677,6 +1684,18 @@ impl TimerImpl {
         }
         SECOND_STAGES_ARMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
+    }
+
+    /// At a notification that finds the guest's clock `ctr` more than the
+    /// programming's steps short of the active event's target (a spurious
+    /// wakeup), requests the same event again, from `ctr`, and returns the
+    /// request's result; otherwise returns `None`.
+    fn reschedule_spurious_wakeup(&mut self, ctr: u64) -> Option<Result<(), Errno>> {
+        let request = self
+            .event
+            .reschedule_if_spurious_wakeup(ctr, self.max_single_step_count())?;
+        debug!("Spurious wakeup - rescheduling new timer event");
+        Some(self.request_event(request))
     }
 
     /// The most single steps the active precise event's latest programming
@@ -2651,12 +2670,8 @@ impl TimerImpl {
         let ctr = self.read_clock();
         let first_stage = self.first_stage.take();
 
-        if let Some(additional_timer_request) = self
-            .event
-            .reschedule_if_spurious_wakeup(ctr, self.max_single_step_count())
-        {
-            debug!("Spurious wakeup - rescheduling new timer event");
-            if let Err(errno) = self.request_event(additional_timer_request) {
+        if let Some(rescheduled) = self.reschedule_spurious_wakeup(ctr) {
+            if let Err(errno) = rescheduled {
                 warn!(
                     "Attempted to reschedule a timer signal after an early wakeup, but failed with - {:?}. A panic will likely follow",
                     errno
@@ -3860,6 +3875,56 @@ mod tests {
                 0
             );
         }
+    }
+
+    // A notification that finds the clock more than the programming's steps
+    // short of a precise target (a spurious wakeup) requests the same event
+    // again: the same target and the same instruction offset. Requested
+    // without its offset, the event was delivered at the target branch.
+    #[test]
+    fn a_spurious_wakeup_requests_the_same_event_with_its_instruction_offset() {
+        use reverie::Pid;
+
+        use super::ActiveEvent;
+        use super::TimerEventRequest;
+        use super::TimerImpl;
+
+        const TICKS: u64 = 1_000_000;
+        block_timer_signal();
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+        let mut timer = TimerImpl::new(pid, tid, false).expect("control requires a working PMU");
+        // The clock stands still, as a stopped guest's does, so that every
+        // read in a call is the same.
+        timer.clock.disable().unwrap();
+        for offset in [11, 0] {
+            timer
+                .request_event(TimerEventRequest::PreciseInstruction(TICKS, offset))
+                .unwrap();
+            timer.timer.disable().unwrap();
+            let requested = timer.event;
+            let ActiveEvent::Precise { clock_target, .. } = requested else {
+                panic!("a precise event: {requested:?}");
+            };
+            // The notification finds the clock where the request did, the
+            // whole request short of the target.
+            let clock = timer.read_clock();
+            assert_eq!(clock_target - clock, TICKS);
+            assert_eq!(timer.reschedule_spurious_wakeup(clock), Some(Ok(())));
+            timer.timer.disable().unwrap();
+            assert_eq!(timer.event, requested, "offset {offset}");
+            // Within the programming's steps of the target it is no
+            // spurious wakeup.
+            assert_eq!(timer.reschedule_spurious_wakeup(clock_target - 1), None);
+        }
+        let event = ActiveEvent::Precise {
+            clock_target: 30_233,
+            offset: 11,
+        };
+        assert!(matches!(
+            event.reschedule_if_spurious_wakeup(7_000, 200),
+            Some(TimerEventRequest::PreciseInstruction(23_233, 11))
+        ));
     }
 
     // A staged precise event's first stage is programmed the first stage
