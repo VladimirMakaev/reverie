@@ -876,6 +876,10 @@ struct SignalResume {
     /// (`Guest::set_signal_info`), written when the signal is resumed from a
     /// signal-delivery stop (`resume_with_signal`).
     replacement: Option<(AnySignal, SiginfoBytes)>,
+    /// Whether the thread steps one instruction with `signal` rather than
+    /// continuing: gdb answered the signal's stop with a step
+    /// (`GdbSignalResume::Step`).
+    step: bool,
 }
 
 /// A delivery that `Guest::deliver_signal` approved in the running signal
@@ -6613,6 +6617,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             reported: Some(taken),
             approved: verdict.approved,
             replacement: verdict.replacement,
+            step: false,
         })
     }
 
@@ -6644,6 +6649,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             reported: None,
             approved: false,
             replacement: None,
+            step: false,
         }
     }
 
@@ -6812,6 +6818,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             reported,
             approved,
             replacement,
+            step,
         } = resume;
         // Before a siginfo write below: a write can land on an exit stop the
         // tracee already took (https://github.com/rrnewton/reverie/issues/1091).
@@ -6884,9 +6891,12 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.held_siginfo_written.store(true, Ordering::Relaxed);
             task.setsiginfo_bytes(&bytes)?;
         }
-        self.resume_stopped_any(task, signal)?
-            .next_state_with_owner(&self.ptracer_waits)
-            .await
+        let running = if step {
+            self.step_stopped_any(task, signal)?
+        } else {
+            self.resume_stopped_any(task, signal)?
+        };
+        running.next_state_with_owner(&self.ptracer_waits).await
     }
 
     /// The Tool's verdict on `sig`: `Tool::handle_signal_event` for a signal
@@ -7159,26 +7169,26 @@ impl<L: Tool + 'static> TracedTask<L> {
                     .report_signal(sig, false, taken.map(|taken| taken.bytes))
                     .await?;
                 let mut signal = verdict.signal;
+                let mut step = false;
                 // A signal the Tool delivers stops for gdb first, which then
-                // decides what the guest gets.
+                // decides what the guest gets. A step with the signal resumes
+                // through `resume_with_signal`, as a continue does, so that
+                // the signal keeps its own siginfo, or the one the callback
+                // chose, and a put-back instance is counted.
                 if let Some(delivered) = signal
                     && self.stops_for_gdb_at(delivered)
                 {
-                    match self.signal_stop_for_gdb(&task, delivered).await? {
-                        GdbSignalResume::Continue(chosen) => signal = chosen,
-                        GdbSignalResume::Step(chosen) => {
-                            return self
-                                .step_stopped_any(task, chosen)?
-                                .next_state_with_owner(&self.ptracer_waits)
-                                .await;
-                        }
-                    }
+                    (signal, step) = match self.signal_stop_for_gdb(&task, delivered).await? {
+                        GdbSignalResume::Continue(chosen) => (chosen, false),
+                        GdbSignalResume::Step(chosen) => (chosen, true),
+                    };
                 }
                 let resume = SignalResume {
                     signal,
                     reported: taken,
                     approved: verdict.approved,
                     replacement: verdict.replacement,
+                    step,
                 };
                 self.resume_with_signal(task, resume).await
             }
