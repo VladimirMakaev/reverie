@@ -1880,19 +1880,42 @@ thread_local! {
 
 /// Whether the SIGTRAP `task` stopped to take was sent by a process: by
 /// `kill`, `tgkill`, `raise`, `sigqueue`, or a POSIX timer or `F_SETSIG` file
-/// that names SIGTRAP. Linux marks every such signal with a `si_code` of zero
-/// or below (`SI_FROMUSER`); every trap of Reverie's own, a single step
-/// (`TRAP_TRACE`), a breakpoint (`TRAP_BRKPT`, `SI_KERNEL`) or a rewritten
-/// site's trap, has a positive one. The kernel's one sender-coded SIGTRAP,
-/// the legacy exec report (`SI_USER`), never comes: Reverie sets
-/// `PTRACE_O_TRACEEXEC`. A siginfo that cannot be read is not evidence, and
-/// the stop keeps its other handling. Not covered: a thread that queues
+/// that names SIGTRAP (`is_sender_coded_sigtrap`). A siginfo that cannot be
+/// read is not evidence, and the stop keeps its other handling.
+fn is_sigtrap_sent_by_a_process(task: &Stopped) -> bool {
+    task.getsiginfo()
+        .is_ok_and(|info| is_sender_coded_sigtrap(&info))
+}
+
+/// Whether `info` is a SIGTRAP a process sent, as `is_sigtrap_sent_by_a_process`
+/// reads it. Linux marks every sent signal with a `si_code` of zero or below
+/// (`SI_FROMUSER`). Reverie's own single steps (`TRAP_TRACE`), breakpoints
+/// (`TRAP_BRKPT`, `SI_KERNEL`) and rewritten sites' traps have a positive one,
+/// save one: where the architecture has no `user_single_step_report` of its
+/// own, aarch64 among them, a stepped syscall's report is `SI_USER` with pid 0
+/// (include/linux/ptrace.h:338-351 at v6.9). There `SI_USER` counts as sent
+/// only with a sender's pid; a kill from a pid namespace the guest cannot see
+/// also carries pid 0 and is taken for a trap. x86_64 reports a stepped
+/// syscall with `TRAP_BRKPT`, so there every `SI_USER` is a sender's. The
+/// kernel's other sender-coded SIGTRAP, the legacy exec report, never comes:
+/// Reverie sets `PTRACE_O_TRACEEXEC`. Not covered: a thread that queues
 /// itself a SIGTRAP with a positive code (`rt_sigqueueinfo` and
 /// `rt_tgsigqueueinfo` allow that only to the calling thread itself) is not
 /// told apart from a kernel trap.
-fn is_sigtrap_sent_by_a_process(task: &Stopped) -> bool {
-    task.getsiginfo()
-        .is_ok_and(|info| info.si_signo == libc::SIGTRAP && info.si_code <= 0)
+fn is_sender_coded_sigtrap(info: &libc::siginfo_t) -> bool {
+    sender_coded_sigtrap(info, !cfg!(target_arch = "x86_64"))
+}
+
+/// `is_sender_coded_sigtrap`'s rule, where `step_report_is_si_user` says
+/// whether this architecture reports a stepped syscall with `SI_USER` and
+/// pid 0, so that both answers can be tested on any host.
+fn sender_coded_sigtrap(info: &libc::siginfo_t, step_report_is_si_user: bool) -> bool {
+    info.si_signo == libc::SIGTRAP
+        && (info.si_code < 0
+            || (info.si_code == libc::SI_USER
+                // SAFETY: `si_pid` reads the sender member, which `SI_USER`
+                // fills in.
+                && (!step_report_is_si_user || unsafe { info.si_pid() } != 0)))
 }
 
 /// Whether the SIGTRAP `task` stopped with is the guest's own `int3`, retired
@@ -6134,6 +6157,23 @@ impl<L: Tool + 'static> TracedTask<L> {
         // default action kills the guest with a core. None of the traps below
         // carries a sender's code. Before, it fell to the last arm and was
         // dropped, so a guest that raised SIGTRAP to die ran on.
+        //
+        // Not covered: a SIGTRAP sent to this thread (`raise`, `tgkill`,
+        // `pthread_kill`, `rt_tgsigqueueinfo`) already pending, blocked or
+        // racing in from another thread, when one of Reverie's own `int3`s
+        // fires, at a rewritten syscall site or a gdb breakpoint. The trap is
+        // forced into the thread's own queue, which keeps one standard
+        // signal, so the trap's siginfo is dropped and the stop carries the
+        // sender's (`legacy_queue` in `__send_signal_locked`,
+        // kernel/signal.c:1095 and :1352 at v6.9); a process-directed `kill`
+        // waits in the shared queue and cannot do this. This check takes the
+        // stop for the sent signal: at a rewritten site the syscall does not
+        // run, and at a breakpoint `rip` is not rewound. If the guest blocked
+        // SIGTRAP, forcing the trap also reset its action to `SIG_DFL` and
+        // unblocked it (:1338-1344), so the guest dies there, where natively
+        // the sent signal would have stayed pending. Before this check, the
+        // same race lost the sent signal instead
+        // (https://github.com/rrnewton/hermit/issues/4858).
         if is_sigtrap_sent_by_a_process(&task) {
             return self.deliver_guest_sigtrap(task, regs).await;
         }
@@ -13736,6 +13776,71 @@ fn breakpoint_inserted(word: u64) -> u64 {
 /// can hold breakpoints inserted or removed since `saved` was read.
 fn breakpoint_removed(current: u64, saved: u64) -> u64 {
     (current & !0xffu64) | (saved & 0xffu64)
+}
+
+#[cfg(test)]
+mod sender_coded_sigtrap_tests {
+    use super::is_sender_coded_sigtrap;
+    use super::sender_coded_sigtrap;
+
+    /// A siginfo for `signo` with `code` and, in its kill member, sender
+    /// `pid`.
+    fn siginfo(signo: i32, code: i32, pid: i32) -> libc::siginfo_t {
+        // SAFETY: an all-zero siginfo is valid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        info.si_signo = signo;
+        info.si_code = code;
+        // The kill member's `si_pid` follows the three leading ints and their
+        // padding to the union's 8-byte alignment: the fifth int.
+        // SAFETY: within the 128-byte siginfo.
+        unsafe { (std::ptr::addr_of_mut!(info) as *mut i32).add(4).write(pid) };
+        // SAFETY: the kill member is filled in above.
+        assert_eq!(unsafe { info.si_pid() }, pid, "the kill member's layout");
+        info
+    }
+
+    #[test]
+    fn a_sender_coded_sigtrap_is_one_a_process_sent() {
+        for (code, pid) in [
+            (libc::SI_TKILL, 7),
+            (libc::SI_QUEUE, 7),
+            (libc::SI_USER, 4242),
+        ] {
+            assert!(
+                is_sender_coded_sigtrap(&siginfo(libc::SIGTRAP, code, pid)),
+                "code {code} pid {pid}"
+            );
+        }
+        // Reverie's own traps have positive codes.
+        for code in [libc::TRAP_TRACE, libc::TRAP_BRKPT, 0x80] {
+            assert!(!is_sender_coded_sigtrap(&siginfo(libc::SIGTRAP, code, 0)));
+        }
+        // Another signal is not a SIGTRAP.
+        assert!(!is_sender_coded_sigtrap(&siginfo(
+            libc::SIGUSR1,
+            libc::SI_USER,
+            4242
+        )));
+    }
+
+    /// A stepped syscall's report is `SI_USER` with pid 0 wherever the
+    /// architecture has no `user_single_step_report` of its own (aarch64);
+    /// on x86_64 that report is `TRAP_BRKPT`, and `SI_USER` with pid 0 is a
+    /// kill from a pid namespace the guest cannot see.
+    #[test]
+    fn si_user_with_pid_0_is_sent_only_where_no_step_report_carries_it() {
+        let report = siginfo(libc::SIGTRAP, libc::SI_USER, 0);
+        assert!(sender_coded_sigtrap(&report, false), "x86_64's rule");
+        assert!(!sender_coded_sigtrap(&report, true), "aarch64's rule");
+        // A sender's pid counts under both.
+        let kill = siginfo(libc::SIGTRAP, libc::SI_USER, 4242);
+        assert!(sender_coded_sigtrap(&kill, false) && sender_coded_sigtrap(&kill, true));
+        assert_eq!(
+            is_sender_coded_sigtrap(&report),
+            cfg!(target_arch = "x86_64"),
+            "this host's rule"
+        );
+    }
 }
 
 #[cfg(test)]
