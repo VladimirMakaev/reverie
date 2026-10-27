@@ -243,7 +243,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
     ) -> G::Response {
         #[cfg(feature = "exec-private-successor")]
         if self.native_failed.load(Ordering::Acquire) {
-            rpc_fatal(123);
+            rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE);
         }
         // Fork detection without a per-hop syscall: the common round-trip only
         // reads the atfork flag. It is set exclusively in a freshly forked
@@ -254,7 +254,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
             // retained native stream can never reconnect as ordinary I/O.
             #[cfg(feature = "exec-private-init")]
             if super::exec_private::active() {
-                rpc_fatal(123);
+                rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE);
             }
             let pid = current_id(libc::SYS_getpid).unwrap_or_else(|_| rpc_fatal(122));
             if connection.pid != pid {
@@ -266,7 +266,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
                     let old_fd = self.fd.swap(new_fd, Ordering::AcqRel);
                     (self.on_reconnect)(old_fd, new_fd)
                 })
-                .unwrap_or_else(|_| rpc_fatal(123));
+                .unwrap_or_else(|_| rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE));
                 let inherited = std::mem::replace(&mut *connection, RpcConnection { pid, client });
                 let (_, _, stream) = inherited.client.into_parts();
                 match stream {
@@ -278,13 +278,16 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
                     // neither reachable nor unreported.
                     GuestRpcStream::Ordinary(stream) => {
                         let inherited_fd = stream.into_raw_fd();
-                        let blocked = crate::guest::protect::block_all_signals()
-                            .unwrap_or_else(|_| rpc_fatal(123));
+                        let blocked =
+                            crate::guest::protect::block_all_signals().unwrap_or_else(|_| {
+                                rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE)
+                            });
                         unsafe {
                             raw_syscall6(libc::SYS_close, [inherited_fd as u64, 0, 0, 0, 0, 0])
                         };
-                        crate::guest::protect::record_if_open(inherited_fd)
-                            .unwrap_or_else(|_| rpc_fatal(123));
+                        crate::guest::protect::record_if_open(inherited_fd).unwrap_or_else(|_| {
+                            rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE)
+                        });
                         drop(blocked);
                     }
                     // Not reached: connect_ordinary builds only Ordinary
@@ -298,7 +301,7 @@ impl<G: GlobalTool> CoordinatorRpc<G> {
         }
         match connection.client.try_send_rpc(message) {
             Ok(response) => response,
-            Err(_) => rpc_fatal(123),
+            Err(_) => rpc_fatal(reverie_rpc_transport::TOOL_RPC_FAILURE_EXIT_CODE),
         }
     }
 }

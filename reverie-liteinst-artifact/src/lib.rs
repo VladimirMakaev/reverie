@@ -739,7 +739,7 @@ fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
 }
 // Reviewed literal expectations, not hashes generated from the current checkout
 // or bytes embedded after a runtime edit. The qualifier self-hash is separate.
-const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 66] = [
+const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 73] = [
     // Bind the signal-mask gate and every changed native-source premise of it.
     (
         "reverie-inguest/src/guest/continuation.rs",
@@ -808,8 +808,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 66] = [
     ),
     (
         "Cargo.toml",
-        971,
-        "484f5411a5cddc3b8338b2a71393b0de43ef8caf21c4fb31eca61e7d155ea783",
+        1310,
+        "b9005e03d3dd22ea0ec8ede786cca806cbbca87947be0f6d2349b038d8feeef9",
     ),
     (
         "reverie-liteinst-artifact/Cargo.toml",
@@ -993,13 +993,13 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 66] = [
     ),
     (
         "reverie-inguest/src/guest/rpc.rs",
-        16172,
-        "02147b80047fed98adb33e60b6710fa4bc20313a6c1e2a4bd7f8b3ed2f2fc576",
+        16538,
+        "d8a69c65ff9a2504c2a737b8fda86a5ef4a252446fea77bf1379ccfe6dc2d98d",
     ),
     (
         "reverie-inguest/src/guest/host.rs",
-        190039,
-        "521cc8c98412603f67fd8ec36bf8860cf6dd89b969645b9cbc52bca814a0930e",
+        204181,
+        "3f3a6486819a5af8212f1d6abe42cc1e1cb098ddd45f8bf137790da50ee8c392",
     ),
     (
         "reverie-inguest/src/guest/host_linux.rs",
@@ -1023,8 +1023,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 66] = [
     ),
     (
         "reverie/src/lib.rs",
-        6840,
-        "d598695a0c5bab650a980bc278101bff67e8ea3054c75668602051ac74c87213",
+        6940,
+        "d72f87195bd6d6cf84f56d537f3bdcd3bca22649dbe1ffe73fbc8c19a897eaca",
     ),
     (
         "reverie/src/perf.rs",
@@ -1070,6 +1070,42 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 66] = [
         "reverie/src/pidfd_self.rs",
         21903,
         "dd5e46c1ae38714c99dc146a95099787b6f9b92f1dfeac0d5f1c8e385a76b764",
+    ),
+    // Shared process ownership, callback outcomes and the reserved RPC protocol.
+    (
+        "reverie/src/tool_process.rs",
+        12833,
+        "2c45ce4db577d912a668c883bd0a2c6fa5b6a369a2a8b0460c643cfdbd1eb525",
+    ),
+    (
+        "reverie/src/tool_outcome.rs",
+        10307,
+        "ee28ac21532ccc32d15116a3bab71aea074e5177a8c3f630c09e74e8a16b798c",
+    ),
+    (
+        "reverie-inguest/src/tool_host.rs",
+        24858,
+        "571d9604b2894cfb51256bc713d155b3d3ce42eb2cda54c5bc9912435ad96eb3",
+    ),
+    (
+        "reverie-rpc-transport/src/lib.rs",
+        4843,
+        "f85ee8b473b9c072de1268a806e036665b3df94d021a26601876a6e0cb2c5adc",
+    ),
+    (
+        "reverie-rpc-transport/src/server.rs",
+        117987,
+        "bde8ada2d200c6d660f5df09448766a6c9a78c14ab7e542a3a5460de3cca4514",
+    ),
+    (
+        "reverie-rpc-transport/src/blocking_client.rs",
+        41752,
+        "231274923759cb4351f265409b9c23370fe5b7ee8cc88b8b324bfd07b5e8b456",
+    ),
+    (
+        "reverie-rpc-transport/src/tool_activation.rs",
+        17031,
+        "3195980ecdb940374c21fe38ccb98839798d078aed929b69edb179283b87536c",
     ),
 ];
 // Native Detcore's fixed-gate publication ordering is a separately declared
@@ -32493,7 +32529,35 @@ mod tests {
         let rv_two = cargo_two.join(suffix);
         // Current compiled bytes are inputs only. Each must independently match
         // the fixed reviewed length/digest catalog before any positive is earned.
-        let compiled_files: [(&str, &[u8]); 68] = [
+        let compiled_files: [(&str, &[u8]); 75] = [
+            (
+                "reverie/src/tool_process.rs",
+                include_bytes!("../../reverie/src/tool_process.rs"),
+            ),
+            (
+                "reverie/src/tool_outcome.rs",
+                include_bytes!("../../reverie/src/tool_outcome.rs"),
+            ),
+            (
+                "reverie-inguest/src/tool_host.rs",
+                include_bytes!("../../reverie-inguest/src/tool_host.rs"),
+            ),
+            (
+                "reverie-rpc-transport/src/lib.rs",
+                include_bytes!("../../reverie-rpc-transport/src/lib.rs"),
+            ),
+            (
+                "reverie-rpc-transport/src/server.rs",
+                include_bytes!("../../reverie-rpc-transport/src/server.rs"),
+            ),
+            (
+                "reverie-rpc-transport/src/blocking_client.rs",
+                include_bytes!("../../reverie-rpc-transport/src/blocking_client.rs"),
+            ),
+            (
+                "reverie-rpc-transport/src/tool_activation.rs",
+                include_bytes!("../../reverie-rpc-transport/src/tool_activation.rs"),
+            ),
             (
                 "reverie-inguest/src/guest/continuation.rs",
                 include_bytes!("../../reverie-inguest/src/guest/continuation.rs"),
@@ -32771,11 +32835,11 @@ mod tests {
             }
         }
         let (rv_inventory, _) = content_reverie_inventory(&rv_one).unwrap();
-        // 66 reviewed sources plus the independently checked qualifier.
-        assert_eq!(rv_inventory.len(), 67);
+        // 73 reviewed sources plus the independently checked qualifier.
+        assert_eq!(rv_inventory.len(), 74);
         let (detcore_inventory, _) =
             content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore).unwrap();
-        assert_eq!(detcore_inventory.len(), 68);
+        assert_eq!(detcore_inventory.len(), 75);
         assert_eq!(
             content_reverie_inventory_for_image(&rv_two, FixedImageKind::Detcore)
                 .unwrap()
