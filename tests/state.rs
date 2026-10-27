@@ -8,6 +8,8 @@
 
 //! Tests for process and thread state.
 
+#![cfg(not(sanitized))]
+
 #[cfg(all(not(sanitized), test))]
 use std::sync::Mutex;
 #[cfg(all(not(sanitized), test))]
@@ -133,7 +135,6 @@ impl Tool for TestTool {
     }
 }
 
-#[cfg(not(sanitized))]
 #[test]
 fn basic_test() {
     use reverie_ptrace::testing::check_fn;
