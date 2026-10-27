@@ -133,7 +133,8 @@ fn spawn_legacy_thread_tracee_with_method(
 /// A traced process whose main thread runs one pthread per entry of
 /// `modes`, each joined before the next starts: 0 pauses forever, 1 spins
 /// for about 300 µs between getppid calls forever, 17 raises SIGTRAP and
-/// exits 17, any other value exits with it.
+/// exits 17, a value from 1000 reads one byte at a time from descriptor
+/// `value - 1000` forever, and any other value exits with it.
 #[cfg(not(sanitized))]
 fn spawn_legacy_threads(
     modes: &'static [usize],
@@ -183,6 +184,14 @@ fn spawn_legacy_threads(
                         let start = now();
                         while now() - start < 300_000 {}
                         unsafe { libc::syscall(libc::SYS_getppid) };
+                    }
+                }
+                if mode >= 1000 {
+                    let mut byte = 0u8;
+                    loop {
+                        unsafe {
+                            libc::read((mode - 1000) as i32, (&mut byte as *mut u8).cast(), 1)
+                        };
                     }
                 }
                 if mode == 17 {
@@ -1682,6 +1691,316 @@ async fn forced_legacy_waits_read_target_status_once_per_attempt_or_period() {
 
     let exit = child_cleanup.exit_event_on_ptracer_thread(&child).unwrap();
     terminal.request_sigkill().unwrap();
+    drop(child);
+    let child = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, exit)
+        .await
+        .unwrap()
+        .unwrap();
+    child_cleanup.mark_claimed_exit();
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            child.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (
+            child_tid,
+            crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+        ),
+    );
+    assert!(terminal.wait(TRACEE_WAIT_TIMEOUT));
+    child_cleanup.disarm();
+
+    let parent = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, root_exit)
+        .await
+        .unwrap()
+        .unwrap();
+    root_cleanup.mark_claimed_exit();
+    drop(parent_running);
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            parent.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (
+            root.into(),
+            crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+        ),
+    );
+    assert!(root_terminal.wait(TRACEE_WAIT_TIMEOUT));
+    root_cleanup.disarm();
+}
+
+/// Waits until the legacy worker of `event` hints at a status that nothing
+/// has consumed yet, which only its own turns can do.
+fn wait_for_legacy_hint(event: &Event, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while event.legacy_wait.lock().observed.is_none() {
+        assert!(Instant::now() < deadline, "{what}: the worker never observed it");
+        thread::sleep(Duration::from_micros(200));
+    }
+}
+
+/// Waits until the legacy worker of `event` has started a held wait after
+/// `before` of them.
+fn wait_for_held_wait(event: &Event, before: usize, what: &str) {
+    let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
+    while event.legacy_held_waits.load(Ordering::Relaxed) <= before {
+        assert!(Instant::now() < deadline, "{what}: the worker never held the stop");
+        thread::sleep(Duration::from_micros(200));
+    }
+}
+
+/// Resumes `stopped` to its next syscall stop and returns that stop.
+async fn next_syscall_stop(stopped: Stopped) -> Stopped {
+    let (next, stop) = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        stopped.syscall(None).unwrap().wait_owned_on_ptracer_thread(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .assume_stopped();
+    assert_eq!(stop, crate::Event::Syscall);
+    next
+}
+
+// A resumption that races a legacy worker's hold is not lost. The held
+// non-leader loops reading a pipe. Each round stops it at a read entry and
+// pauses its worker at one of the two points of the race, resumes it into
+// the read during the pause, and releases the worker. Only then, after the
+// worker has had time to settle into whatever wait it chose, does the pipe
+// get a byte: the read's exit stop must reach the worker's own turns
+// although the held period outlasts the test, with nothing consuming it in
+// between. Even rounds pause right after the worker published the entry
+// stop, odd rounds after it decided to wait as held, before it takes the
+// lock to do so. Reading the wakeup count after the publish pause, or
+// waiting without comparing the counts under that lock, leaves the worker in
+// a held wait here. (No pause point can separate the publication from a read
+// placed right after it: the read must stay before `event.update`.) A
+// cancellation signal then kills the group, and the worker must observe the
+// last thread's exit stop by itself.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_resume_racing_a_held_wait_is_not_lost() {
+    if run_legacy_test_outer("forced_legacy_resume_racing_a_held_wait_is_not_lost") {
+        return;
+    }
+    const ROUNDS: usize = 10;
+    let [read_end, write_end] = legacy_pipe();
+    let modes: &'static [usize] = Box::leak(Box::new([1000 + read_end.as_raw_fd() as usize]));
+    let (root, stopped, mut root_cleanup, _force) = spawn_legacy_threads(
+        modes,
+        legacy_thread_options() | Options::PTRACE_O_TRACESYSGOOD,
+        LegacyAttachMethod::Traceme,
+    );
+    drop(read_end);
+    let root_exit = root_cleanup.exit_event_on_ptracer_thread(&stopped).unwrap();
+    let root_terminal = stopped.terminal_cleanup();
+    let write_byte = || {
+        assert_eq!(
+            unsafe { libc::write(write_end.as_raw_fd(), b"r".as_ptr().cast(), 1) },
+            1
+        )
+    };
+    let (parent, crate::Event::NewChild(crate::ChildOp::Clone, child)) = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        stopped.resume(None).unwrap().wait_owned_on_ptracer_thread(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .assume_stopped() else {
+        panic!("missing reading pthread clone");
+    };
+    let child_tid = child.pid();
+    let mut child_cleanup = legacy_child_cleanup(&child);
+    let terminal = child.terminal_cleanup();
+    let event = Arc::clone(terminal.event.event());
+    *event.legacy_held_period.lock() = Some(Duration::from_secs(60));
+    let (mut child, sigstop) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, child.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(sigstop, crate::Event::Signal(Signal::SIGSTOP));
+    let parent_running = parent.resume(None).unwrap();
+    let read_fd = modes[0] as u64 - 1000;
+    let is_read_entry = |stopped: &Stopped| {
+        matches!(
+            stopped.getsyscallinfo().unwrap().operation,
+            crate::SyscallInfoOp::Entry { number, arguments }
+                if number == libc::SYS_read as u64 && arguments[0] == read_fd
+        )
+    };
+    // Run the thread's start-up to its first read, then through that read.
+    let mut entries = 0;
+    while !is_read_entry(&child) {
+        entries += 1;
+        assert!(entries < 200, "the thread never reached its read");
+        child = next_syscall_stop(child).await;
+    }
+    let mut held = event.legacy_held_waits.load(Ordering::Relaxed);
+    let running = child.syscall(None).unwrap();
+    write_byte();
+    let (mut child, _) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, running.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    for round in 0..ROUNDS {
+        // At the previous read's exit stop: wait until the worker holds it,
+        // so that the pause below can only take the next stop.
+        wait_for_held_wait(&event, held, &format!("round {round}: read exit"));
+        let (captured, capture) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        let pause = BoundedTestPause {
+            captured,
+            resume: released,
+        };
+        if round % 2 == 0 {
+            *event.legacy_publish_pause.lock() = Some(pause);
+        } else {
+            *event.legacy_held_wait_pause.lock() = Some(pause);
+        }
+        let entry = next_syscall_stop(child).await;
+        capture
+            .recv_timeout(TRACEE_WAIT_TIMEOUT)
+            .unwrap_or_else(|_| panic!("round {round}: the worker never reached the pause"));
+        assert!(is_read_entry(&entry), "round {round}: not at the read entry");
+        let running = entry.syscall(None).unwrap();
+        release.send(()).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        assert!(event.legacy_wait.lock().observed.is_none());
+        write_byte();
+        wait_for_legacy_hint(&event, &format!("round {round}: read exit"));
+        held = event.legacy_held_waits.load(Ordering::Relaxed);
+        let (exit, stop) =
+            tokio::time::timeout(TRACEE_WAIT_TIMEOUT, running.wait_owned_on_ptracer_thread())
+                .await
+                .unwrap()
+                .unwrap()
+                .assume_stopped();
+        assert_eq!(stop, crate::Event::Syscall);
+        child = exit;
+    }
+
+    // The signal's wakeup, or the leader's exit-stop probe, brings the held
+    // worker to the exit stop. Nothing polls `exit` until it has observed it.
+    let exit = child_cleanup.exit_event_on_ptracer_thread(&child).unwrap();
+    terminal.request_sigkill().unwrap();
+    wait_for_legacy_hint(&event, "the cancellation signal");
+    drop(child);
+    let child = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, exit)
+        .await
+        .unwrap()
+        .unwrap();
+    child_cleanup.mark_claimed_exit();
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            child.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (
+            child_tid,
+            crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+        ),
+    );
+    assert!(terminal.wait(TRACEE_WAIT_TIMEOUT));
+    child_cleanup.disarm();
+    let parent = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, root_exit)
+        .await
+        .unwrap()
+        .unwrap();
+    root_cleanup.mark_claimed_exit();
+    drop(parent_running);
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            parent.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (
+            root.into(),
+            crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+        ),
+    );
+    assert!(root_terminal.wait(TRACEE_WAIT_TIMEOUT));
+    root_cleanup.disarm();
+}
+
+// While the ptracer holds a legacy non-leader in a stop, its worker waits
+// for a wakeup instead of polling: no turns while held. A group SIGKILL from
+// outside, which no request of the ptracer reports, still reaches the
+// worker without waiting out the held period: the leader's exit stop
+// probes it.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_held_worker_waits_for_a_wakeup_or_probe() {
+    if run_legacy_test_outer("forced_legacy_held_worker_waits_for_a_wakeup_or_probe") {
+        return;
+    }
+    let (root, stopped, mut root_cleanup, _force) = spawn_legacy_thread_tracee(true);
+    let root_exit = root_cleanup.exit_event_on_ptracer_thread(&stopped).unwrap();
+    let root_terminal = stopped.terminal_cleanup();
+    let (parent, crate::Event::NewChild(crate::ChildOp::Clone, child)) = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        stopped.resume(None).unwrap().wait_owned_on_ptracer_thread(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .assume_stopped() else {
+        panic!("missing paused pthread clone");
+    };
+    let child_tid = child.pid();
+    let mut child_cleanup = legacy_child_cleanup(&child);
+    let terminal = child.terminal_cleanup();
+    let worker = terminal.event.event().clone();
+    *worker.legacy_held_period.lock() = Some(Duration::from_secs(60));
+    let (child, event) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, child.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(event, crate::Event::Signal(Signal::SIGSTOP));
+    let parent_running = parent.resume(None).unwrap();
+
+    let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
+    while worker.legacy_held_waits.load(Ordering::Relaxed) == 0 {
+        assert!(Instant::now() < deadline, "the worker never held the stop");
+        thread::sleep(Duration::from_millis(1));
+    }
+    let turns = || worker.legacy_worker_turns.load(Ordering::Relaxed);
+    let before = turns();
+    thread::sleep(Duration::from_millis(200));
+    let held_turns = turns() - before;
+    assert_eq!(held_turns, 0, "a held worker took {held_turns} turns in 200 ms");
+
+    let exit = child_cleanup.exit_event_on_ptracer_thread(&child).unwrap();
+    // Neither a ptrace request nor a cancellation signal of this ptracer.
+    assert_eq!(unsafe { libc::kill(root.as_raw(), libc::SIGKILL) }, 0);
+    // Nothing polls `exit` until the worker has observed the exit stop on
+    // its own turns, so that a consume by the ptracer cannot stand in for
+    // the probe.
+    wait_for_legacy_hint(&worker, "the group kill");
     drop(child);
     let child = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, exit)
         .await
