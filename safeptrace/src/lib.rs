@@ -1092,6 +1092,9 @@ impl Stopped {
     /// of the exit stop, so the queued stops ahead of it are still dead.
     fn map_err(&self, err: Errno) -> Error {
         if err == Errno::ESRCH {
+            // The tracee has left the stop this capability names.
+            #[cfg(feature = "notifier")]
+            self.1.event().stop_may_have_ended();
             self.retire_statuses_before_exit_stop();
             Error::Died(Zombie::from_token(self.0, self.1.clone()))
         } else {
@@ -1495,6 +1498,8 @@ impl Stopped {
                 if error == Errno::ESRCH {
                     // The retained value keeps its ownership role, but the
                     // tracee has left the exit stop this capability names.
+                    #[cfg(feature = "notifier")]
+                    self.1.event().stop_may_have_ended();
                     self.retire_statuses_before_exit_stop();
                 }
                 Err((self, error))

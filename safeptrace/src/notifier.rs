@@ -699,13 +699,27 @@ struct Event {
     /// hands their raw statuses to this generation's one publisher. A hint
     /// never enters `status` or creates an exit-stop capability.
     legacy_wait: Mutex<LegacyWaitProgress>,
-    /// Whether this generation's legacy observation worker has a reason to
-    /// take its next turn before it is due ([`Event::wake_legacy_worker`]).
-    /// It has its own lock, never held across a poll, so that the actual
-    /// ptracer does not wait for one; the worker clears it.
-    legacy_wakeup: Mutex<bool>,
+    /// How often this generation's legacy observation worker was given a
+    /// reason to take its next turn before it is due
+    /// ([`Event::wake_legacy_worker`], [`Event::probe_legacy_worker`]). It
+    /// has its own lock, never held across a poll, so that the actual
+    /// ptracer does not wait for one. Nothing is taken while holding it.
+    legacy_wakeup: Mutex<LegacyWakeups>,
     /// Wakes the legacy observation worker waiting on `legacy_wakeup`.
     legacy_wake: Condvar,
+    /// Replaces [`LEGACY_HELD_PERIOD`] for this generation's worker.
+    #[cfg(test)]
+    legacy_held_period: Mutex<Option<Duration>>,
+    /// Pauses the worker once, after it decided to wait as a held worker
+    /// and before it takes `legacy_wakeup` to do so.
+    #[cfg(test)]
+    legacy_held_wait_pause: Mutex<Option<BoundedTestPause>>,
+    /// Waits the worker started as a held worker.
+    #[cfg(test)]
+    legacy_held_waits: AtomicUsize,
+    /// Pauses the worker once, right after it published a status.
+    #[cfg(test)]
+    legacy_publish_pause: Mutex<Option<BoundedTestPause>>,
     /// Turns of the legacy worker that, right after waiting out the whole
     /// poll period with no wakeup, published a status or first observed one.
     #[cfg(test)]
@@ -816,6 +830,18 @@ struct LegacyWaitProgress {
     consumed: VecDeque<i32>,
     error: Option<Errno>,
     retiring: bool,
+}
+
+/// What a legacy observation worker was woken for ([`Event::legacy_wakeup`]).
+/// Each field counts calls, and only grows: a worker compares the counts
+/// with those it last acted on, under the same lock it waits with, so no
+/// call between two of its turns is lost (see [`legacy_worker_thread`]).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LegacyWakeups {
+    /// [`Event::wake_legacy_worker`] calls.
+    targeted: u64,
+    /// [`Event::probe_legacy_worker`] calls.
+    probes: u64,
 }
 
 #[derive(Debug)]
@@ -1383,8 +1409,16 @@ impl Event {
             #[cfg(test)]
             notifier_registration_pause: Mutex::new(None),
             legacy_wait: Mutex::new(LegacyWaitProgress::default()),
-            legacy_wakeup: Mutex::new(false),
+            legacy_wakeup: Mutex::new(LegacyWakeups::default()),
             legacy_wake: Condvar::new(),
+            #[cfg(test)]
+            legacy_held_period: Mutex::new(None),
+            #[cfg(test)]
+            legacy_held_wait_pause: Mutex::new(None),
+            #[cfg(test)]
+            legacy_held_waits: AtomicUsize::new(0),
+            #[cfg(test)]
+            legacy_publish_pause: Mutex::new(None),
             #[cfg(test)]
             legacy_late_turns: AtomicUsize::new(0),
             legacy_wait_owner: OnceLock::new(),
@@ -1444,12 +1478,29 @@ impl Event {
 
     /// Runs this generation's legacy observation worker now instead of when
     /// its next poll is due: the actual ptracer consumed a status for it to
-    /// publish, or resumed or interrupted the tracee, whose next stop it then
-    /// polls for from the shortest wait up (see [`legacy_worker_thread`]). A wakeup
+    /// publish, or resumed, interrupted, detached or signalled the tracee, or
+    /// found that it had left its stop. The worker then polls for the next
+    /// stop from the shortest wait up, and a stop it published before this
+    /// call no longer counts as held (see [`legacy_worker_thread`]). A wakeup
     /// only moves the worker's next turn earlier; the turn checks and
     /// observes what it would have at its due time.
     fn wake_legacy_worker(&self) {
-        *self.legacy_wakeup.lock() = true;
+        let mut wakeups = self.legacy_wakeup.lock();
+        wakeups.targeted = wakeups.targeted.wrapping_add(1);
+        drop(wakeups);
+        self.legacy_wake.notify_one();
+    }
+
+    /// Runs this generation's legacy observation worker now, and lets a
+    /// held one poll for [`LEGACY_PROBE_WINDOW`], because something may have
+    /// ended its tracee's stop without a ptrace request
+    /// ([`probe_legacy_workers`]). Unlike [`Event::wake_legacy_worker`], a
+    /// probe does not end the hold: once the window passes with nothing
+    /// found, the worker waits [`LEGACY_HELD_PERIOD`] again.
+    fn probe_legacy_worker(&self) {
+        let mut wakeups = self.legacy_wakeup.lock();
+        wakeups.probes = wakeups.probes.wrapping_add(1);
+        drop(wakeups);
         self.legacy_wake.notify_one();
     }
 
@@ -2793,6 +2844,20 @@ impl EventHandle {
         }
     }
 
+    /// After a request found that the tracee had left a stop the caller
+    /// held (ESRCH), or after a cancellation signal: wakes this generation's
+    /// legacy observation worker as [`Self::expect_stop`] does, and probes
+    /// every other one ([`probe_legacy_workers`]), since what ended this stop
+    /// (a SIGKILL, a group exit or another thread's exec) can end theirs.
+    pub(super) fn stop_may_have_ended(&self) {
+        self.expect_stop();
+        probe_legacy_workers(
+            self.resolved()
+                .identity()
+                .map(|identity| identity.snapshot.tgid),
+        );
+    }
+
     pub(super) fn initial_capture_error(&self) -> Option<Errno> {
         self.resolved().0.initial_capture_refusal.get().copied()
     }
@@ -2839,6 +2904,9 @@ impl EventHandle {
             progress.retiring = true;
             drop(gate);
             drop(progress);
+            // A held worker would notice the retirement only at its next
+            // due turn: take that turn now.
+            event.wake_legacy_worker();
             if event.worker_state.load(Ordering::Acquire) == WORKER_NOT_STARTED {
                 NOTIFIER.resolve_echild(pid, &handle);
             }
@@ -2946,7 +3014,12 @@ impl EventHandle {
             Ok(status) => status,
             // The observation owner decides transient newborn ECHILD versus
             // exact retirement and publishes it after draining its FIFO.
-            Err(Errno::ECHILD | Errno::EINTR) => None,
+            // Have it decide now: a held worker's next turn may be far off.
+            Err(Errno::ECHILD) => {
+                event.wake_legacy_worker();
+                None
+            }
+            Err(Errno::EINTR) => None,
             Err(error) => return Err(error),
         };
         if let Some(status) = status {
@@ -3041,6 +3114,8 @@ impl EventHandle {
         let selected = Self(self.resolved().0.clone(), Some(native));
         drop(gate);
         drop(progress);
+        // The legacy worker switches to the native wait at its next turn.
+        event.wake_legacy_worker();
         event.status_changed.notify_all();
         event.status_waker.wake();
         Ok(selected)
@@ -4414,7 +4489,9 @@ const LEGACY_WORKER_TIMER_SLACK_NS: libc::c_ulong = 1_000;
 /// goes between attachment checks ([`legacy_worker_thread`]).
 ///
 /// With one turn, this bounds how late the worker notices a lost
-/// attachment or host owner that no observation reports. Most losses are
+/// attachment or host owner that no observation reports, while its tracee
+/// is not held in a stop ([`LEGACY_HELD_PERIOD`] bounds it while it is).
+/// Most losses are
 /// reported, and are checked at once: a numeric observation of a non-leader
 /// finds it only as a tracee of this process (Linux's `do_wait_pid`), so the
 /// observation returns ECHILD once a host owner's exit or a detach ends the
@@ -4425,8 +4502,6 @@ const LEGACY_WORKER_TIMER_SLACK_NS: libc::c_ulong = 1_000;
 /// each check reads `status`, so a period of many turns keeps idle threads
 /// cheap.
 const LEGACY_CHECK_PERIOD: Duration = Duration::from_millis(10);
-
-<<<<<<< HEAD
 
 /// How long a legacy observation worker waits between turns while the
 /// ptracer holds its tracee in a stop the worker published, when nothing
@@ -4446,7 +4521,6 @@ const LEGACY_HELD_PERIOD: Duration = Duration::from_millis(100);
 /// not held does, after a probe ([`probe_legacy_workers`]): long enough for
 /// the threads a group exit killed to reach their exit stops.
 const LEGACY_PROBE_WINDOW: Duration = Duration::from_millis(10);
-
 
 /// Every running legacy observation worker, for [`probe_legacy_workers`].
 /// Nothing else is locked while this is held.
@@ -4531,23 +4605,33 @@ fn legacy_held_period(event: &Event) -> Duration {
     LEGACY_HELD_PERIOD
 }
 
-=======
-
-
-
->>>>>>> 98f2d9bf29 (Wake the legacy thread-wait worker instead of polling it every 1 ms)
 /// A Procfs worker never consumes a numeric wait. It supplies bounded hints
 /// until the live actual ptracer assists, and publishes only that caller's
 /// consumed FIFO. In particular, host ptracer exit cannot make it steal a
 /// replacement's stop or terminal report.
 ///
-/// Its turns are at most [`LEGACY_POLL_PERIOD`] apart. A turn that finds
-/// nothing waits twice as long as the last, from [`LEGACY_FIRST_WAIT`]; one
-/// that hints at a status waits the whole period, as the ptracer's consume
-/// wakes it ([`Event::wake_legacy_worker`]); one that publishes takes the
-/// next turn at once. A wakeup (a consume, or a resumption or interrupt of
-/// the tracee) starts the next turn at once and the waits over from the
-/// first.
+/// While its tracee may run, its turns are at most [`LEGACY_POLL_PERIOD`]
+/// apart. A turn that finds nothing waits twice as long as the last, from
+/// [`LEGACY_FIRST_WAIT`]; one that hints at a status waits the whole
+/// period, as the ptracer's consume wakes it
+/// ([`Event::wake_legacy_worker`]); one that publishes takes the next turn
+/// at once. A wakeup (a consume, or a resumption or interrupt of the
+/// tracee) starts the next turn at once and the waits over from the first.
+///
+/// Once it has published a stop, the ptracer holds the tracee in that stop
+/// until it sends a request, which wakes the worker. Until then, each turn
+/// would find nothing, so the turns are [`LEGACY_HELD_PERIOD`] apart. A
+/// probe ([`probe_legacy_workers`]) makes a held worker poll as above for
+/// [`LEGACY_PROBE_WINDOW`], and a wakeup ends the hold.
+///
+/// No wakeup that ends a hold is lost. The worker reads the targeted count
+/// ([`LegacyWakeups`]) just before it publishes the stop, and the ptracer
+/// can resume, interrupt, detach or signal the tracee only after it has
+/// received the stop, so each such request counts after that read. The
+/// worker waits as held only while the count still equals that read, and
+/// it compares the counts and starts to wait while holding the lock that
+/// every wakeup takes to count: a wakeup either counts before the
+/// comparison, which sees it, or after the wait has started, which it ends.
 fn legacy_worker_thread(
     _pid: Pid,
     event: &Arc<Event>,
@@ -4572,11 +4656,19 @@ fn legacy_worker_thread(
             0,
         )
     };
+    let _listing = LegacyWorkerListing::new(event, identity.snapshot.tgid);
     let mut wait = LEGACY_FIRST_WAIT;
     #[cfg(test)]
     let mut late = false;
     // When the last attachment check that read the target's status ran.
     let mut checked_at: Option<Instant> = None;
+    // The wakeup counts this worker has acted on.
+    let mut seen = LegacyWakeups::default();
+    // While the ptracer holds the tracee in a stop this worker published:
+    // the targeted wakeup count read just before that publication.
+    let mut held: Option<u64> = None;
+    // While a probed held worker polls: until when.
+    let mut probing_until: Option<Instant> = None;
     loop {
         #[cfg(test)]
         pause_retirement_for_test(&event.legacy_worker_cycle_pause);
@@ -4594,8 +4686,16 @@ fn legacy_worker_thread(
             if std::mem::take(&mut late) {
                 event.legacy_late_turns.fetch_add(1, Ordering::Relaxed);
             }
+            // Before publishing: every request that can end this stop
+            // counts after this read (see above).
+            let before_publication = event.legacy_wakeup.lock().targeted;
             // Never acquire status/publication locks while holding progress.
             event.update(status);
+            #[cfg(test)]
+            pause_retirement_for_test(&event.legacy_publish_pause);
+            if may_end_other_stops(status) {
+                probe_legacy_workers(Some(identity.snapshot.tgid));
+            }
             if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
                 let mut progress = event.legacy_wait.lock();
                 debug_assert!(progress.consumed.is_empty());
@@ -4603,6 +4703,8 @@ fn legacy_worker_thread(
                 progress.observed = None;
                 break;
             }
+            held = libc::WIFSTOPPED(status).then_some(before_publication);
+            probing_until = None;
             wait = LEGACY_FIRST_WAIT;
             continue;
         }
@@ -4633,8 +4735,6 @@ fn legacy_worker_thread(
         // reattach, without an intervening ECHILD observation by this
         // worker. On an empty turn that notice is worth at most one status
         // read per LEGACY_CHECK_PERIOD, as the check costs a read.
-        #[cfg(test)]
-        let hinted_before = progress.observed.is_some();
         // A turn whose observation found nothing acts on nothing, so it needs
         // no postcheck, and it checks only once LEGACY_CHECK_PERIOD has
         // passed since the last check that read. Every other result is
@@ -4722,18 +4822,49 @@ fn legacy_worker_thread(
             event.exit_waiters.wake_all();
         }
         // A turn that hinted waits the whole period: the ptracer's consume of
-        // that status wakes it.
-        let timeout = if wake { LEGACY_POLL_PERIOD } else { wait };
-        let mut pending = event.legacy_wakeup.lock();
-        if !*pending {
-            event.legacy_wake.wait_for(&mut pending, timeout);
+        // that status wakes it. A held worker that is not probing waits the
+        // held period, unless a wakeup ended the hold (checked below).
+        let held_wait =
+            !wake && held.is_some() && probing_until.is_none_or(|until| Instant::now() >= until);
+        let held_period = legacy_held_period(event);
+        #[cfg(test)]
+        if held_wait {
+            pause_retirement_for_test(&event.legacy_held_wait_pause);
         }
-        if std::mem::take(&mut *pending) {
+        let mut wakeups = event.legacy_wakeup.lock();
+        let timeout = if wake {
+            LEGACY_POLL_PERIOD
+        } else if held_wait && held == Some(wakeups.targeted) {
+            #[cfg(test)]
+            event.legacy_held_waits.fetch_add(1, Ordering::Relaxed);
+            held_period
+        } else {
+            wait
+        };
+        if *wakeups == seen {
+            event.legacy_wake.wait_for(&mut wakeups, timeout);
+        }
+        let targeted = wakeups.targeted != seen.targeted;
+        let probed = wakeups.probes != seen.probes;
+        if held.is_some_and(|count| count != wakeups.targeted) {
+            held = None;
+            probing_until = None;
+        }
+        seen = *wakeups;
+        drop(wakeups);
+        if targeted {
             wait = LEGACY_FIRST_WAIT;
+        } else if probed {
+            // Only a held worker polls for the probe. One whose tracee may
+            // run already polls, and keeps its backoff.
+            if held.is_some() {
+                wait = LEGACY_FIRST_WAIT;
+                probing_until = Some(Instant::now() + LEGACY_PROBE_WINDOW);
+            }
         } else {
             #[cfg(test)]
             {
-                late = timeout == LEGACY_POLL_PERIOD;
+                late = timeout >= LEGACY_POLL_PERIOD;
             }
             if !wake {
                 wait = wait.saturating_mul(2).min(LEGACY_POLL_PERIOD);
@@ -4782,6 +4913,9 @@ fn worker_thread(pid: Pid, event: Arc<Event>, identity: Arc<WorkerIdentity>) {
                 let _ = pause.resume.recv_timeout(Duration::from_secs(2));
             }
             event.update(status);
+            if may_end_other_stops(status) {
+                probe_legacy_workers(Some(identity.snapshot.tgid));
+            }
 
             // Try to avoid reaching an ECHILD error by terminating the loop on the
             // last event.
@@ -4978,13 +5112,17 @@ fn resume_cancelled_sync_status(pid: Pid, status: i32, handle: &EventHandle) -> 
     match nix::sys::ptrace::cont(pid.into(), None) {
         Ok(()) => {
             handle.invalidate_numeric_auth();
+            handle.expect_stop();
             Ok(())
         }
         // An untraced job-control stop needs no resume for the already-pending
         // exact-pidfd SIGKILL to terminate it.
         // SIGKILL can advance an exit-stopped task before PTRACE_CONT reaches
         // it; the exact pidfd wait below still observes the terminal status.
-        Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(nix::errno::Errno::ESRCH) => {
+            handle.expect_stop();
+            Ok(())
+        }
         Err(nix::errno::Errno::EIO) if status != PTRACE_EVENT_EXIT_STOP => Ok(()),
         Err(error) => Err(Errno::new(error as i32).into()),
     }
@@ -5126,6 +5264,9 @@ fn wait_sync_for_policy(
                         }
                     };
                     event.update_sync_status(status);
+                    if may_end_other_stops(status) {
+                        probe_legacy_workers(Some(identity.snapshot.tgid));
+                    }
                     #[cfg(test)]
                     let pause = SYNC_STATUS_PUBLICATION_PAUSES.lock().remove(&pid);
                     #[cfg(test)]
@@ -6704,7 +6845,10 @@ impl TerminalCleanup {
             .event
             .identity()
             .ok_or_else(|| self.registration_error().unwrap_or(Errno::ENODATA))?;
-        identity.pidfd.send_cancellation_signal(signal)
+        let sent = identity.pidfd.send_cancellation_signal(signal);
+        // SIGKILL ends every stop of the group without a ptrace request.
+        self.event.stop_may_have_ended();
+        sent
     }
 
     #[cfg(test)]
