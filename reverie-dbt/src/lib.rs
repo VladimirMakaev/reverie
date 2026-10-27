@@ -609,6 +609,22 @@ impl std::fmt::Display for UnsupportedSignalTransformation {
 
 impl std::error::Error for UnsupportedSignalTransformation {}
 
+enum GuestRpc<'a, T: Tool> {
+    // Keep the compatibility adapter inline: a guest returned by `new`
+    // cannot borrow a temporary adapter from that constructor.
+    Runtime(DbtGlobal<'a, T>),
+    Borrowed(&'a dyn GlobalRPC<T::GlobalState>),
+}
+
+impl<T: Tool> GuestRpc<'_, T> {
+    fn endpoint(&self) -> &dyn GlobalRPC<T::GlobalState> {
+        match self {
+            Self::Runtime(rpc) => rpc,
+            Self::Borrowed(rpc) => *rpc,
+        }
+    }
+}
+
 /// In-process guest state passed to a Reverie tool handler.
 pub struct DbtGuest<'a, T>
 where
@@ -620,8 +636,7 @@ where
     ppid: Option<Pid>,
     branch_count: u64,
     thread_state: &'a mut T::ThreadState,
-    global_state: &'a T::GlobalState,
-    config: &'a <T::GlobalState as GlobalTool>::Config,
+    rpc: GuestRpc<'a, T>,
     invoke_syscall: SyscallInvoker,
     read_registers: RegisterReader,
     write_registers: RegisterWriter,
@@ -653,6 +668,74 @@ where
         read_registers: RegisterReader,
         write_registers: RegisterWriter,
     ) -> Self {
+        Self::from_rpc(
+            context,
+            tid,
+            pid,
+            ppid,
+            branch_count,
+            thread_state,
+            GuestRpc::Runtime(DbtGlobal {
+                tid,
+                global_state,
+                config,
+                guest_rpc: Some((context, invoke_syscall)),
+            }),
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        )
+    }
+
+    /// Creates a guest borrowing the caller's actual global RPC endpoint.
+    ///
+    /// The endpoint supplies configuration and both RPC hooks; no local global
+    /// state is constructed and no ambient coordinator selection is performed.
+    /// It must remain valid for this guest's complete callback, including any
+    /// suspended Tool future, and use this callback's thread and I/O context.
+    ///
+    /// This borrow does not authorize DBT's separate native mapping-capture
+    /// channel. Such captures return [`reverie::MappingCaptureError::Unavailable`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_rpc(
+        context: usize,
+        tid: Pid,
+        pid: Pid,
+        ppid: Option<Pid>,
+        branch_count: u64,
+        thread_state: &'a mut T::ThreadState,
+        rpc: &'a dyn GlobalRPC<T::GlobalState>,
+        invoke_syscall: SyscallInvoker,
+        read_registers: RegisterReader,
+        write_registers: RegisterWriter,
+    ) -> Self {
+        Self::from_rpc(
+            context,
+            tid,
+            pid,
+            ppid,
+            branch_count,
+            thread_state,
+            GuestRpc::Borrowed(rpc),
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_rpc(
+        context: usize,
+        tid: Pid,
+        pid: Pid,
+        ppid: Option<Pid>,
+        branch_count: u64,
+        thread_state: &'a mut T::ThreadState,
+        rpc: GuestRpc<'a, T>,
+        invoke_syscall: SyscallInvoker,
+        read_registers: RegisterReader,
+        write_registers: RegisterWriter,
+    ) -> Self {
         Self {
             context,
             tid,
@@ -660,8 +743,7 @@ where
             ppid,
             branch_count,
             thread_state,
-            global_state,
-            config,
+            rpc,
             invoke_syscall,
             read_registers,
             write_registers,
@@ -775,6 +857,33 @@ where
     }
 }
 
+impl<T: Tool> GuestRpc<'_, T> {
+    fn try_send_rpc_sync(
+        &self,
+        message: <T::GlobalState as GlobalTool>::Request,
+    ) -> Result<<T::GlobalState as GlobalTool>::Response, <T::GlobalState as GlobalTool>::Request>
+    {
+        match self {
+            Self::Borrowed(rpc) => rpc.try_send_rpc_sync(message),
+            Self::Runtime(rpc) => {
+                let Some((context, invoke_syscall)) = rpc.guest_rpc else {
+                    return Err(message);
+                };
+                if !crate::sync_rpc::is_active() {
+                    return Err(message);
+                }
+                Ok(crate::sync_rpc::send_rpc_from_guest::<T::GlobalState>(
+                    context,
+                    invoke_syscall,
+                    rpc.tid,
+                    rpc.config,
+                    message,
+                ))
+            }
+        }
+    }
+}
+
 #[reverie::tool]
 impl<T> GlobalRPC<T::GlobalState> for DbtGuest<'_, T>
 where
@@ -786,19 +895,7 @@ where
     ) -> <T::GlobalState as GlobalTool>::Response {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#121): Review cross-process GlobalState RPC routing.
-        // See `DbtGlobal::send_rpc`: prefer the cross-process coordinator when
-        // one is configured, so fork/exec children share one GlobalState.
-        if crate::sync_rpc::is_active() {
-            crate::sync_rpc::send_rpc_from_guest::<T::GlobalState>(
-                self.context,
-                self.invoke_syscall,
-                self.tid,
-                self.config,
-                message,
-            )
-        } else {
-            self.global_state.receive_rpc(self.tid, message).await
-        }
+        self.rpc.endpoint().send_rpc(message).await
     }
 
     fn try_send_rpc_sync(
@@ -806,20 +903,11 @@ where
         message: <T::GlobalState as GlobalTool>::Request,
     ) -> Result<<T::GlobalState as GlobalTool>::Response, <T::GlobalState as GlobalTool>::Request>
     {
-        if !crate::sync_rpc::is_active() {
-            return Err(message);
-        }
-        Ok(crate::sync_rpc::send_rpc_from_guest::<T::GlobalState>(
-            self.context,
-            self.invoke_syscall,
-            self.tid,
-            self.config,
-            message,
-        ))
+        self.rpc.try_send_rpc_sync(message)
     }
 
     fn config(&self) -> &<T::GlobalState as GlobalTool>::Config {
-        self.config
+        self.rpc.endpoint().config()
     }
 }
 
@@ -888,7 +976,12 @@ where
         &self,
         prepared: reverie::PreparedMappingCapture<<T::GlobalState as GlobalTool>::Request>,
     ) -> Result<<T::GlobalState as GlobalTool>::Response, reverie::MappingCaptureError> {
-        mapping_capture::execute::<T>(self.context, self.tid, self.config, prepared)
+        match &self.rpc {
+            GuestRpc::Runtime(rpc) => {
+                mapping_capture::execute::<T>(self.context, self.tid, rpc.config, prepared)
+            }
+            GuestRpc::Borrowed(_) => Err(reverie::MappingCaptureError::Unavailable),
+        }
     }
 
     fn runtime_private_memory_is_current(
@@ -2807,6 +2900,8 @@ pub unsafe extern "C" fn reverie_dbt_runtime_totals(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod rpc_owner;
 
     /// A word of `stack`, as if it started at address 0x1000.
     fn word_of(stack: &[u64]) -> impl Fn(u64) -> Option<u64> + '_ {

@@ -21,6 +21,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use reverie::Error;
+use reverie::GlobalRPC;
 use reverie::Guest;
 use reverie::MappingCaptureError;
 use reverie::MappingCaptureIdentity;
@@ -139,6 +140,31 @@ fn prepared(root: i32) -> PreparedMappingCapture<()> {
     PreparedMappingCapture::new(token, private, ()).expect("valid prepared equality bindings")
 }
 
+struct UnrelatedRpc;
+
+#[reverie::tool]
+impl GlobalRPC<()> for UnrelatedRpc {
+    async fn send_rpc(&self, _message: ()) {
+        panic!("mapping capture must not send an ordinary RPC")
+    }
+
+    fn config(&self) -> &() {
+        &()
+    }
+}
+
+unsafe extern "C" fn unused_syscall(_: usize, _: i64, _: *const u64, _: u32) -> i64 {
+    panic!("mapping capture must not inject a syscall")
+}
+
+unsafe extern "C" fn unused_read_regs(_: usize, _: *mut libc::user_regs_struct) -> i32 {
+    panic!("mapping capture must not read registers")
+}
+
+unsafe extern "C" fn unused_write_regs(_: usize, _: *const libc::user_regs_struct) -> i32 {
+    panic!("mapping capture must not write registers")
+}
+
 fn exercise() {
     assert!(
         CAPTURE.get().is_none(),
@@ -167,6 +193,29 @@ fn exercise() {
         "native-spawn Tool reached native capture"
     );
     assert_eq!(SPAWN_CALLBACKS.load(Ordering::SeqCst), 0);
+
+    let mut state = ();
+    let guest = crate::DbtGuest::<ManagedProbe>::new_with_rpc(
+        CONTEXT,
+        tid,
+        tid,
+        None,
+        0,
+        &mut state,
+        &UnrelatedRpc,
+        unused_syscall,
+        unused_read_regs,
+        unused_write_regs,
+    );
+    assert_eq!(
+        guest.try_mapping_capture(prepared(root)),
+        Err(MappingCaptureError::Unavailable)
+    );
+    assert_eq!(
+        CALLS.load(Ordering::SeqCst),
+        0,
+        "borrowed RPC incorrectly authorized the native primary channel"
+    );
 
     assert_eq!(
         execute::<ManagedProbe>(CONTEXT, tid, &(), prepared(root)),
