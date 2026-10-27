@@ -1219,12 +1219,35 @@ fn serve(
                 if stopping {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                wait_for_connection(&listener, ACCEPT_WAIT);
             }
             Err(error) => return Err(error),
         }
     }
     collector.take()?.finish()
+}
+
+/// The longest `serve` waits for a connection before it checks `stop` again:
+/// how promptly a finished run's collector notices it is done.
+const ACCEPT_WAIT: Duration = Duration::from_millis(1);
+
+/// Waits until `listener` has a connection to accept, or `timeout` passes.
+/// The guest's runtime sends each tracing record as its own connection and
+/// waits for that record's acknowledgement (native/client.c), so the
+/// collector must accept a connection the moment it arrives. Sleeping a fixed
+/// millisecond instead cost every record up to that millisecond, and much
+/// longer on a loaded host, which for a guest that emits thousands of
+/// records made the collection, not the guest, the run's cost. Any error
+/// (`EINTR` among them) just ends the wait; the caller's `accept` decides.
+fn wait_for_connection(listener: &UnixListener, timeout: Duration) {
+    let mut descriptor = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: one valid pollfd, which poll only writes `revents` of.
+    unsafe { libc::poll(&mut descriptor, 1, timeout) };
 }
 
 fn handle_connection(
@@ -3680,5 +3703,64 @@ mod tests {
         assert!(final_write < seal);
         assert!(seal < client_registration);
         assert!(!main[seal..].contains("runtime_callbacks_page.value."));
+    }
+}
+
+#[cfg(test)]
+mod serve_tests {
+    use super::*;
+
+    /// A session whose collector is serving, for this process as the root.
+    fn started_session() -> (File, EvidenceSession) {
+        let file = tempfile::tempfile().unwrap();
+        let session = EvidenceSession::new(&file, None).unwrap();
+        session.claim_run().unwrap();
+        session.publish_root(std::process::id()).unwrap();
+        session.start().unwrap();
+        (file, session)
+    }
+
+    /// The collector's abstract socket address, from the client arguments.
+    fn session_address(session: &EvidenceSession) -> SocketAddr {
+        let hex = session.client_arguments()[1].clone();
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+            .collect();
+        SocketAddr::from_abstract_name(&bytes).unwrap()
+    }
+
+    /// An idle collector notices `finish` and stops: its wait for a
+    /// connection is bounded (`ACCEPT_WAIT`), never an indefinite block.
+    #[test]
+    fn an_idle_collector_stops_promptly_at_finish() {
+        let (_file, session) = started_session();
+        std::thread::sleep(Duration::from_millis(20));
+        let begin = Instant::now();
+        let _ = session.finish(false);
+        let took = begin.elapsed();
+        assert!(took < Duration::from_secs(5), "finish took {took:?}");
+    }
+
+    /// The collector answers each connection, one after another, as the
+    /// guest's runtime makes them: here a header with the wrong token, which
+    /// it refuses with 1 and keeps serving.
+    #[test]
+    fn the_collector_answers_connections_one_after_another() {
+        let (_file, session) = started_session();
+        let address = session_address(&session);
+        let mut header = [0_u8; CHANNEL_HEADER_LEN];
+        header[..8].copy_from_slice(CHANNEL_MAGIC);
+        for round in 0..50 {
+            let mut stream = UnixStream::connect_addr(&address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.write_all(&header).unwrap();
+            let mut answer = [9_u8; 1];
+            stream.read_exact(&mut answer).unwrap();
+            assert_eq!(answer, [1], "round {round}");
+        }
+        let _ = session.finish(false);
     }
 }
