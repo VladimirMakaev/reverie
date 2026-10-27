@@ -230,6 +230,61 @@ const SHARED_INPUTS_051: &[SourceRow] = &[
     ),
 ];
 
+// Complete 0.5.4 cohort: only the two manifests' version fields differ
+// from SHARED_INPUTS_051. All eight Rust sources and geometry stay exact.
+const SHARED_INPUTS_054: &[SourceRow] = &[
+    (
+        "reverie-inguest/Cargo.toml",
+        5569,
+        "0050a4e99fec9666cd297123bf298e19db712734e97cd97bd7b227114b826c50",
+    ),
+    (
+        "reverie-inguest/src/lib.rs",
+        11734,
+        "0fbf94503eac27b65e52967c11c675e23e7a2f50338ca32150002ff4c64fabbf",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/mod.rs",
+        2093,
+        "f6764939d2016bd3c9414b17b35f21f8cf7217f128135b83cfb5459aa3ae5e1e",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/mod.rs",
+        4853,
+        "369e35bcafda51a271720507dcf7a7c9072fb5db7486e110e14f15e4df91f0dd",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/abi.rs",
+        12171,
+        "f7de3cd3a0653785f8aacc01e0fabdeb89172b2660f07ea0df9d393078299aab",
+    ),
+    (
+        "reverie-inguest/src/private_runtime/tls/layout.rs",
+        499,
+        "8fcceedb234c081b5125d95d73eaafa083fadc2d1be41698b724487ab7cfae36",
+    ),
+    (
+        "reverie-loader/Cargo.toml",
+        343,
+        "0ebb8a376d4c8b6637d5058d76ad7bf9b3fcecea3deb474065e41a1707f7cc23",
+    ),
+    (
+        "reverie-loader/src/lib.rs",
+        1510,
+        "b3318334635e632a23283c1f51633b090eb809de9710ab0c98038b684abbb5b8",
+    ),
+    (
+        "reverie-loader/src/musl_tls.rs",
+        7478,
+        "84011bb8505fa3357908e7445b1305f54303bae32ddb9d393546da8e309ee1ea",
+    ),
+    (
+        "reverie-loader/src/mapped_inputs.rs",
+        17803,
+        "81cd7474215ff617fb1bc16b236461d4deb33697c7d559130f4bdb98b0f0e2c2",
+    ),
+];
+
 fn classify(observed: &[(String, u64, String)]) -> Result<Variant> {
     let same = |expected: &[SourceRow]| {
         observed.len() == expected.len()
@@ -242,11 +297,13 @@ fn classify(observed: &[(String, u64, String)]) -> Result<Variant> {
         same(SHARED),
         same(SHARED_INPUTS),
         same(SHARED_INPUTS_051),
+        same(SHARED_INPUTS_054),
     ) {
-        (true, false, false, false) => Ok(Variant::LegacyInguest),
-        (false, true, false, false) | (false, false, true, false) | (false, false, false, true) => {
-            Ok(Variant::SharedLoader)
-        }
+        (true, false, false, false, false) => Ok(Variant::LegacyInguest),
+        (false, true, false, false, false)
+        | (false, false, true, false, false)
+        | (false, false, false, true, false)
+        | (false, false, false, false, true) => Ok(Variant::SharedLoader),
         _ => Err("runtime TLS sources are not one complete reviewed tuple".into()),
     }
 }
@@ -337,6 +394,54 @@ mod tests {
         let mut duplicate = expected;
         duplicate.push(duplicate[0].clone());
         assert!(classify(&duplicate).is_err());
+    }
+    // Fixed version-only declaration controls; no runtime filename authority.
+    fn development_054_rows() -> Vec<(String, u64, String)> {
+        let mut observed = rows(SHARED_INPUTS_051);
+        observed[0].2 = "0050a4e99fec9666cd297123bf298e19db712734e97cd97bd7b227114b826c50".into();
+        observed[6].2 = "0ebb8a376d4c8b6637d5058d76ad7bf9b3fcecea3deb474065e41a1707f7cc23".into();
+        observed
+    }
+    #[test]
+    fn tls_source_declarations_select_complete_054_without_mixed_versions() {
+        assert_eq!(
+            classify(&development_054_rows()).unwrap(),
+            Variant::SharedLoader
+        );
+        for historical in [SHARED_INPUTS, SHARED_INPUTS_051] {
+            for index in [0, 6] {
+                let mut partial = development_054_rows();
+                partial[index] = rows(historical)[index].clone();
+                assert!(classify(&partial).is_err(), "mixed manifest row {index}");
+            }
+        }
+        for index in [1, 2, 3, 4, 5, 7, 8, 9] {
+            assert_eq!(SHARED_INPUTS_054[index], SHARED_INPUTS_051[index]);
+        }
+    }
+    #[test]
+    fn tls_source_declarations_refuse_each_missing_changed_or_duplicate_054_row() {
+        let expected = development_054_rows();
+        for index in 0..expected.len() {
+            let mut missing = expected.clone();
+            missing.remove(index);
+            assert!(classify(&missing).is_err(), "missing row {index}");
+            let mut changed = expected.clone();
+            changed[index].2.replace_range(..1, "x");
+            assert!(classify(&changed).is_err(), "changed digest row {index}");
+            let mut size = expected.clone();
+            size[index].1 += 1;
+            assert!(classify(&size).is_err(), "changed size row {index}");
+            let mut path = expected.clone();
+            path[index].0.push_str(".unreviewed");
+            assert!(classify(&path).is_err(), "changed path row {index}");
+        }
+        let mut duplicate = expected.clone();
+        duplicate.push(duplicate[0].clone());
+        assert!(classify(&duplicate).is_err());
+        let mut extra = expected;
+        extra.push(("unreviewed.rs".into(), 1, "0".repeat(64)));
+        assert!(classify(&extra).is_err());
     }
     // Numeric declaration controls only, not authenticated-source positives.
     #[test]

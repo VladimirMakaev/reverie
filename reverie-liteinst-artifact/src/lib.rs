@@ -767,8 +767,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 57] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/tls_sources.rs",
-        15895,
-        "2e8c776411de4ecc9937bd340420185e8786f770eb96a2c8390504bfea9b0705",
+        19927,
+        "d7bc03dd3fa432f406977a02d5fe58628cc656aca26d2bb921d22e69094348b6",
     ),
     (
         "Cargo.toml",
@@ -778,7 +778,7 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 57] = [
     (
         "reverie-liteinst-artifact/Cargo.toml",
         518,
-        "9115b87c568b997424bb222ff2453bd4566154a70296e7ec7f16b0cb6efc9285",
+        "a72a78974cb63771bc1be6c2fa726b5f2b0126f84aa491bc57474470615887e0",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/view_site.rs",
@@ -863,7 +863,7 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 57] = [
     (
         "reverie-inguest/Cargo.toml",
         5569,
-        "71e2a295a5f59e3c129247c91b9beb84d19a07b0148153c884449af37d082aa7",
+        "0050a4e99fec9666cd297123bf298e19db712734e97cd97bd7b227114b826c50",
     ),
     (
         "reverie-inguest/src/lib.rs",
@@ -873,7 +873,7 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 57] = [
     (
         "reverie-syscalls/Cargo.toml",
         1293,
-        "41d0e825558f8491ddaa06ec8eaf2afc0e79e1a53245131fef1662c26749c6a6",
+        "c1332d9c08bf2003027298132602fe4846a5b9662af9c650e12a04c777e38bb3",
     ),
     (
         "reverie-syscalls/src/lib.rs",
@@ -898,7 +898,7 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 57] = [
     (
         "reverie-liteinst/Cargo.toml",
         5330,
-        "fc279871c9080a72f399090a16d08ab0ffb298301bf992375a46da0d844d8f14",
+        "e7b3c9b460a9e9eb358284f9f41615847c0f1cd3d0f2594aaa556b343cdd408c",
     ),
     (
         "reverie-liteinst/src/lib.rs",
@@ -908,7 +908,7 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 57] = [
     (
         "reverie-liteinst-preload/Cargo.toml",
         916,
-        "bb955ebff9395a9beeae17dfc90894393ea1275578b87475ed4621b4cbfb5aa6",
+        "c73713a62257f63df8b4df482f41ac9f6e823e41cea949954c34e12abd5f5d32",
     ),
     (
         "reverie-liteinst-preload/src/lib.rs",
@@ -973,7 +973,7 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 57] = [
     (
         "reverie/Cargo.toml",
         2373,
-        "46ebd1bba6d231683df7ec46e6b4e8c856e3822bba24fe2ec3f57b01f77c984b",
+        "a45d88309f3cd555e1840465d635e1dfd6713ef4cf5f7012816068610a31e651",
     ),
     (
         "reverie/src/lib.rs",
@@ -1407,18 +1407,18 @@ fn compiled_library_package(
         "compiled metadata source differs from full pin",
     )?;
     require(
-        p["version"] == "0.5.1",
+        p["version"] == "0.5.4",
         "compiled Reverie package version differs",
     )?;
     let id = match source {
         Some(source) => format!(
-            "{}#{name}@0.5.1",
+            "{}#{name}@0.5.4",
             source
                 .rsplit_once('#')
                 .ok_or("compiled Git source lacks revision")?
                 .0
         ),
-        None => format!("path+file://{}#0.5.1", root.join(name).display()),
+        None => format!("path+file://{}#0.5.4", root.join(name).display()),
     };
     require(
         p["id"] == id,
@@ -1511,12 +1511,12 @@ fn compiled_leaf_package(
     let expected_id = match image_kind {
         FixedImageKind::Standalone => match source {
             Some(source) => format!(
-                "{}#reverie-liteinst-preload@0.5.1",
+                "{}#reverie-liteinst-preload@0.5.4",
                 source.rsplit_once('#').unwrap().0
             ),
-            None => format!("path+file://{}#0.5.1", rv_root.join(name).display()),
+            None => format!("path+file://{}#0.5.4", rv_root.join(name).display()),
         },
-        FixedImageKind::Detcore => format!("path+file://{}#0.5.1", root.join(name).display()),
+        FixedImageKind::Detcore => format!("path+file://{}#0.5.4", root.join(name).display()),
     };
     require(
         leaf.id == expected_id,
@@ -1550,11 +1550,11 @@ fn content_package(
         "content metadata manifest differs from exact compiler spelling",
     )?;
     require(
-        raw["source"].as_str() == Some(source) && raw["version"] == "0.5.1",
+        raw["source"].as_str() == Some(source) && raw["version"] == "0.5.4",
         "content metadata source/version differs from full pin",
     )?;
     let id = format!(
-        "{}#{name}@0.5.1",
+        "{}#{name}@0.5.4",
         source
             .rsplit_once('#')
             .ok_or("content Git source lacks revision")?
@@ -1724,7 +1724,7 @@ fn content_detcore_manifest_and_lock_pin(
         selected.len() == 1
             && selected[0]["manifest_path"].as_str()
                 == root.join("detcore-liteinst/Cargo.toml").to_str()
-            && selected[0]["version"] == "0.5.1"
+            && selected[0]["version"] == "0.5.4"
             && selected[0]["source"].is_null(),
         "content Detcore leaf manifest/version/source differs",
     )?;
@@ -1776,7 +1776,7 @@ fn content_detcore_manifest_and_lock_pin(
                     .lines()
                     .filter(|line| line.starts_with("version = "))
                     .collect::<Vec<_>>()
-                    == ["version = \"0.5.1\""],
+                    == ["version = \"0.5.4\""],
             format!("content Detcore lock source/version differs: {name}"),
         )?;
     }
@@ -1795,7 +1795,7 @@ fn content_detcore_manifest_and_lock_pin(
                 .lines()
                 .filter(|line| line.starts_with("version = "))
                 .collect::<Vec<_>>()
-                == ["version = \"0.5.1\""],
+                == ["version = \"0.5.4\""],
         "content Detcore local lock entry differs",
     )
 }
@@ -29367,8 +29367,8 @@ mod tests {
             };
             let raw_manifest = logical_root.join(name).join("Cargo.toml");
             let raw_target = logical_root.join(&relative_target);
-            let valid = serde_json::json!({"packages": [{"name":name, "version":"0.5.1",
-                "id":format!("{}#{name}@0.5.1", source.rsplit_once('#').unwrap().0), "source":source,
+            let valid = serde_json::json!({"packages": [{"name":name, "version":"0.5.4",
+                "id":format!("{}#{name}@0.5.4", source.rsplit_once('#').unwrap().0), "source":source,
                 "manifest_path":raw_manifest, "targets":[{"name":target, "kind":kind, "crate_types":kind, "src_path":raw_target}]}]});
             let selected = content_package(&valid, name, target, kind, &binding, &source).unwrap();
             assert_eq!(
@@ -29378,6 +29378,16 @@ mod tests {
             for (field, value) in [
                 ("name", serde_json::json!("lookalike")),
                 ("version", serde_json::json!("0.4.0")),
+                ("version", serde_json::json!("0.5.1")),
+                (
+                    "id",
+                    serde_json::json!(
+                        valid["packages"][0]["id"]
+                            .as_str()
+                            .unwrap()
+                            .replace("@0.5.4", "@0.5.1")
+                    ),
+                ),
                 ("id", serde_json::json!("wrong-package-id")),
                 (
                     "source",
@@ -29611,9 +29621,9 @@ mod tests {
         ]
         .into_iter()
         .map(|name| {
-            format!("[[package]]\nname = \"{name}\"\nversion = \"0.5.1\"\nsource = \"{source}\"\n")
+            format!("[[package]]\nname = \"{name}\"\nversion = \"0.5.4\"\nsource = \"{source}\"\n")
         })
-        .chain(["[[package]]\nname = \"detcore-liteinst\"\nversion = \"0.5.1\"\n".into()])
+        .chain(["[[package]]\nname = \"detcore-liteinst\"\nversion = \"0.5.4\"\n".into()])
         .collect::<String>();
         fs::write(&lock, &lock_bytes).unwrap();
         let dependencies = [
@@ -29631,8 +29641,8 @@ mod tests {
         })
         .collect::<Vec<_>>();
         let runtime = serde_json::json!({"workspace_root":root,"packages":[{
-            "name":"detcore-liteinst", "version":"0.5.1",
-            "id":format!("path+file://{}#0.5.1",root.join("detcore-liteinst").display()),
+            "name":"detcore-liteinst", "version":"0.5.4",
+            "id":format!("path+file://{}#0.5.4",root.join("detcore-liteinst").display()),
             "source":null,"manifest_path":root.join("detcore-liteinst/Cargo.toml"),
             "dependencies":dependencies,"targets":[{"name":"detcore_liteinst","kind":["cdylib"],
                 "crate_types":["cdylib"],"src_path":root.join("detcore-liteinst/src/lib.rs")}]
@@ -29730,6 +29740,7 @@ mod tests {
         for (field, value) in [
             ("name", serde_json::json!("reverie-liteinst-preload")),
             ("version", serde_json::json!("0.4.1")),
+            ("version", serde_json::json!("0.5.1")),
             ("source", serde_json::json!(source)),
             (
                 "manifest_path",
@@ -29749,7 +29760,7 @@ mod tests {
             (
                 "id",
                 serde_json::json!(format!(
-                    "path+file://{}#0.5.1",
+                    "path+file://{}#0.5.4",
                     root.join("elsewhere/detcore-liteinst").display()
                 )),
             ),
@@ -29813,11 +29824,17 @@ mod tests {
             lock_bytes.replacen("name = \"reverie-core\"", "name = \"lookalike\"", 1),
             lock_bytes.replacen("?rev=", "?rev=wrong", 1),
             lock_bytes.replacen('#', "#wrong", 1),
-            lock_bytes.replacen("version = \"0.5.1\"", "version = \"0.4.0\"", 1),
+            lock_bytes.replacen("version = \"0.5.4\"", "version = \"0.4.0\"", 1),
+            lock_bytes.replacen("version = \"0.5.4\"", "version = \"0.5.1\"", 1),
             lock_bytes.replacen("name = \"detcore-liteinst\"", "name = \"lookalike\"", 1),
             lock_bytes.replacen(
-                "name = \"detcore-liteinst\"\nversion = \"0.5.1\"",
+                "name = \"detcore-liteinst\"\nversion = \"0.5.4\"",
                 "name = \"detcore-liteinst\"\nversion = \"0.4.1\"",
+                1,
+            ),
+            lock_bytes.replacen(
+                "name = \"detcore-liteinst\"\nversion = \"0.5.4\"",
+                "name = \"detcore-liteinst\"\nversion = \"0.5.1\"",
                 1,
             ),
             format!("{lock_bytes}{lock_bytes}"),
@@ -30001,7 +30018,7 @@ mod tests {
         assert!(runner.commands.is_empty());
         let source = format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{pin}");
         let git_id = |name: &str| {
-            format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{name}@0.5.1")
+            format!("git+https://github.com/rrnewton/reverie.git?rev={pin}#{name}@0.5.4")
         };
         let package = |name: &str, target: &str, kind: &[&str], git: bool, version: &str| {
             serde_json::json!({
@@ -30024,7 +30041,7 @@ mod tests {
         ] {
             for git in [false, true] {
                 let valid =
-                    serde_json::json!({"packages": [package(name, target, kind, git, "0.5.1")]});
+                    serde_json::json!({"packages": [package(name, target, kind, git, "0.5.4")]});
                 let expected_source = git.then_some(source.as_str());
                 compiled_library_package(&valid, name, target, kind, &root, expected_source)
                     .unwrap();
@@ -30040,6 +30057,16 @@ mod tests {
                 let mutations = [
                     ("name", serde_json::json!("lookalike")),
                     ("version", serde_json::json!("0.4.0")),
+                    ("version", serde_json::json!("0.5.1")),
+                    (
+                        "id",
+                        serde_json::json!(
+                            valid["packages"][0]["id"]
+                                .as_str()
+                                .unwrap()
+                                .replace("0.5.4", "0.5.1")
+                        ),
+                    ),
                     ("id", serde_json::json!("same-name-wrong-source")),
                     (
                         "source",
@@ -30129,13 +30156,13 @@ mod tests {
                 FixedImageKind::Standalone,
                 "reverie-liteinst-preload",
                 "reverie_liteinst_preload",
-                "0.5.1",
+                "0.5.4",
             ),
             (
                 FixedImageKind::Detcore,
                 "detcore-liteinst",
                 "detcore_liteinst",
-                "0.5.1",
+                "0.5.4",
             ),
         ] {
             for git in [false, true] {
@@ -30143,6 +30170,15 @@ mod tests {
                 let expected_source = git.then_some(source.as_str());
                 compiled_leaf_package(&valid, &root, &root, expected_source, image).unwrap();
                 for (field, value) in [
+                    (
+                        "id",
+                        serde_json::json!(
+                            valid["packages"][0]["id"]
+                                .as_str()
+                                .unwrap()
+                                .replace("0.5.4", "0.5.1")
+                        ),
+                    ),
                     ("id", serde_json::json!("wrong-leaf-id")),
                     ("source", serde_json::json!("wrong-leaf-source")),
                     (
@@ -50607,13 +50643,13 @@ pub mod private_static {
                 require(rows.len() == 1, "static metadata leaf ambiguous")?;
                 let leaf = rows[0];
                 let id = format!(
-                    "path+file://{}#0.5.1",
+                    "path+file://{}#0.5.4",
                     expected.workspace.join("detcore-liteinst").display()
                 );
                 require(
                     leaf["id"] == id
                         && leaf["source"].is_null()
-                        && leaf["version"] == "0.5.1"
+                        && leaf["version"] == "0.5.4"
                         && leaf["manifest_path"].as_str() == manifest.to_str(),
                     "static leaf package identity mismatch",
                 )?;
