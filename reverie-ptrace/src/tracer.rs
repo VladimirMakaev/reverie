@@ -4876,6 +4876,18 @@ mod tests {
     /// `FatalTool` config for the timer-decoded fork control.
     const FATAL_TIMER_FORK_MODE: u8 = 4;
 
+    /// The syscall a guest's `libc::pause()` waits in, as procfs's
+    /// `/proc/<pid>/syscall` names it. aarch64 has no `pause`, and glibc's
+    /// wrapper there calls `ppoll(NULL, 0, NULL, NULL)` instead
+    /// (sysdeps/unix/sysv/linux/pause.c, since glibc 2.26:
+    /// https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/unix/sysv/linux/pause.c;hb=glibc-2.39).
+    /// An older glibc used `rt_sigsuspend` there, which this never matches,
+    /// so the wait below would time out rather than pass.
+    #[cfg(target_arch = "x86_64")]
+    const LIBC_PAUSE_SYSCALL: i64 = libc::SYS_pause;
+    #[cfg(not(target_arch = "x86_64"))]
+    const LIBC_PAUSE_SYSCALL: i64 = libc::SYS_ppoll;
+
     #[derive(Default)]
     struct FatalTool {
         starts: std::sync::atomic::AtomicUsize,
@@ -4953,7 +4965,7 @@ mod tests {
                         .ok()
                         .and_then(|text| text.split_whitespace().next().map(str::to_owned))
                         .and_then(|value| value.parse::<i64>().ok())
-                        == Some(libc::SYS_pause);
+                        == Some(LIBC_PAUSE_SYSCALL);
                     if ready && paused {
                         break;
                     }
