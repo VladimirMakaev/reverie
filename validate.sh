@@ -770,6 +770,10 @@ run_check "Build workspace" cargo build --workspace --all-features
 run_check "LiteInst allocator fixtures" build_liteinst_allocator_fixtures
 run_check "DBT virtual identity and pidfd_open policy" \
     "$ROOT_DIR/reverie-dbt/scripts/test-identity-policy.sh"
+run_check "DBT Counter2 caller artifact and standalone gates" \
+    "$ROOT_DIR/reverie-dbt/scripts/build-client.sh" \
+    --caller-manifest "$ROOT_DIR/reverie-examples/counter2-dbt-runtime/Cargo.toml" \
+    --profile debug --jobs 8 --check
 # The counted runner accepts only a command that starts with `cargo test`, so
 # the fixture paths reach the tests through the environment rather than an
 # `env NAME=VALUE` prefix. They are exported for this step alone.

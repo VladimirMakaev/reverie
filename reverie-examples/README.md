@@ -26,6 +26,26 @@ This implementation of the tool uses a *distributed* notion of state,
 maintaining a per-thread, per-process, and global state. Basically, this is
 an example of "MapReduce" style tracing of a process tree.
 
+The default thread report goes through the Tool's GlobalState, so a coordinated
+caller can report even after the guest closes stderr. The process contributes
+its totals once; a thread report does not add them again.
+
+The public DBT command uses the same CounterLocal Tool in an explicit caller
+artifact. Produce it for the same Cargo profile as the command:
+
+```bash
+reverie-dbt/scripts/build-client.sh \
+  --caller-manifest reverie-examples/counter2-dbt-runtime/Cargo.toml \
+  --profile debug --jobs 8 --check
+target/debug/counter2 --backend dbt -- /bin/echo hello
+```
+
+`--dbt-artifact` or `REVERIE_DBT_CALLER_ARTIFACT` selects a different verified
+manifest. An invalid override fails without fallback. Ptrace remains the
+default backend. This DBT caller retains its existing initial-process/thread
+limits. The separate legacy exact frontend and benchmark still use their
+explicit runtime reporter; they have not been migrated to this caller.
+
 # noop: Identity Function Tool
 
 This instrumentation tool intercepts events but does nothing with them. It is

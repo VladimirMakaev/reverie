@@ -8,7 +8,7 @@
 
 //! End-to-end checks for the exact example `Tool` types on LiteInst, with
 //! Counter1 allocator coverage through the shared backend launcher.
-//! DBT Counter1 and Strace require their explicit caller producers for the
+//! DBT Counter1, Counter2, and Strace require their explicit caller producers for the
 //! same Cargo profile; they use the standard manifest layout. The separate
 //! Counter1 local-Global case requires the no-argument prototype producer
 //! `reverie-dbt/scripts/build-client.sh`, or `REVERIE_DBT_CLIENT`.
@@ -422,6 +422,91 @@ fn exact_counter2_tool_reports_process_and_thread_totals() {
         summary.ends_with("from 1 processes, 1 thread(s)."),
         "{stderr}"
     );
+}
+
+fn counter2_reports_exit_after_echo_closes_stdio(backend: &str) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_counter2"));
+    command.args(["--backend", backend, "--", "/bin/echo", "hello"]);
+    let output = output_with_timeout(&mut command);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"hello\n");
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    let reports = stderr
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            line.strip_prefix("counter2-local thread=")
+                .map(|report| (index, report))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(reports.len(), 1, "{stderr}");
+    let (tid, count) = reports[0]
+        .1
+        .split_once(" syscalls=")
+        .expect("counter2 thread report has no syscall count");
+    assert!(tid.parse::<i32>().unwrap() > 0, "{stderr}");
+    let count = count.parse::<u64>().unwrap();
+    assert!(count > 0, "{stderr}");
+
+    let summaries = stderr
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            line.strip_prefix(" [counter tool] Total system calls in process tree: ")
+                .map(|summary| (index, summary))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(summaries.len(), 1, "{stderr}");
+    let (total, details) = summaries[0]
+        .1
+        .split_once(", from ")
+        .expect("counter2 total has no process details");
+    assert_eq!(details, "1 processes, 1 thread(s).", "{stderr}");
+    assert_eq!(total.parse::<u64>().unwrap(), count, "{stderr}");
+    assert!(reports[0].0 < summaries[0].0, "{stderr}");
+}
+
+#[test]
+fn ptrace_counter2_reports_exit_after_echo_closes_stdio() {
+    counter2_reports_exit_after_echo_closes_stdio("ptrace");
+}
+
+#[test]
+fn dbt_counter2_reports_exit_after_echo_closes_stdio() {
+    counter2_reports_exit_after_echo_closes_stdio("dbt");
+}
+
+#[test]
+fn dbt_counter2_bad_override_never_uses_the_valid_default_pair() {
+    let default = Path::new(env!("CARGO_BIN_EXE_counter2"))
+        .parent()
+        .unwrap()
+        .join("reverie-dbt-callers/counter2/manifest.json");
+    reverie_dbt::CallerArtifact::load(&default).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let malformed = directory.path().join("malformed.json");
+    std::fs::write(&malformed, b"{}").unwrap();
+    for path in [directory.path().join("missing.json"), malformed] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_counter2"));
+        command.env("REVERIE_DBT_CALLER_ARTIFACT", &path).args([
+            "--backend",
+            "dbt",
+            "--",
+            "/bin/echo",
+            "hello",
+        ]);
+        let output = output_with_timeout(&mut command);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("cannot load DBT caller artifact"),
+            "{stderr}"
+        );
+        assert!(stderr.contains(path.to_str().unwrap()), "{stderr}");
+        assert!(!stderr.contains("counter2-local thread="), "{stderr}");
+    }
 }
 
 #[test]
