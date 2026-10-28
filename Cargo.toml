@@ -40,6 +40,7 @@ members = [
 exclude = [
     "public_autocargo/experimental",
     "reverie-examples/strace-dbt-runtime",
+    "reverie-examples/chrome-trace-dbt-runtime",
     "reverie-examples/counter1-dbt-runtime",
     "reverie-examples/counter2-dbt-runtime",
     "reverie-dbt/tests/fixtures/caller-lifecycle-runtime",

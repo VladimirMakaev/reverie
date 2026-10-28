@@ -14,9 +14,10 @@
 //! The in-guest backends (LiteInst, in-guest-trap, e9patch) host a tool
 //! through a preload that compiles it in: the example preload,
 //! `libreverie_examples.so` (`src/lib.rs`), selects the tool by the name the
-//! caller passes. Counter1 and Strace select verified external DBT caller
+//! caller passes. Counter1, Counter2, Strace and ChromeTrace select verified DBT caller
 //! artifacts through `run_blocking_with_caller`, with the tool's GlobalState
-//! served here by the caller owner. Other examples use DBT's prototype runtime
+//! served here by the caller owner. These callers inherit the CLI's stdin.
+//! Other examples use DBT's prototype runtime
 //! (reverie-dbt), which selects a compiled-in tool by the same name
 //! (`reverie_dbt::TOOL_ENV`) and serves its GlobalState here over DBT's
 //! coordinator socket. SaBRe's
@@ -405,7 +406,7 @@ where
     }
     command.envs(args.envs.iter().cloned());
     let (output, global_state) = runner
-        .output_with_caller_tool::<T::GlobalState>(&command, config)
+        .output_with_inherited_stdin_and_caller_tool::<T::GlobalState>(&command, config)
         .await
         .map_err(|error| {
             if let Some(output) = reverie_dbt::failed_run_output(&error) {

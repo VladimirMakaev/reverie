@@ -8,12 +8,14 @@
 
 //! End-to-end checks for the exact example `Tool` types on LiteInst, with
 //! Counter1 allocator coverage through the shared backend launcher.
-//! DBT Counter1, Counter2, and Strace require their explicit caller producers for the
-//! same Cargo profile; they use the standard manifest layout. The separate
+//! DBT Counter1, Counter2, Strace and ChromeTrace require their explicit caller
+//! producers for the same Cargo profile; they use the standard manifest layout.
+//! The ChromeTrace negative control also requires the basics-noop caller. The separate
 //! Counter1 local-Global case requires the no-argument prototype producer
 //! `reverie-dbt/scripts/build-client.sh`, or `REVERIE_DBT_CLIENT`.
 
 use std::fs::File;
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -641,13 +643,21 @@ fn exact_chrome_trace_tool_writes_process_and_syscall_events() {
         &["/bin/echo", "hello"],
     );
 
-    assert!(output.status.success(), "{output:?}");
-    assert_eq!(output.stdout, b"hello\n");
-    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_chrome_trace_guest_output(&output);
 
     let trace = std::fs::read(&trace_path).unwrap();
     std::fs::remove_file(&trace_path).unwrap();
     let trace: serde_json::Value = serde_json::from_slice(&trace).unwrap();
+    assert_chrome_trace_events(&trace);
+}
+
+fn assert_chrome_trace_guest_output(output: &Output) {
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"hello\n");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+fn assert_chrome_trace_events(trace: &serde_json::Value) {
     let events = trace
         .as_array()
         .expect("chrome trace is not an event array");
@@ -668,6 +678,153 @@ fn exact_chrome_trace_tool_writes_process_and_syscall_events() {
         }),
         "{trace}"
     );
+}
+
+fn chrome_trace_command(backend: &str, trace_path: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_chrome_trace"));
+    command
+        .arg("--backend")
+        .arg(backend)
+        .arg("--preload")
+        .arg(preload())
+        .arg("--out")
+        .arg(trace_path);
+    command
+}
+
+fn chrome_trace_writes_process_and_syscall_events(backend: &str, identity: &str) {
+    let trace_path = std::env::temp_dir().join(format!(
+        "reverie-chrome-trace-{identity}-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&trace_path);
+    let mut command = chrome_trace_command(backend, &trace_path);
+    command.args(["--", "/bin/echo", "hello"]);
+    let output = output_with_timeout(&mut command);
+
+    assert_chrome_trace_guest_output(&output);
+    let trace = std::fs::read(&trace_path).unwrap();
+    let trace: serde_json::Value = serde_json::from_slice(&trace).unwrap();
+    assert_chrome_trace_events(&trace);
+    // Keep the identity-owned trace on failure for diagnosis.
+    std::fs::remove_file(&trace_path).unwrap();
+}
+
+#[test]
+fn ptrace_chrome_trace_tool_writes_process_and_syscall_events() {
+    chrome_trace_writes_process_and_syscall_events(
+        "ptrace",
+        "ptrace_chrome_trace_tool_writes_process_and_syscall_events",
+    );
+}
+
+#[test]
+fn dbt_chrome_trace_tool_writes_process_and_syscall_events() {
+    chrome_trace_writes_process_and_syscall_events(
+        "dbt",
+        "dbt_chrome_trace_tool_writes_process_and_syscall_events",
+    );
+}
+
+fn chrome_trace_preserves_stdin_and_writes_events(backend: &str, identity: &str) {
+    let trace_path = std::env::temp_dir().join(format!(
+        "reverie-chrome-trace-{identity}-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&trace_path);
+    // The standard pipe descriptors are close-on-exec. Close the writer before
+    // spawning so the guest sees EOF after exactly these six bytes.
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    writer.write_all(b"hello\n").unwrap();
+    drop(writer);
+    let mut command = chrome_trace_command(backend, &trace_path);
+    command.stdin(reader).args(["--", "/bin/cat"]);
+    let output = output_with_timeout(&mut command);
+    eprintln!("Chrome trace cat output: {output:?}");
+
+    assert_chrome_trace_guest_output(&output);
+    let trace = std::fs::read(&trace_path).unwrap();
+    let trace: serde_json::Value = serde_json::from_slice(&trace).unwrap();
+    assert_chrome_trace_events(&trace);
+    // Keep the identity-owned trace on failure for diagnosis.
+    std::fs::remove_file(&trace_path).unwrap();
+}
+
+#[test]
+fn ptrace_chrome_trace_preserves_stdin_and_writes_events() {
+    chrome_trace_preserves_stdin_and_writes_events(
+        "ptrace",
+        "ptrace_chrome_trace_preserves_stdin_and_writes_events",
+    );
+}
+
+#[test]
+fn dbt_chrome_trace_preserves_stdin_and_writes_events() {
+    chrome_trace_preserves_stdin_and_writes_events(
+        "dbt",
+        "dbt_chrome_trace_preserves_stdin_and_writes_events",
+    );
+}
+
+#[test]
+fn dbt_chrome_trace_oracle_requires_actual_tool() {
+    let noop = Path::new(env!("CARGO_BIN_EXE_chrome_trace"))
+        .parent()
+        .unwrap()
+        .join("reverie-dbt-callers/basics-noop/manifest.json");
+    reverie_dbt::CallerArtifact::load(&noop).unwrap();
+    let trace_path = std::env::temp_dir().join(format!(
+        "reverie-chrome-trace-dbt_chrome_trace_oracle_requires_actual_tool-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&trace_path);
+    let mut command = chrome_trace_command("dbt", &trace_path);
+    command
+        .arg("--dbt-artifact")
+        .arg(noop)
+        .args(["--", "/bin/echo", "hello"]);
+    let output = output_with_timeout(&mut command);
+    eprintln!("Chrome trace Noop output: {output:?}");
+    // The real Noop Tool must run the guest successfully before it can expose
+    // the event oracle's sensitivity. A caller setup refusal is not evidence.
+    assert_chrome_trace_guest_output(&output);
+    let trace = std::fs::read(&trace_path).unwrap();
+    let trace: serde_json::Value = serde_json::from_slice(&trace).unwrap();
+    eprintln!("Chrome trace Noop events: {trace}");
+    assert!(trace.as_array().unwrap().is_empty(), "{trace}");
+    assert!(std::panic::catch_unwind(|| assert_chrome_trace_events(&trace)).is_err());
+    std::fs::remove_file(&trace_path).unwrap();
+}
+
+#[test]
+fn dbt_chrome_trace_missing_artifact_refuses() {
+    let default = Path::new(env!("CARGO_BIN_EXE_chrome_trace"))
+        .parent()
+        .unwrap()
+        .join("reverie-dbt-callers/chrome-trace/manifest.json");
+    reverie_dbt::CallerArtifact::load(&default).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.json");
+    let trace_path = directory.path().join(format!(
+        "dbt_chrome_trace_missing_artifact_refuses-{}.json",
+        std::process::id()
+    ));
+    let mut command = chrome_trace_command("dbt", &trace_path);
+    command
+        .arg("--dbt-artifact")
+        .arg(&missing)
+        .args(["--", "/bin/echo", "hello"]);
+    let output = output_with_timeout(&mut command);
+    eprintln!("Chrome trace missing-artifact output: {output:?}");
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot load DBT caller artifact"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(missing.to_str().unwrap()), "{stderr}");
+    assert!(!trace_path.exists(), "unexpected artifact: {trace_path:?}");
 }
 
 #[test]

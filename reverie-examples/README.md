@@ -10,6 +10,27 @@ Reverie.
 This tool is like `strace`, but generates a trace file that can be loaded in
 `chrome://tracing/`.
 
+The public DBT command runs the shared ChromeTrace Tool and writes the returned
+GlobalState to `--out`. Produce its caller for the command's Cargo profile:
+
+```bash
+reverie-dbt/scripts/build-client.sh \
+  --caller-manifest reverie-examples/chrome-trace-dbt-runtime/Cargo.toml \
+  --profile debug --jobs 8 --check
+printf 'hello\n' | target/debug/chrome_trace --backend dbt --out trace.json -- /bin/cat
+```
+
+Ptrace remains the default. `--dbt-artifact` or `REVERIE_DBT_CALLER_ARTIFACT`
+selects a verified caller manifest; an invalid selection fails without fallback.
+The shared Counter1, Counter2, Strace and ChromeTrace caller launcher inherits
+stdin. It still forwards captured stdout/stderr after completion, reports
+signal termination as an error, and retains the caller's existing lifecycle
+and private RPC environment limits.
+
+The separate `HERMIT_DBT_CHROME_TRACE` prototype remains an unconverted
+implementation with its existing script consumers. It does not use this
+shared Tool's completed-syscall event path.
+
 # counter1: Reverie Counter Tool (1)
 
 This is a basic example of event counting. It counts the number of system
