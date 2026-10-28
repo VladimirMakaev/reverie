@@ -54927,10 +54927,12 @@ mod tests {
                 why
             );
         }
-        for profile in [25, 85] {
+        // A const table may be instantiated separately at each use. Select
+        // from the actual candidate array, not another promoted table copy.
+        for (profile, selected) in both {
             assert_eq!(
                 fixed_detcore_unique_template("fixed_setup_bitmap_range", &both, why, |t| Ok(
-                    core::ptr::eq(t, &DETCORE_VALIDATE_TEMPLATES[profile])
+                    core::ptr::eq(t, selected)
                 ))
                 .unwrap()
                 .0,
