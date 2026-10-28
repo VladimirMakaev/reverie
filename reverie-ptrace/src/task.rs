@@ -90,6 +90,7 @@ use crate::gdbstub::BreakpointType;
 use crate::gdbstub::CoreRegs;
 use crate::gdbstub::GdbRequest;
 use crate::gdbstub::GdbServer;
+use crate::gdbstub::PassedSignals;
 use crate::gdbstub::ResumeAction;
 use crate::gdbstub::ResumeInferior;
 use crate::gdbstub::StopEvent;
@@ -853,6 +854,15 @@ impl TakenSignal {
     }
 }
 
+/// What gdb chose for a signal it was shown before delivery
+/// (`TracedTask::signal_stop_for_gdb`).
+enum GdbSignalResume {
+    /// Continue, delivering this signal, or none.
+    Continue(Option<AnySignal>),
+    /// Step one instruction, delivering this signal, or none.
+    Step(Option<AnySignal>),
+}
+
 /// The signal a stopped guest resumes with, and, if
 /// `Tool::handle_signal_event` reported it, how its delivery stop took it.
 struct SignalResume {
@@ -866,6 +876,10 @@ struct SignalResume {
     /// (`Guest::set_signal_info`), written when the signal is resumed from a
     /// signal-delivery stop (`resume_with_signal`).
     replacement: Option<(AnySignal, SiginfoBytes)>,
+    /// Whether the thread steps one instruction with `signal` rather than
+    /// continuing: gdb answered the signal's stop with a step
+    /// (`GdbSignalResume::Step`).
+    step: bool,
 }
 
 /// A delivery that `Guest::deliver_signal` approved in the running signal
@@ -4012,6 +4026,9 @@ pub struct TracedTask<L: Tool> {
     /// Where this thread is when another thread is in a gdb stop.
     gdb_view: ThreadView,
 
+    /// The signals gdb asked to have delivered without a stop.
+    gdb_passed_signals: PassedSignals,
+
     /// Notify gdbserver start accepting incoming packets.
     gdbserver_start_tx: Option<oneshot::Sender<()>>,
 
@@ -4162,6 +4179,10 @@ impl<L: Tool> TracedTask<L> {
         let (next_state, next_state_rx) = mpsc::channel(1);
         let (daemonizer, daemonizer_rx) = mpsc::channel(1);
         let (gdb_resume_tx, gdb_resume_rx) = mpsc::channel(1);
+        let gdb_passed_signals = gdbserver
+            .as_ref()
+            .map(|server| server.passed_signals.clone())
+            .unwrap_or_default();
         let (gdb_request_tx, gdb_request_rx) = mpsc::channel(1);
         let (exit_suspend_tx, exit_suspend_rx) = mpsc::channel(16);
         let sigtrap_table = global_state.sigtrap_tables.lock().unwrap().copy(tid, None);
@@ -4242,6 +4263,7 @@ impl<L: Tool> TracedTask<L> {
             gdb_resume_rx: Some(gdb_resume_rx),
             breakpoints: Default::default(),
             gdb_view: ThreadView::default(),
+            gdb_passed_signals: gdb_passed_signals.clone(),
             suspended: Arc::new(AtomicBool::new(false)),
             gdb_request_tx: Some(gdb_request_tx),
             gdb_request_rx: Some(gdb_request_rx),
@@ -4343,6 +4365,7 @@ impl<L: Tool> TracedTask<L> {
             gdb_resume_rx: Some(gdb_resume_rx),
             breakpoints: self.breakpoints.clone(),
             gdb_view: ThreadView::default(),
+            gdb_passed_signals: self.gdb_passed_signals.clone(),
             suspended: Arc::new(AtomicBool::new(false)),
             gdb_request_tx: Some(gdb_request_tx),
             gdb_request_rx: Some(gdb_request_rx),
@@ -4468,6 +4491,7 @@ impl<L: Tool> TracedTask<L> {
                     .clone(),
             )),
             gdb_view: ThreadView::default(),
+            gdb_passed_signals: self.gdb_passed_signals.clone(),
             suspended: Arc::new(AtomicBool::new(false)),
             gdb_request_tx: Some(gdb_request_tx),
             gdb_request_rx: Some(gdb_request_rx),
@@ -6185,7 +6209,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.notify_gdb_stop(StopReason::stopped(
                 task.pid(),
                 self.pid(),
-                StopEvent::Signal(Signal::SIGTRAP),
+                StopEvent::Signal(Signal::SIGTRAP.into()),
                 regs.into(),
             ))
             .await?;
@@ -6237,7 +6261,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         self.notify_gdb_stop(StopReason::stopped(
             task.pid(),
             self.pid(),
-            StopEvent::Signal(Signal::SIGTRAP),
+            StopEvent::Signal(Signal::SIGTRAP.into()),
             regs.into(),
         ))
         .await?;
@@ -6536,6 +6560,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             reported: Some(taken),
             approved: verdict.approved,
             replacement: verdict.replacement,
+            step: false,
         })
     }
 
@@ -6567,6 +6592,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             reported: None,
             approved: false,
             replacement: None,
+            step: false,
         }
     }
 
@@ -6735,6 +6761,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             reported,
             approved,
             replacement,
+            step,
         } = resume;
         // Before a siginfo write below: a write can land on an exit stop the
         // tracee already took (https://github.com/rrnewton/reverie/issues/1091).
@@ -6807,9 +6834,12 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.held_siginfo_written.store(true, Ordering::Relaxed);
             task.setsiginfo_bytes(&bytes)?;
         }
-        self.resume_stopped_any(task, signal)?
-            .next_state_with_owner(&self.ptracer_waits)
-            .await
+        let running = if step {
+            self.step_stopped_any(task, signal)?
+        } else {
+            self.resume_stopped_any(task, signal)?
+        };
+        running.next_state_with_owner(&self.ptracer_waits).await
     }
 
     /// The Tool's verdict on `sig`: `Tool::handle_signal_event` for a signal
@@ -7081,12 +7111,27 @@ impl<L: Tool + 'static> TracedTask<L> {
                 let verdict = self
                     .report_signal(sig, false, taken.map(|taken| taken.bytes))
                     .await?;
-                let signal = verdict.signal;
+                let mut signal = verdict.signal;
+                let mut step = false;
+                // A signal the Tool delivers stops for gdb first, which then
+                // decides what the guest gets. A step with the signal resumes
+                // through `resume_with_signal`, as a continue does, so that
+                // the signal keeps its own siginfo, or the one the callback
+                // chose, and a put-back instance is counted.
+                if let Some(delivered) = signal
+                    && self.stops_for_gdb_at(delivered)
+                {
+                    (signal, step) = match self.signal_stop_for_gdb(&task, delivered).await? {
+                        GdbSignalResume::Continue(chosen) => (chosen, false),
+                        GdbSignalResume::Step(chosen) => (chosen, true),
+                    };
+                }
                 let resume = SignalResume {
                     signal,
                     reported: taken,
                     approved: verdict.approved,
                     replacement: verdict.replacement,
+                    step,
                 };
                 self.resume_with_signal(task, resume).await
             }
@@ -7364,6 +7409,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 request_tx: request_tx.ok_or(Errno::EIO)?,
                 resume_tx: resume_tx.ok_or(Errno::EIO)?,
                 view: self.gdb_view.clone(),
+                replied: None,
             };
 
             // NB: notify initial gdb stop, this is the first time we can
@@ -12779,11 +12825,21 @@ impl<L: Tool + 'static> TracedTask<L> {
         if let Some(stop_tx) = self.gdb_stop_tx.as_ref() {
             let request_tx = self.gdb_request_tx.clone();
             let resume_tx = self.gdb_resume_tx.clone();
+            // The run can end as soon as a process exit is reported, which
+            // would drop gdb's connection with the reply unwritten: wait until
+            // the session has written it, or gone away.
+            let (replied, written) = if matches!(reason, StopReason::Exited(..)) {
+                let (replied, written) = oneshot::channel();
+                (Some(replied), Some(written))
+            } else {
+                (None, None)
+            };
             let stop = StoppedInferior {
                 reason,
                 request_tx: request_tx.ok_or(Errno::EIO)?,
                 resume_tx: resume_tx.ok_or(Errno::EIO)?,
                 view: self.gdb_view.clone(),
+                replied,
             };
             // The session closes a thread's stop channel when gdb lets the
             // thread go: at a detach or kill, at the thread's exit, and when
@@ -12794,6 +12850,8 @@ impl<L: Tool + 'static> TracedTask<L> {
                     tid = %self.tid(),
                     "GDB no longer follows this tracee; stop not reported"
                 );
+            } else if let Some(written) = written {
+                let _ = written.await;
             }
         }
         Ok(())
@@ -12857,11 +12915,15 @@ impl<L: Tool + 'static> TracedTask<L> {
                 // panic here).
                 let is_step_over = resume_action == ExpectedGdbResume::StepOver;
                 let running = match resume.action {
-                    ResumeAction::Step(sig) => self.step_stopped(task, sig)?,
-                    ResumeAction::Continue(sig) if is_resume => self.resume_stopped(task, sig)?,
-                    ResumeAction::Continue(sig) if is_step_only => self.step_stopped(task, sig)?,
+                    ResumeAction::Step(sig) => self.step_stopped_any(task, sig)?,
+                    ResumeAction::Continue(sig) if is_resume => {
+                        self.resume_stopped_any(task, sig)?
+                    }
+                    ResumeAction::Continue(sig) if is_step_only => {
+                        self.step_stopped_any(task, sig)?
+                    }
                     ResumeAction::Continue(sig) if is_step_over => {
-                        self.resume_stopped(task, sig)?
+                        self.resume_stopped_any(task, sig)?
                     }
                     action => panic!(
                         "[pid = {}] unexpected resume action {:?}, expecting: {:?}",
@@ -12883,7 +12945,17 @@ impl<L: Tool + 'static> TracedTask<L> {
         if !self.attached_by_gdb {
             return self.resume_stopped(task, None);
         }
+        let (resume, released_by_session) = self.wait_for_gdb_resume().await?;
+        let (running, resumed) = self.handle_gdb_resume(resume, task, resume_action).await?;
+        self.note_gdb_resume(resumed, released_by_session);
+        Ok(running)
+    }
 
+    /// Waits in a gdb stop, answering gdb's requests, until gdb resumes this
+    /// thread. Returns gdb's resume, `None` if the resume channel closed, and
+    /// whether the session let the thread go without one, in which case the
+    /// resume is a detach.
+    async fn wait_for_gdb_resume(&mut self) -> Result<(Option<ResumeInferior>, bool), TraceError> {
         let mut resume_rx = self.gdb_resume_rx.take().ok_or(Errno::EIO)?;
         let mut gdb_request_rx = self.gdb_request_rx.take().ok_or(Errno::EIO)?;
         let answering = self.gdb_view.enter(ThreadState::InGdbStop);
@@ -12901,9 +12973,8 @@ impl<L: Tool + 'static> TracedTask<L> {
                 None => future::pending().await,
             }
         });
-        let mut released_by_session = false;
 
-        let (running, resumed) = loop {
+        let result = loop {
             let request_future = Box::pin(gdb_request_rx.recv());
             let resume_or_release = future::select(&mut resume_future, &mut released);
 
@@ -12912,19 +12983,14 @@ impl<L: Tool + 'static> TracedTask<L> {
                     self.handle_gdb_request(gdb_request).await;
                 }
                 Either::Right((Either::Left((resume_request, _)), _)) => {
-                    break self
-                        .handle_gdb_resume(resume_request, task, resume_action)
-                        .await?;
+                    break (resume_request, false);
                 }
                 Either::Right((Either::Right(((), _)), _)) => {
-                    released_by_session = true;
                     let detach = ResumeInferior {
                         action: ResumeAction::Continue(None),
                         detach: true,
                     };
-                    break self
-                        .handle_gdb_resume(Some(detach), task, resume_action)
-                        .await?;
+                    break (Some(detach), true);
                 }
             }
         };
@@ -12933,7 +12999,12 @@ impl<L: Tool + 'static> TracedTask<L> {
         drop(answering);
         self.gdb_request_rx = Some(gdb_request_rx);
         self.gdb_resume_rx = Some(resume_rx);
+        Ok(result)
+    }
 
+    /// Records how gdb resumed this thread (`wait_for_gdb_resume`): a detach
+    /// ends gdb's hold on it, and a step makes its next trap one to report.
+    fn note_gdb_resume(&mut self, resumed: Option<ResumeInferior>, released_by_session: bool) {
         if let Some(resumed) = resumed {
             if resumed.detach {
                 tracing::debug!(
@@ -12957,8 +13028,54 @@ impl<L: Tool + 'static> TracedTask<L> {
 
             self.resumed_by_gdb = Some(resumed.action);
         }
+    }
 
-        Ok(running)
+    /// Whether `sig`, about to be delivered, is reported to gdb as a stop
+    /// first: while gdb is attached, unless gdb asked for it to be passed
+    /// silently (`QPassSignals`) or has no number for it (Linux's SIGSTKFLT),
+    /// which gdb could not name when it resumes.
+    fn stops_for_gdb_at(&self, sig: AnySignal) -> bool {
+        self.attached_by_gdb
+            && self.gdb_stop_tx.is_some()
+            && !self.gdb_passed_signals.passes(sig)
+            && crate::gdbstub::signal_has_gdb_number(sig)
+    }
+
+    /// Reports `sig`, which the Tool is about to have delivered at this
+    /// signal-delivery stop, to gdb as a stop, as a native gdbserver does, and
+    /// returns what gdb chose: to continue with the signal (gdb's default for
+    /// a signal it passes), with another signal, or with none (`signal 0`), or
+    /// to step. A detach, or a session that lets the thread go, delivers the
+    /// signal as if gdb had never seen it, and a kill delivers SIGKILL.
+    async fn signal_stop_for_gdb(
+        &mut self,
+        task: &Stopped,
+        sig: AnySignal,
+    ) -> Result<GdbSignalResume, TraceError> {
+        self.notify_gdb_stop(StopReason::stopped(
+            task.pid(),
+            self.pid(),
+            StopEvent::Signal(sig),
+            task.getregs()?.into(),
+        ))
+        .await?;
+        let (resume, released_by_session) = self.wait_for_gdb_resume().await?;
+        self.note_gdb_resume(resume, released_by_session);
+        Ok(match resume {
+            None => GdbSignalResume::Continue(Some(sig)),
+            Some(resume) if resume.detach => match resume.action {
+                ResumeAction::Continue(Some(kill)) => GdbSignalResume::Continue(Some(kill)),
+                _ => GdbSignalResume::Continue(Some(sig)),
+            },
+            Some(resume) => match resume.action {
+                ResumeAction::Continue(chosen) => GdbSignalResume::Continue(chosen),
+                ResumeAction::Step(chosen) => GdbSignalResume::Step(chosen),
+                // Not advertised in `vCont?`; deliver as without gdb.
+                ResumeAction::Stop | ResumeAction::StepUntil(..) => {
+                    GdbSignalResume::Continue(Some(sig))
+                }
+            },
+        })
     }
 
     /// Resume from a software breakpoint set by gdb. The resume action is
@@ -13086,7 +13203,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         self.notify_gdb_stop(StopReason::stopped(
             task.pid(),
             self.pid(),
-            StopEvent::Signal(Signal::SIGTRAP),
+            StopEvent::Signal(Signal::SIGTRAP.into()),
             task.getregs()?.into(),
         ))
         .await?;
