@@ -597,10 +597,14 @@ fn exact_strace_tool_observes_filtered_write() {
 }
 
 fn run_dbt_strace(extra: &[&str], guest: &[&str]) -> Output {
+    run_strace("dbt", extra, guest)
+}
+
+fn run_strace(backend: &str, extra: &[&str], guest: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_strace"));
     command
         .arg("--backend")
-        .arg("dbt")
+        .arg(backend)
         .args(extra)
         .arg("--")
         .args(guest);
@@ -620,10 +624,19 @@ fn dbt_exact_strace_tool_observes_filtered_write() {
 
 #[test]
 fn dbt_strace_reports_exit_after_echo_closes_stdio() {
+    strace_reports_exit_after_echo_closes_stdio("dbt");
+}
+
+#[test]
+fn ptrace_strace_reports_exit_after_echo_closes_stdio() {
+    strace_reports_exit_after_echo_closes_stdio("ptrace");
+}
+
+fn strace_reports_exit_after_echo_closes_stdio(backend: &str) {
     // GNU echo closes stdout and stderr before exit. Keep the original write
     // oracle above unchanged, and also require the consuming Tool diagnostics
     // to survive those application descriptor closes through controller RPC.
-    let output = run_dbt_strace(&["--trace", "write"], &["/bin/echo", "hello"]);
+    let output = run_strace(backend, &["--trace", "write"], &["/bin/echo", "hello"]);
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"hello\n");
     let stderr = String::from_utf8(output.stderr).unwrap();
