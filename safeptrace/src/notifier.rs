@@ -797,6 +797,12 @@ struct Event {
     legacy_observation_pause: Mutex<Option<BoundedTestPause>>,
     #[cfg(test)]
     legacy_worker_cycle_pause: Mutex<Option<BoundedTestPause>>,
+    /// Turns of this Event's legacy observation worker, and how many of
+    /// them read the target's retained status.
+    #[cfg(test)]
+    legacy_worker_turns: AtomicUsize,
+    #[cfg(test)]
+    legacy_worker_status_reads: AtomicUsize,
 }
 
 /// Keeps a generation's TID from being reaped. See [`EventHandle::hold_tid`].
@@ -859,6 +865,8 @@ thread_local! {
     static PTRACER_HOST_PROOFS: Cell<usize> = const { Cell::new(0) };
     static WAKER_CALLBACK_RECHECKS: Cell<usize> = const { Cell::new(0) };
     static PTRACER_ATTACHMENT_STATUS_READS: Cell<usize> = const { Cell::new(0) };
+    /// Calls of `retained_proc_status` on this thread.
+    static RETAINED_STATUS_READS: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -934,6 +942,19 @@ impl LegacyWaitOwner {
     }
 
     fn is_live(&self) -> Result<bool, Errno> {
+        // Signal 0 through the retained descriptor asks the same question of
+        // the same PID object in one syscall, without opening a file: it
+        // succeeds exactly while a task is attached to that object, as
+        // reading its status does. The PID number and thread group of an
+        // attached task cannot differ from the captured ones. A refusal
+        // proves nothing either way (audit, an LSM, a seccomp filter or a
+        // PID namespace mismatch can refuse the call), so it falls back to
+        // the status read.
+        if let Some(fd) = &self.self_signal_fd
+            && let Ok(live) = descriptor_is_live(fd.as_raw_fd())
+        {
+            return Ok(live);
+        }
         match retained_proc_status(self.lifetime.as_raw_fd()) {
             Ok(status) => Ok(status.pid == self.tid && status.tgid == self.tgid),
             Err(Errno::ENOENT | Errno::ESRCH) => Ok(false),
@@ -1403,6 +1424,10 @@ impl Event {
             legacy_observation_pause: Mutex::new(None),
             #[cfg(test)]
             legacy_worker_cycle_pause: Mutex::new(None),
+            #[cfg(test)]
+            legacy_worker_turns: AtomicUsize::new(0),
+            #[cfg(test)]
+            legacy_worker_status_reads: AtomicUsize::new(0),
         }
     }
 
@@ -3149,6 +3174,8 @@ struct RetainedProcStatus {
 /// main's syscalls. Such a filter killed a `pread` reread
 /// (https://github.com/rrnewton/reverie/issues/970).
 fn retained_proc_status(directory: RawFd) -> Result<RetainedProcStatus, Errno> {
+    #[cfg(test)]
+    RETAINED_STATUS_READS.with(|reads| reads.set(reads.get() + 1));
     let _open = launch_window::TransientOpen::begin();
     let raw = unsafe {
         libc::openat(
@@ -3519,11 +3546,12 @@ impl ThreadHandle {
                 Ok(waitid::IdType::Pidfd(fd.as_raw_fd()))
             }
             Self::Procfs { pid, directory } => {
-                // This is a bounded observation precheck, not a guarantee
-                // that a host ptracer's exit cannot release the task. Every
-                // numeric WNOWAIT observation must recheck the retained
-                // directory afterward. Only the actual owner's consuming
-                // helper may turn an original observation into a report.
+                // A lifetime check through the retained directory, not a
+                // guarantee that a host ptracer's exit cannot release the
+                // task later. A numeric WNOWAIT observation is checked this
+                // way after it returns (see `legacy_wait_once`). Only the
+                // actual owner's consuming helper may turn an original
+                // observation into a report.
                 match retained_proc_status(directory.as_raw_fd()) {
                     Ok(status) if status.pid == *pid => Ok(waitid::IdType::Pid((*pid).into())),
                     Ok(_) | Err(Errno::ENOENT | Errno::ESRCH) => Err(Errno::ECHILD),
@@ -3538,16 +3566,22 @@ impl ThreadHandle {
             Self::Pidfd(fd) | Self::LegacyLeader { fd, .. } => {
                 waitid::waitpidfd(fd.as_raw_fd(), flags)
             }
-            Self::Procfs { .. } => loop {
-                let status = self.legacy_wait_once(self.wait_id()?, flags)?;
+            Self::Procfs { pid, .. } => loop {
+                // No check before the observation: the one after it proves
+                // the number still named this PID object when the kernel
+                // resolved it (see `legacy_wait_once`). A check before would
+                // only refuse earlier what that one refuses anyway. (A call
+                // without WNOWAIT is refused with EPERM even for a dead
+                // handle, where the check before used to answer ECHILD.)
+                let status = self.legacy_wait_once(waitid::IdType::Pid((*pid).into()), flags)?;
                 if status.is_some() || flags.contains(WaitPidFlag::WNOHANG) {
                     return Ok(status);
                 }
                 // Non-leader exec releases its former TID in de_thread,
                 // independently of this Event's reaper. Never block in a
-                // numeric wait after the lifetime check: it could bind a
-                // replacement child. Recheck the retained descriptor on
-                // every bounded observation instead.
+                // numeric wait: one that started after the release could
+                // bind a replacement child. Recheck the retained descriptor
+                // after every bounded observation instead.
                 thread::sleep(Duration::from_millis(1));
             },
         }
@@ -3558,15 +3592,18 @@ impl ThreadHandle {
         checked_id: waitid::IdType,
         flags: WaitPidFlag,
     ) -> Result<Option<i32>, Errno> {
-        // Background and generic descriptor helpers are observation-only.
-        // Irreversible numeric waits require the actual owner helper below.
-        if !flags.contains(WaitPidFlag::WNOWAIT) {
-            return Err(Errno::EPERM);
-        }
-        let status = waitid::wait_raw(checked_id, flags | WaitPidFlag::WNOHANG)?;
+        let status = observe_numeric_id(checked_id, flags)?;
         // A host ptracer thread can exit and release this stopped task
-        // independently of the Event gate. An observation cannot steal a
-        // replacement report; the retained postcheck rejects that hint.
+        // independently of the Event gate, and a non-leader exec releases
+        // its TID. An observation cannot steal a replacement report: this
+        // retained postcheck rejects that hint.
+        //
+        // It is also sufficient on its own. waitid resolves the number to a
+        // PID object once, on entry. The kernel removes a number from its
+        // table only when the last task leaves that PID object, and no task
+        // joins it afterwards. So if the retained directory still reaches a
+        // task now, the number named this PID object from capture until
+        // now, including when waitid resolved it.
         self.wait_id()?;
         Ok(status)
     }
@@ -3596,6 +3633,22 @@ impl ThreadHandle {
         })
         .map(|_| ())
     }
+}
+
+/// One bounded numeric WNOWAIT observation of `pid`, with no lifetime check.
+/// The caller must check the retained directory after it returns before it
+/// trusts the result (see `ThreadHandle::legacy_wait_once`).
+fn observe_numeric(pid: Pid, flags: WaitPidFlag) -> Result<Option<i32>, Errno> {
+    observe_numeric_id(waitid::IdType::Pid(pid.into()), flags)
+}
+
+fn observe_numeric_id(id: waitid::IdType, flags: WaitPidFlag) -> Result<Option<i32>, Errno> {
+    // Background and generic descriptor helpers are observation-only.
+    // Irreversible numeric waits require the actual owner helper.
+    if !flags.contains(WaitPidFlag::WNOWAIT) {
+        return Err(Errno::EPERM);
+    }
+    waitid::wait_raw(id, flags | WaitPidFlag::WNOHANG)
 }
 
 #[cfg(test)]
@@ -4127,7 +4180,6 @@ fn try_consume_legacy_status(
     if *gate || handle.is_some_and(|handle| !std::ptr::eq(handle.event().as_ref(), event)) {
         return Ok(None);
     }
-    authenticate_legacy_wait_owner(identity, event)?;
     let observe = WaitPidFlag::from_bits_retain(
         WaitPidFlag::WEXITED.bits()
             | WaitPidFlag::WSTOPPED.bits()
@@ -4136,13 +4188,24 @@ fn try_consume_legacy_status(
             | libc::__WALL
             | libc::__WNOTHREAD,
     );
-    let Some(observed) = identity.pidfd.wait_status(observe)? else {
+    // Observe before authenticating, so that one retained read serves as
+    // both the observation's postcheck (see `ThreadHandle::legacy_wait_once`)
+    // and the owner's authentication. The observation consumes nothing, and
+    // __WNOTHREAD admits only this thread's own children and tracees.
+    let observed = observe_numeric(identity.pid, observe);
+    // Capture-time TracerPid is never authority: this reads the current one.
+    // A refused authentication returns its error before the observation's,
+    // as it did when it ran first.
+    authenticate_legacy_wait_owner(identity, event)?;
+    let Some(observed) = observed? else {
         return Ok(None);
     };
-    // The WNOWAIT helper has checked the retained descriptor after its
-    // numeric observation. Reauthenticate current attachment before any
-    // irreversible query; capture-time TracerPid is never authority.
-    authenticate_legacy_wait_owner(identity, event)?;
+    // No second authentication before the irreversible query below. From
+    // the one above until that query returns, this thread runs no ptrace
+    // request and cannot exit, so the tracee stays attached to it. Only
+    // this thread's thread group can reap the tracee, and every Safe
+    // execution-control operation is drained by the exclusive gate. The
+    // stop or zombie observed above therefore keeps holding the TID.
     let terminal = libc::WIFEXITED(observed) || libc::WIFSIGNALED(observed);
     let flags = WaitPidFlag::from_bits_retain(
         if terminal {
@@ -4273,17 +4336,39 @@ fn wait_thread_status(identity: &WorkerIdentity, event: &Event) -> Option<i32> {
 /// progress mutex, so it cannot race an actual consuming producer. Publication
 /// happens only after this returns and that mutex has been dropped.
 fn close_unowned_legacy_wait(identity: &WorkerIdentity, event: &Event) -> Result<bool, Errno> {
+    check_legacy_attachment(identity, event).map(|check| check == LegacyAttachment::Closed)
+}
+
+/// The result of [`check_legacy_attachment`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LegacyAttachment {
+    /// The gate is closed, now or by this check: retire.
+    Closed,
+    /// The retained target status was read now, through `identity.proc_dir`,
+    /// with matching Pid and Tgid, and showed an attachment that is kept.
+    Read,
+    /// Kept without reading, because another holder had the gate.
+    Unread,
+}
+
+/// [`close_unowned_legacy_wait`], also reporting whether the target's
+/// retained status was read and matched. A read that follows a numeric
+/// observation is that observation's postcheck.
+fn check_legacy_attachment(
+    identity: &WorkerIdentity,
+    event: &Event,
+) -> Result<LegacyAttachment, Errno> {
     let Some(mut gate) = event.terminal_reaping.try_write() else {
-        return Ok(false);
+        return Ok(LegacyAttachment::Unread);
     };
     if *gate {
-        return Ok(true);
+        return Ok(LegacyAttachment::Closed);
     }
     match identity.current_tracer_pid() {
         Ok(tracer) => {
             if let Some(owner) = event.legacy_wait_owner.get() {
                 if owner.tid == tracer && owner.is_live()? {
-                    return Ok(false);
+                    return Ok(LegacyAttachment::Read);
                 }
             } else if tracer.as_raw() != 0 {
                 // Observation before the actual owner's first poll still
@@ -4297,7 +4382,7 @@ fn close_unowned_legacy_wait(identity: &WorkerIdentity, event: &Event) -> Result
                     Ok(host)
                         if host.pid == tracer && host.tgid == Pid::from(nix::unistd::getpid()) =>
                     {
-                        return Ok(false);
+                        return Ok(LegacyAttachment::Read);
                     }
                     Ok(_) | Err(Errno::ENOENT | Errno::ESRCH) => {}
                     Err(error) => return Err(error),
@@ -4308,16 +4393,33 @@ fn close_unowned_legacy_wait(identity: &WorkerIdentity, event: &Event) -> Result
         Err(error) => return Err(error),
     }
     *gate = true;
-    Ok(true)
+    Ok(LegacyAttachment::Closed)
 }
+
+/// How long a legacy observation worker whose observations find nothing
+/// goes between attachment checks ([`legacy_worker_thread`]).
+///
+/// With one turn, this bounds how late the worker notices a lost
+/// attachment or host owner that no observation reports. Most losses are
+/// reported, and are checked at once: a numeric observation of a non-leader
+/// finds it only as a tracee of this process (Linux's `do_wait_pid`), so the
+/// observation returns ECHILD once a host owner's exit or a detach ends the
+/// attachment, or once the TID is released with nothing reusing it. Only a
+/// reattachment by another host thread, or a released TID reused by another
+/// child or tracee of this process, waits for this period. Turns that find
+/// nothing are most turns of a thread that runs or blocks in the guest, and
+/// each check reads `status`, so a period of many turns keeps idle threads
+/// cheap.
+const LEGACY_CHECK_PERIOD: Duration = Duration::from_millis(10);
 
 /// The first wait of a legacy observation worker after something woke it or
 /// it made progress ([`legacy_worker_thread`]). Each turn that finds nothing
 /// doubles the wait, up to [`LEGACY_POLL_PERIOD`].
 const LEGACY_FIRST_WAIT: Duration = Duration::from_micros(10);
 
-/// The longest wait between two turns of a legacy observation worker, which
-/// also bounds how late it notices a lost attachment or host owner.
+/// The longest wait between two turns of a legacy observation worker.
+/// [`LEGACY_CHECK_PERIOD`], plus one turn, bounds how late it notices a
+/// lost attachment or host owner.
 const LEGACY_POLL_PERIOD: Duration = Duration::from_millis(1);
 
 /// The timer slack of a legacy observation worker thread, in nanoseconds.
@@ -4363,6 +4465,8 @@ fn legacy_worker_thread(
     let mut wait = LEGACY_FIRST_WAIT;
     #[cfg(test)]
     let mut late = false;
+    // When the last attachment check that read the target's status ran.
+    let mut checked_at: Option<Instant> = None;
     loop {
         #[cfg(test)]
         pause_retirement_for_test(&event.legacy_worker_cycle_pause);
@@ -4404,36 +4508,69 @@ fn legacy_worker_thread(
             unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, 0 as libc::c_ulong, 0, 0, 0) };
             return Some(native.clone());
         }
+        // Observe first. The attachment check below then reads the target's
+        // retained status after this numeric observation, so its one read is
+        // also the observation's postcheck (see
+        // `ThreadHandle::legacy_wait_once`).
+        let observed = if progress.retiring {
+            Err(Errno::ECHILD)
+        } else {
+            observe_numeric(identity.pid, observe)
+        };
         // Attachment and host-owner lifetime are checked even while the
         // same WNOWAIT hint remains parked. A former host owner can exit,
         // or a different host thread can immediately reattach, without an
         // intervening ECHILD observation by this worker.
-        match close_unowned_legacy_wait(identity, event) {
-            Ok(true) => {
-                progress.retiring = true;
-                progress.observed = None;
-                drop(progress);
-                event.mark_echild();
-                break;
+        //
+        // A turn whose observation found nothing acts on nothing, so it needs
+        // no postcheck, and it checks only once LEGACY_CHECK_PERIOD has
+        // passed since the last check that read. Every other result is
+        // checked in its own turn, and so is every turn while an error is
+        // published: only a check clears it, as before.
+        let due = !matches!(observed, Ok(None))
+            || progress.error.is_some()
+            || checked_at.is_none_or(|at| at.elapsed() >= LEGACY_CHECK_PERIOD);
+        #[cfg(test)]
+        event.legacy_worker_turns.fetch_add(1, Ordering::Relaxed);
+        let postchecked = if !due {
+            true
+        } else {
+            match check_legacy_attachment(identity, event) {
+                Ok(LegacyAttachment::Closed) => {
+                    progress.retiring = true;
+                    progress.observed = None;
+                    drop(progress);
+                    event.mark_echild();
+                    break;
+                }
+                Ok(LegacyAttachment::Read) => {
+                    #[cfg(test)]
+                    event
+                        .legacy_worker_status_reads
+                        .fetch_add(1, Ordering::Relaxed);
+                    checked_at = Some(Instant::now());
+                    true
+                }
+                Ok(LegacyAttachment::Unread) => false,
+                Err(error) => {
+                    progress.error = Some(error);
+                    drop(progress);
+                    event.status_changed.notify_all();
+                    event.status_waker.wake();
+                    event.exit_waiters.wake_all();
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
             }
-            Ok(false) => {}
-            Err(error) => {
-                progress.error = Some(error);
-                drop(progress);
-                event.status_changed.notify_all();
-                event.status_waker.wake();
-                event.exit_waiters.wake_all();
-                thread::sleep(Duration::from_millis(1));
-                continue;
-            }
-        }
+        };
+        // Another holder of the gate left the observation without a
+        // postcheck: check it separately, as before.
+        let observed = match observed {
+            Ok(status) if !postchecked => identity.pidfd.wait_id().map(|_| status),
+            observed => observed,
+        };
         #[cfg(test)]
         let hinted_before = progress.observed.is_some();
-        let observed = if progress.retiring {
-            Err(Errno::ECHILD)
-        } else {
-            identity.pidfd.wait_status(observe)
-        };
         match observed {
             Ok(status) => {
                 progress.observed = status;
