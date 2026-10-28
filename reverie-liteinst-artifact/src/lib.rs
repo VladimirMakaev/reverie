@@ -739,7 +739,7 @@ fn content_manifest_relative(image_kind: FixedImageKind) -> &'static str {
 }
 // Reviewed literal expectations, not hashes generated from the current checkout
 // or bytes embedded after a runtime edit. The qualifier self-hash is separate.
-const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 73] = [
+const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 77] = [
     // Bind the signal-mask gate and every changed native-source premise of it.
     (
         "reverie-inguest/src/guest/continuation.rs",
@@ -833,8 +833,28 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 73] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
-        237052,
-        "7de6b421cd20b9be86ebac8adfcc52e827e968aabed455257b0506b956bc6dfc",
+        240921,
+        "b8eb0c81e1cf232bbae3acd98a533483c55c40b704ab167dae3099de9248ad13",
+    ),
+    (
+        "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
+        74330,
+        "a88dadba3226d536e988490b23b57eb8c825f7de30884f21ba9f8c717a5662ec",
+    ),
+    (
+        "reverie-liteinst-artifact/tests/fixtures/package_roles_fallback_member.rs",
+        807404,
+        "04ff07ffea256146614bdc1a91b6b0bbadadaf2ad907416173d38095393de724",
+    ),
+    (
+        "reverie-liteinst-artifact/tests/fixtures/package_roles_libc_member.rs",
+        55656,
+        "3bab7521b595ec2000429a78f28f9aa068d1e99e39d89c0f2723474accd79c92",
+    ),
+    (
+        "reverie-liteinst-artifact/tests/fixtures/package_roles_tp_member.rs",
+        45656,
+        "947830c8caee21ca600939d2c13c719eda58f88175fff1c64e89eb7b6cddf3b0",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/native_leaves.rs",
@@ -1192,6 +1212,15 @@ fn content_reverie_inventory_for_image(
             require(
                 entry.sha256 == private_static::selected_initializers::implementation_sha256(),
                 "declared selected-initializer source differs from compiled host module",
+            )?;
+        } else if entry.relative
+            == "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs"
+        {
+            content_catalog_matches(&entry.relative, entry.size, &entry.sha256)?;
+            require(
+                entry.sha256
+                    == private_static::selected_initializers::package_role_implementation_sha256(),
+                "declared package-role source differs from compiled host module",
             )?;
         } else if entry.relative
             == "reverie-liteinst-artifact/src/private_static/selected_initializers/native_leaves.rs"
@@ -32529,7 +32558,7 @@ mod tests {
         let rv_two = cargo_two.join(suffix);
         // Current compiled bytes are inputs only. Each must independently match
         // the fixed reviewed length/digest catalog before any positive is earned.
-        let compiled_files: [(&str, &[u8]); 75] = [
+        let compiled_files: [(&str, &[u8]); 79] = [
             (
                 "reverie/src/tool_process.rs",
                 include_bytes!("../../reverie/src/tool_process.rs"),
@@ -32776,6 +32805,22 @@ mod tests {
                 include_bytes!("private_static/selected_initializers/view_table.rs"),
             ),
             (
+                "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
+                include_bytes!("private_static/selected_initializers/package_roles.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/tests/fixtures/package_roles_fallback_member.rs",
+                include_bytes!("../tests/fixtures/package_roles_fallback_member.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/tests/fixtures/package_roles_libc_member.rs",
+                include_bytes!("../tests/fixtures/package_roles_libc_member.rs"),
+            ),
+            (
+                "reverie-liteinst-artifact/tests/fixtures/package_roles_tp_member.rs",
+                include_bytes!("../tests/fixtures/package_roles_tp_member.rs"),
+            ),
+            (
                 "reverie-liteinst-artifact/src/private_static/selected_initializers/native_leaves.rs",
                 include_bytes!("private_static/selected_initializers/native_leaves.rs"),
             ),
@@ -32835,11 +32880,11 @@ mod tests {
             }
         }
         let (rv_inventory, _) = content_reverie_inventory(&rv_one).unwrap();
-        // 73 reviewed sources plus the independently checked qualifier.
-        assert_eq!(rv_inventory.len(), 74);
+        // 77 reviewed sources plus the independently checked qualifier.
+        assert_eq!(rv_inventory.len(), 78);
         let (detcore_inventory, _) =
             content_reverie_inventory_for_image(&rv_one, FixedImageKind::Detcore).unwrap();
-        assert_eq!(detcore_inventory.len(), 75);
+        assert_eq!(detcore_inventory.len(), 79);
         assert_eq!(
             content_reverie_inventory_for_image(&rv_two, FixedImageKind::Detcore)
                 .unwrap()
