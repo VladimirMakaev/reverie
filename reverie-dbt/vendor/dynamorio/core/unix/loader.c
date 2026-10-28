@@ -252,7 +252,7 @@ private_errno_remove(privmod_t *owner)
     if (private_errno_accessor != NULL &&
         (private_errno_owner_held || !dynamo_exited_all_other_threads))
         private_errno_unsupported("live private errno provider unmap");
-    ATOMIC_PTRSZ_ALIGNED_WRITE(&private_errno_accessor, 0, false);
+    ATOMIC_PTRSZ_ALIGNED_WRITE(&private_errno_accessor, (ptr_int_t)0, false);
     private_errno_owner = NULL;
     private_errno_candidate = NULL;
 }
