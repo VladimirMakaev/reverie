@@ -54,7 +54,7 @@
 //!
 //! Proper use of timers requires that all delivered signals of type
 //! `Timer::signal_type()` be passed through `Timer::handle_signal`, and that
-//! `Timer::observe_event()` be called whenever a Tool-observable reverie event
+//! `Timer::observe_stop()` be called whenever a Tool-observable reverie event
 //! occurs. A caller that observes a stop before it knows whether the Tool
 //! observes it must pass a stop that the Tool does not observe to
 //! `Timer::disregard_stop()`, and finish what of the active event this
@@ -723,13 +723,24 @@ impl Timer {
     /// unless the thread exits before anything decides the event (see
     /// [`Timer::settle_at_exit`]); one that cancels the event instead records
     /// it at once, as does [`Timer::retire`].
-    pub fn observe_event(&mut self, event: &TraceEvent) {
+    ///
+    /// The stop is `task`'s, by `event`, and the clock it may read must be
+    /// current first: the counter's page is current only once the thread is
+    /// switched out (see `PerfCounter::ctr_value_fast`), and a plain signal,
+    /// seccomp or group stop is decoded with no ptrace request that would
+    /// wait for that. A request is made only where the page needs it, and
+    /// only when the event reads the clock: while a precise event is
+    /// scheduled.
+    pub fn observe_stop(&mut self, task: &Stopped, event: &TraceEvent) {
         if let Some(t) = self.inner_mut_noinit() {
+            if t.reads_clock_at(event) {
+                t.switch_out(task);
+            }
             t.observe_event(event);
         }
     }
 
-    /// Undoes what the latest [`Timer::observe_event`] did to the active
+    /// Undoes what the latest [`Timer::observe_stop`] did to the active
     /// event, for a stop that turns out to be one the Tool does not observe,
     /// such as a trap that Reverie consumes without a Tool callback. Such a
     /// stop neither cancels the event nor ends its single steps.
@@ -2033,6 +2044,26 @@ impl TimerImpl {
         }
     }
 
+    /// Makes sure the stopped `task` is switched out before the clock is read,
+    /// where reading the clock needs that (see
+    /// `PerfCounter::fast_read_needs_switch_out`): a ptrace request waits for
+    /// it. Only its waiting matters; a thread that died surfaces at the next
+    /// request.
+    fn switch_out(&self, task: &Stopped) {
+        if self.clock.fast_read_needs_switch_out() {
+            let _ = task.getsiginfo();
+        }
+    }
+
+    /// Whether [`TimerImpl::observe_event`] reads the clock at a stop by
+    /// `event`: a scheduled precise event that the stop may find reached.
+    fn reads_clock_at(&self, event: &TraceEvent) -> bool {
+        matches!(self.event, ActiveEvent::Precise { .. })
+            && self.timer_status == EventStatus::Scheduled
+            && self.initial_command == InitialCommand::Ordinary
+            && !matches!(event, TraceEvent::Signal(signal) if *signal == MARKER_SIGNAL)
+    }
+
     pub fn observe_event(&mut self, event: &TraceEvent) {
         // The first stop after a request decides the event: a stop by this
         // timer's signal delivers it, and any other stop cancels it. When that
@@ -2047,10 +2078,7 @@ impl TimerImpl {
             ActiveEvent::Precise {
                 clock_target,
                 offset,
-            } if self.timer_status == EventStatus::Scheduled
-                && self.initial_command == InitialCommand::Ordinary
-                && !matches!(event, TraceEvent::Signal(signal) if *signal == MARKER_SIGNAL) =>
-            {
+            } if self.reads_clock_at(event) => {
                 let clock = self.read_clock();
                 target_reached(clock, clock_target, offset).then(|| MissedTarget {
                     clock,
@@ -3044,6 +3072,10 @@ impl TimerImpl {
                 (_, Wait::Stopped(new_task, event))
                     if !matches!(event, TraceEvent::Signal(Signal::SIGTRAP)) =>
                 {
+                    if matches!(unit, StepUnit::ToBranch { .. }) {
+                        // The check reads the clock.
+                        self.switch_out(&new_task);
+                    }
                     self.check_branch_run(unit, current.rcbs(), target_rcb, false);
                     if matches!(event, TraceEvent::Exec(_)) {
                         // A single-stepped execve: Linux flushed the old
@@ -3066,7 +3098,15 @@ impl TimerImpl {
                     new_task
                 }
                 #[cfg(not(target_arch = "x86_64"))]
-                Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP)) => new_task,
+                Wait::Stopped(new_task, TraceEvent::Signal(Signal::SIGTRAP)) => {
+                    // The clock is read below, and nothing at a single step's
+                    // stop has made a ptrace request yet (x86 reads the
+                    // registers here). A branch run's stop has.
+                    if matches!(unit, StepUnit::Instruction) {
+                        self.switch_out(&new_task);
+                    }
+                    new_task
+                }
                 // Any other stop ends the stepping, and so does a SIGTRAP that
                 // the step did not report, such as an `int3`'s, or one whose
                 // siginfo cannot be read. The step's instruction may still
