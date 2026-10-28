@@ -12726,6 +12726,13 @@ impl<L: Tool + 'static> TracedTask<L> {
                     // handler can make requests of the tracer that the filter
                     // may refuse or kill it at
                     // (`thread_may_be_seccomp_filtered`).
+                    // Report the vforkdone stop this event already names
+                    // before the extra step below replaces its Wait: after
+                    // the step only the step trap remains, and
+                    // `report_vfork_done_in_place` would see no event and
+                    // report nothing, leaving the client's later forks to
+                    // be refused as unreported.
+                    self.report_vfork_done_in_place(&wait).await?;
                     let wait = match wait {
                         Wait::Stopped(parent, Event::VforkDone)
                             if self.in_signal_callback && !thread_may_be_seccomp_filtered() =>

@@ -1130,6 +1130,38 @@ async fn a_client_that_follows_vforks_is_told_when_each_injected_one_is_done() {
     a_client_that_follows_vforks_is_told_when_each_is_done::<InjectTool>("vforks-injected").await;
 }
 
+/// A client that follows forks, and not vforks, is told of the fork with
+/// a `fork` stop naming the child, which it detaches; the vforks are not
+/// reported. Nothing here yet observes the guest's `vforkdone` after a
+/// vfork injected from a signal callback.
+#[tokio::test]
+async fn a_client_that_follows_forks_is_told_of_the_fork() {
+    let ForkGuest { path, .. } = fork_guest();
+    let status = debug_to_end(path, "fork-events", |mut remote| async move {
+        remote.supported(&format!("{NO_EVENTS};fork-events+")).await;
+        let main = remote.thread.clone();
+        let stop = remote.resume().await;
+        let child = stop
+            .strip_prefix("T05fork:")
+            .and_then(|rest| rest.split(';').next())
+            .unwrap_or_else(|| panic!("expected a fork stop: {stop:?}"))
+            .to_owned();
+        assert_eq!(stop_thread(&stop), main);
+        let pid = child
+            .strip_prefix('p')
+            .and_then(|id| id.split('.').next())
+            .expect("the child's process");
+        assert_eq!(remote.request(&format!("D;{pid}")).await, "OK");
+        assert_exited_zero(&remote.resume().await, "after the fork");
+    })
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "every child exited as expected"
+    );
+}
+
 /// An exec is reported as an `exec` stop only to a client that follows
 /// execs; to another it is the trap that stops the thread after an exec
 /// natively, when the tracer does not ask Linux for exec events.
