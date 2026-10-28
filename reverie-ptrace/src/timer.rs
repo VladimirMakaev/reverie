@@ -53,8 +53,9 @@
 //! late notification let the guest pass it.
 //!
 //! Proper use of timers requires that all delivered signals of type
-//! `Timer::signal_type()` be passed through `Timer::handle_signal`, and that
-//! `Timer::observe_stop()` be called whenever a Tool-observable reverie event
+//! `Timer::signal_type()` be passed through `Timer::accept_signal` and
+//! `Timer::deliver_accepted`, and that `Timer::observe_stop()` be called
+//! whenever a Tool-observable reverie event
 //! occurs. A caller that observes a stop before it knows whether the Tool
 //! observes it must pass a stop that the Tool does not observe to
 //! `Timer::disregard_stop()`, and finish what of the active event this
@@ -1090,31 +1091,16 @@ impl Timer {
         }
     }
 
-    /// When a signal is received, this method drives the timer event to
-    /// completion via single stepping, after checking that the signal was meant
-    /// for this specific timer. This *must* be called when a timer signal is
-    /// received for correctness.
-    ///
-    /// Preconditions: task is in signal-delivery-stop.
-    /// Postconditions: if a signal meant for this timer was the cause of the
-    /// stop, the tracee will be at the precise instruction the timer event
-    /// should fire at, unless signal delivery was already past the target. In
-    /// that case the overshoot is recorded and the event fires at the observed
-    /// counter.
-    /// Drives a timer signal using caller-owned stopped-state transitions.
-    ///
-    /// The caller uses this hook to keep its exact-generation root-stop lease
-    /// synchronized across the precise timer's internal single steps, and to
-    /// observe each step's wait, for example to retain a decoded new child.
-    pub(crate) async fn handle_signal(
-        &mut self,
-        task: Stopped,
-        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
-        waits: &std::sync::Arc<PtracerWaitOwner>,
-    ) -> Result<Stopped, HandleFailure> {
+    /// Checks that the signal
+    /// stop `task` is this timer's notification and that its event is to be
+    /// delivered, and returns the task to deliver it from
+    /// ([`Timer::deliver_accepted`]). The stop's siginfo is read here, so
+    /// the caller may move the thread off the signal stop between the two
+    /// (with requests that retire no guest branch) before the event is
+    /// delivered.
+    pub(crate) fn accept_signal(&mut self, task: Stopped) -> Result<Stopped, HandleFailure> {
         match self.inner_mut_noinit() {
-            Some(t) => t.handle_signal(task, step, observe, waits).await,
+            Some(t) => t.accept_signal(task),
             None => {
                 warn!("Stray SIGSTKFLT indicates a bug!");
                 Err(HandleFailure::ImproperSignal(task))
@@ -1122,9 +1108,34 @@ impl Timer {
         }
     }
 
+    /// Drives the event of a signal [`Timer::accept_signal`] accepted, with
+    /// caller-owned stopped-state transitions: the caller keeps its
+    /// exact-generation root-stop lease synchronized across the precise
+    /// timer's internal single steps (`step`) and observes each step's wait
+    /// (`observe`), for example to retain a decoded new child.
+    ///
+    /// Postconditions: the tracee is at the precise instruction the timer
+    /// event should fire at, unless signal delivery was already past the
+    /// target. In that case the overshoot is recorded and the event fires at
+    /// the observed counter.
+    pub(crate) async fn deliver_accepted(
+        &mut self,
+        task: Stopped,
+        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
+        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
+        waits: &std::sync::Arc<PtracerWaitOwner>,
+    ) -> Result<Stopped, HandleFailure> {
+        match self.inner_mut_noinit() {
+            Some(t) => t.deliver(task, step, observe, waits).await,
+            // Only an initialized timer accepts a signal.
+            None => Err(HandleFailure::ImproperSignal(task)),
+        }
+    }
+
     /// Finishes what of the active event a disregarded stop left unfinished,
-    /// as [`Timer::handle_signal`] would have finished it. The task is in the
-    /// disregarded stop, and the result is as for [`Timer::handle_signal`].
+    /// as [`Timer::deliver_accepted`] would have finished it. The task is in
+    /// the disregarded stop, and the result is as for
+    /// [`Timer::deliver_accepted`].
     pub(crate) async fn continue_stepping(
         &mut self,
         task: Stopped,
@@ -3064,13 +3075,8 @@ impl TimerImpl {
         }
     }
 
-    async fn handle_signal(
-        &mut self,
-        task: Stopped,
-        step: &mut (dyn FnMut(Stopped, StepUnit) -> Result<Running, TraceError> + Send),
-        observe: &mut (dyn FnMut(&Wait, StepStop) -> Result<(), TraceError> + Send),
-        waits: &std::sync::Arc<PtracerWaitOwner>,
-    ) -> Result<Stopped, HandleFailure> {
+    /// See [`Timer::accept_signal`].
+    fn accept_signal(&mut self, task: Stopped) -> Result<Stopped, HandleFailure> {
         self.recheck_kept_programming();
         // From libc 0.2.190 `siginfo_t` is not `Send`, so it must not be
         // alive at the `.await` below; this block owns it.
@@ -3137,7 +3143,7 @@ impl TimerImpl {
         };
 
         // At this point, we've decided that a timer event is to be delivered.
-        self.deliver(task, step, observe, waits).await
+        Ok(task)
     }
 
     /// Delivers the active event, whose notification the guest has taken or

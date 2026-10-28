@@ -2722,6 +2722,138 @@ static void mode_sync_signal_at_last_sigreturn(void) {
   sigtrap_full_state("last sigreturn state");
 }
 
+/* A SIGTRAP the guest queues itself while it blocks it, with a code and a
+ * pid of its own, across Reverie's steps: injected reads of the thread's
+ * status (which must show it pending), a private injection, a precise
+ * timer's steps, an injected ppoll whose temporary mask unblocks it (which
+ * must return EINTR with the handler run), and an injected unblock. The
+ * lines are the native ones: the queued SIGTRAP is seen pending after
+ * each step, and is delivered exactly when it would be, with its code and
+ * pid. */
+static volatile int gk_n, gk_code, gk_pid;
+static void gk_handler(int sig, siginfo_t* si, void* uc) {
+  (void)sig;
+  (void)uc;
+  gk_n++;
+  gk_code = si->si_code;
+  gk_pid = si->si_pid;
+}
+static void gk_queue(void) {
+  siginfo_t si;
+  memset(&si, 0, sizeof si);
+  si.si_signo = SIGTRAP;
+  si.si_code = -7;
+  si.si_pid = 4242;
+  long pid = getpid(), tid = syscall(SYS_gettid);
+  if (SITEM(SYS_rt_tgsigqueueinfo, pid, tid, SIGTRAP, (long)&si, 0, SHAPE_TAIL) != 0)
+    die("queue SIGTRAP");
+}
+static void gk_state(const char* tag) {
+  char buf[4096];
+  int fd = open("/proc/thread-self/status", O_RDONLY);
+  if (fd < 0)
+    die("open /proc/thread-self/status");
+  long n = SITEM(SYS_read, fd, (long)buf, sizeof buf - 1, 0, 0, SHAPE_INJECT);
+  close(fd);
+  if (n <= 0)
+    die("read /proc/thread-self/status");
+  buf[n] = 0;
+  say("kept %s SigPnd=%d ShdPnd=%d handled=%d\n",
+      tag,
+      status_sigtrap_bit(buf, "SigPnd:"),
+      status_sigtrap_bit(buf, "ShdPnd:"),
+      gk_n);
+}
+static void mode_sigtrap_guest_pending_kept(void) {
+  warm();
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = gk_handler;
+  sa.sa_flags = SA_SIGINFO;
+  if (sigaction(SIGTRAP, &sa, NULL) != 0)
+    die("sigaction SIGTRAP");
+  sigset_t trap;
+  sigemptyset(&trap);
+  sigaddset(&trap, SIGTRAP);
+  if (sigprocmask(SIG_BLOCK, &trap, NULL) != 0)
+    die("block SIGTRAP");
+  gk_queue();
+  gk_state("queued");
+  SITEM(SYS_getppid, 0, 0, 0, 0, 0, SHAPE_PRIVATE);
+  gk_state("after-injection");
+  SITEM(SYS_getppid, 0, 0, 0, 0, PM_BRANCHES + 1 + 3, ARM_TIMER | SHAPE_TAIL);
+  for (volatile int j = 0; j < PM_BRANCHES; j++)
+    ;
+  gk_state("after-timer");
+  sigset_t none;
+  sigemptyset(&none);
+  struct timespec ts = {1, 0};
+  long r = SITEM(SYS_ppoll, 0, 0, (long)&ts, (long)&none, 8, SHAPE_INJECT);
+  say("kept ppoll r=%ld handled=%d code=%d pid=%d\n", r, gk_n, gk_code, gk_pid);
+  gk_state("after-ppoll");
+  gk_queue();
+  gk_state("queued-again");
+  if (SITEM(SYS_rt_sigprocmask, SIG_UNBLOCK, (long)&trap, 0, 8, 0, SHAPE_INJECT) != 0)
+    die("unblock SIGTRAP");
+  say("kept unblocked handled=%d code=%d pid=%d\n", gk_n, gk_code, gk_pid);
+}
+
+/* A SIGTRAP the guest queued itself while blocking it, out of the queue for
+ * a precise timer's steps, which run through a SIGUSR1 handler's return as
+ * in sync_signal_behind_sigreturn. The handler's frame keeps SIGTRAP
+ * blocked (sigtrap_stash_sigreturn_keeps), or unblocks it
+ * (sigtrap_stash_sigreturn_unblocks), which natively delivers it as the
+ * rt_sigreturn returns. */
+static volatile int ss_unblock;
+static void ss_usr1_handler(int sig, siginfo_t* si, void* uc) {
+  (void)sig;
+  (void)si;
+  ucontext_t* context = uc;
+  if (ss_unblock)
+    sigdelset(&context->uc_sigmask, SIGTRAP);
+  else
+    sigaddset(&context->uc_sigmask, SIGTRAP);
+  gk_queue();
+  /* As in sbs_usr1_handler: the target lies sbs_c branches past the loop,
+   * beyond the handler's return, which follows the loop at once. */
+  SITEM(SYS_getppid, 0, 0, 0, 0, PM_BRANCHES + 1 + sbs_c, ARM_TIMER | SHAPE_TAIL);
+  for (volatile int j = 0; j < PM_BRANCHES; j++)
+    ;
+}
+static void sigtrap_stash_sigreturn(int unblock) {
+  warm();
+  ss_unblock = unblock;
+  struct sigaction trap, usr1;
+  memset(&trap, 0, sizeof trap);
+  trap.sa_sigaction = gk_handler;
+  trap.sa_flags = SA_SIGINFO;
+  memset(&usr1, 0, sizeof usr1);
+  usr1.sa_sigaction = ss_usr1_handler;
+  usr1.sa_flags = SA_SIGINFO;
+  sigfillset(&usr1.sa_mask);
+  sigdelset(&usr1.sa_mask, SIGSTKFLT);
+  if (sigaction(SIGTRAP, &trap, NULL) != 0 || sigaction(SIGUSR1, &usr1, NULL) != 0)
+    die("sigaction");
+  for (sbs_c = 2; sbs_c < 6; sbs_c++) {
+    raise(SIGUSR1);
+    for (volatile int j = 0; j < 200; j++)
+      ;
+  }
+  gk_state("after-rounds");
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGTRAP);
+  if (SITEM(SYS_rt_sigprocmask, SIG_UNBLOCK, (long)&set, 0, 8, 0, SHAPE_TAIL) != 0)
+    die("unblock SIGTRAP");
+  say("kept stash rounds handled=%d code=%d pid=%d\n", gk_n, gk_code, gk_pid);
+}
+static void mode_sigtrap_stash_sigreturn_keeps(void) {
+  sigtrap_stash_sigreturn(0);
+}
+static void mode_sigtrap_stash_sigreturn_unblocks(void) {
+  sigtrap_stash_sigreturn(1);
+}
+
 /* Each SIGTRAP state across a precise timer's single-steps: the timer is
  * armed PM_BRANCHES + 1 branches out and fires in the branch loop, whose
  * last branches it single-steps
@@ -3036,10 +3168,19 @@ static void mode_sigtrap_int3_timer(void) {
   }
 }
 
-/* SIGTRAP blocked with one pending, then a private injection, which Reverie
- * must single-step: the run ends with a named failure. */
+/* SIGTRAP blocked with one pending, behind another blocked signal that is
+ * pending too, then a private injection, which Reverie must single-step.
+ * Queued again, SIGTRAP could not keep its place among them, so it is not
+ * kept, and the run ends with a named failure. */
 static void mode_sigtrap_pending_at_step(void) {
   sigtrap_set(trap_handler, 1);
+  sigset_t usr2;
+  sigemptyset(&usr2);
+  sigaddset(&usr2, SIGUSR2);
+  if (sigprocmask(SIG_BLOCK, &usr2, NULL) != 0)
+    die("block SIGUSR2");
+  if (syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGUSR2) != 0)
+    die("tgkill SIGUSR2");
   if (syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), SIGTRAP) != 0)
     die("tgkill SIGTRAP");
   SITEM(SYS_getppid, 0, 0, 0, 0, 0, SHAPE_PRIVATE);
@@ -5577,6 +5718,12 @@ int main(int argc, char** argv) {
     mode_sync_signal_behind_sigreturn();
   else if (!strcmp(m, "sync_signal_at_last_sigreturn"))
     mode_sync_signal_at_last_sigreturn();
+  else if (!strcmp(m, "sigtrap_stash_sigreturn_keeps"))
+    mode_sigtrap_stash_sigreturn_keeps();
+  else if (!strcmp(m, "sigtrap_stash_sigreturn_unblocks"))
+    mode_sigtrap_stash_sigreturn_unblocks();
+  else if (!strcmp(m, "sigtrap_guest_pending_kept"))
+    mode_sigtrap_guest_pending_kept();
   else if (!strcmp(m, "perf_marker"))
     mode_perf_marker();
   else if (!strcmp(m, "timer_allow"))
