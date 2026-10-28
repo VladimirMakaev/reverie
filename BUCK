@@ -215,8 +215,17 @@ rust_library(
                 "description": "Command helpers for generic Reverie conformance tests.",
                 "publish": False,
             },
-            "test": [{"name": "basics", "path": "../tests/basics.rs"}],
+            # DBT caller artifacts use the explicit OSS producer. Buck's
+            # generic-basics target retains its existing ptrace selection.
+            "features": {"default": [], "dbt": ["dep:reverie-dbt"]},
+            "test": [
+                {"name": "basics", "path": "../tests/basics.rs"},
+                {"name": "dbt_command", "path": "tests/dbt_command.rs", "required-features": ["dbt"]},
+            ],
             "dependencies_override": {
+                "dependencies": {
+                    "reverie-dbt": {"version": "0.5.4", "path": "../reverie-dbt", "default-features": False, "optional": True},
+                },
                 "dev-dependencies": {
                     "nix": {"features": ["fs", "process", "signal"]},
                     "reverie-ptrace": {"features": ["nightly"]},
@@ -249,7 +258,7 @@ rust_library(
 
 rust_unittest(
     name = "generic-basics",
-    srcs = ["tests/basics.rs", "tests/tool_fixtures/basics.rs"],
+    srcs = ["tests/basics.rs", "tests/support/basics_commands.rs", "tests/tool_fixtures/basics.rs"],
     crate_root = "tests/basics.rs",
     rustc_flags = sanitized_feature,
     deps = [

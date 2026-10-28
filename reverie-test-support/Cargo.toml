@@ -10,9 +10,14 @@ edition = "2024"
 license = "BSD-2-Clause"
 publish = false
 
+[features]
+default = []
+dbt = ["dep:reverie-dbt"]
+
 [dependencies]
 reverie = { version = "0.5.4", path = "../reverie", package = "reverie-core" }
 reverie-ptrace = { version = "0.5.4", path = "../reverie-ptrace" }
+reverie-dbt = { version = "0.5.4", path = "../reverie-dbt", default-features = false, optional = true }
 
 [dev-dependencies]
 close-err = "1.0.2"
@@ -29,3 +34,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sanitized)"] }
 [[test]]
 name = "basics"
 path = "../tests/basics.rs"
+
+[[test]]
+name = "dbt_command"
+path = "tests/dbt_command.rs"
+required-features = ["dbt"]

@@ -632,6 +632,27 @@ impl DbtRunner {
         runner.output_with_global::<G>(guest, config).await
     }
 
+    /// Runs a paired caller Tool with inherited stdin and captured output.
+    ///
+    /// This has the same authenticated activation, consuming completion, and
+    /// initial-process domain as [`Self::output_with_caller_tool`]. It only
+    /// changes stdin from null to inherited; signal termination remains a
+    /// caller launch error rather than a returned signal status.
+    pub async fn output_with_inherited_stdin_and_caller_tool<G>(
+        &self,
+        guest: &Command,
+        config: G::Config,
+    ) -> io::Result<(Output, G)>
+    where
+        G: GlobalTool + 'static,
+    {
+        let mut runner = self.clone();
+        runner.caller_tool = true;
+        runner
+            .output_with_inherited_stdin_and_global::<G>(guest, config)
+            .await
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(impl-dbi-gap-closure): Review exact-environment DBT coordinator launch.
     /// Runs `guest` with captured output, one shared global, and an exact environment.

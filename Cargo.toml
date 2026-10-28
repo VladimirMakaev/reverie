@@ -43,4 +43,6 @@ exclude = [
     "reverie-examples/counter1-dbt-runtime",
     "reverie-examples/counter2-dbt-runtime",
     "reverie-dbt/tests/fixtures/caller-lifecycle-runtime",
+    "tests/fixtures/basics-noop-dbt-runtime",
+    "tests/fixtures/basics-counter-dbt-runtime",
 ]
