@@ -669,12 +669,15 @@ fn fallback_target(
     }
     Ok(selected)
 }
+const FALLBACK_SECTION: &str = ".text.reverie_inguest_fallback_entry";
+
 fn fallback_input(owner: &ObjectInput<'_>) -> Result<sym::Sym> {
     require(
         owner.member_name.starts_with("reverie_inguest-"),
         "package fallback runtime member differs",
     )?;
     let (_, symbol) = named(&owner.elf, "fallback_entry")?;
+    let dedicated = section_name(&owner.elf, &symbol)? == FALLBACK_SECTION;
     let section = owner
         .elf
         .section_headers
@@ -688,29 +691,48 @@ fn fallback_input(owner: &ObjectInput<'_>) -> Result<sym::Sym> {
             && symbol.st_size == 48
             && section.sh_type == 1
             && section.sh_flags == 6
-            && section.sh_size == 289
+            && section.sh_size == if dedicated { 48 } else { 289 }
             && section.sh_addralign == 16
-            && section_name(&owner.elf, &symbol)? == ".text",
+            && (dedicated || section_name(&owner.elf, &symbol)? == ".text"),
         "package fallback exact complete function/contribution differs",
     )?;
-    for (name, offset, size, kind) in [
+    let mut aliases = vec![
         ("fallback_completion_syscall", 44, 0, sym::STT_NOTYPE),
         ("fallback_completion_return", 46, 0, sym::STT_NOTYPE),
-        ("reverie_native_launch_syscall", 48, 55, sym::STT_FUNC),
-        ("reverie_inguest_trusted_syscall", 112, 44, sym::STT_FUNC),
-        (
-            "reverie_inguest_trusted_syscall_ip",
-            144,
-            0,
-            sym::STT_NOTYPE,
-        ),
-        (
-            "reverie_inguest_trusted_syscall_return_ip",
-            146,
-            0,
-            sym::STT_NOTYPE,
-        ),
-    ] {
+    ];
+    if dedicated {
+        // The whole source-owned contribution is the one complete function.
+        // No compiler-selected neighboring function is a custody witness.
+        require(
+            owner
+                .elf
+                .syms
+                .iter()
+                .filter(|s| s.st_shndx == symbol.st_shndx)
+                .count()
+                == 3,
+            "package fallback dedicated input has extra aliases",
+        )?;
+    } else {
+        // Keep the previously qualified historical contribution closed.
+        aliases.extend([
+            ("reverie_native_launch_syscall", 48, 55, sym::STT_FUNC),
+            ("reverie_inguest_trusted_syscall", 112, 44, sym::STT_FUNC),
+            (
+                "reverie_inguest_trusted_syscall_ip",
+                144,
+                0,
+                sym::STT_NOTYPE,
+            ),
+            (
+                "reverie_inguest_trusted_syscall_return_ip",
+                146,
+                0,
+                sym::STT_NOTYPE,
+            ),
+        ]);
+    }
+    for (name, offset, size, kind) in aliases {
         let (_, alias) = named(&owner.elf, name)?;
         require(
             alias.st_shndx == symbol.st_shndx
@@ -783,15 +805,21 @@ fn join_fallback(
 ) -> Result<RelocatedDefinition> {
     let symbol = fallback_input(owner)?;
     let address = mapped_definition(map, owner, &symbol)?;
-    let (_, ordinary) = named(elf, "reverie_inguest_trusted_syscall")?;
-    require(
-        ordinary.st_value == address + 112
-            && ordinary.st_size == 44
-            && ordinary.st_type() == sym::STT_FUNC
-            && ordinary.st_bind() == sym::STB_LOCAL
-            && ordinary.st_visibility() == sym::STV_HIDDEN,
-        "package fallback final ordinary physical contribution differs",
-    )?;
+    let dedicated = section_name(&owner.elf, &symbol)? == FALLBACK_SECTION;
+    let ordinary = if dedicated {
+        None
+    } else {
+        let (_, ordinary) = named(elf, "reverie_inguest_trusted_syscall")?;
+        require(
+            ordinary.st_value == address + 112
+                && ordinary.st_size == 44
+                && ordinary.st_type() == sym::STT_FUNC
+                && ordinary.st_bind() == sym::STB_LOCAL
+                && ordinary.st_visibility() == sym::STV_HIDDEN,
+            "package fallback final ordinary physical contribution differs",
+        )?;
+        Some(ordinary)
+    };
     let (_, linked) = named(elf, "fallback_entry")?;
     require(
         linked.st_value == address
@@ -806,18 +834,30 @@ fn join_fallback(
         .get(linked.st_shndx)
         .ok_or("package fallback final section absent")?;
     require(
-        ordinary.st_shndx == linked.st_shndx
+        ordinary.is_none_or(|s| s.st_shndx == linked.st_shndx)
             && section.sh_type == 1
             && section.sh_flags & 7 == 6
             && address >= section.sh_addr
-            && address.checked_add(156).is_some_and(|end| {
-                section
-                    .sh_addr
-                    .checked_add(section.sh_size)
-                    .is_some_and(|limit| end <= limit)
-            }),
+            && address
+                .checked_add(if dedicated { 48 } else { 156 })
+                .is_some_and(|end| {
+                    section
+                        .sh_addr
+                        .checked_add(section.sh_size)
+                        .is_some_and(|limit| end <= limit)
+                }),
         "package fallback/ordinary contribution escapes declared RX section",
     )?;
+    if dedicated {
+        require(
+            elf.syms
+                .iter()
+                .filter(|s| s.st_shndx != 0 && s.st_value >= address && s.st_value < address + 48)
+                .count()
+                == 3,
+            "package fallback dedicated final body has extra aliases",
+        )?;
+    }
     for (name, offset) in [
         ("fallback_completion_syscall", 44),
         ("fallback_completion_return", 46),
@@ -1842,8 +1882,8 @@ mod tests {
         }
         assert_eq!(count, 20);
     }
-    fn fallback_image() -> (Vec<u8>, String) {
-        let owner = object(FALLBACK, InitializerRole::PackageFallback);
+    fn fallback_image_from(input: &[u8]) -> (Vec<u8>, String) {
+        let owner = object(input, InitializerRole::PackageFallback);
         let symbol = fallback_input(&owner).unwrap();
         let source = relocation_rows(&owner, symbol.st_shndx, 48).unwrap();
         let targets = source
@@ -1902,8 +1942,7 @@ mod tests {
                 owner.elf.section_headers[*index].sh_size,
             ));
         }
-        let body =
-            section_file_bytes(&owner.elf.section_headers[symbol.st_shndx], FALLBACK).unwrap();
+        let body = section_file_bytes(&owner.elf.section_headers[symbol.st_shndx], input).unwrap();
         let relocs = source
             .iter()
             .enumerate()
@@ -1913,7 +1952,7 @@ mod tests {
         let mut map = map_row(&owner, symbol.st_shndx, 0x401000);
         for (i, (_, section, address)) in targets.iter().enumerate() {
             map.push_str(&map_row(&owner, *section, *address));
-            let data = section_file_bytes(&owner.elf.section_headers[*section], FALLBACK).unwrap();
+            let data = section_file_bytes(&owner.elf.section_headers[*section], input).unwrap();
             let at = if *address == 0x500100 {
                 0x6100
             } else if *address == 0x402000 {
@@ -1927,6 +1966,141 @@ mod tests {
             result[0x1000 + r.0 as usize..0x1000 + r.0 as usize + 4].copy_from_slice(&encoded);
         }
         (result, map)
+    }
+    fn fallback_image() -> (Vec<u8>, String) {
+        fallback_image_from(FALLBACK)
+    }
+
+    // Synthetic ELF DATA for the exact isolated-function geometry. Preserve
+    // the historical fixture and its negative controls; this is no source or
+    // compiler provenance claim. The same three body relocations and their
+    // actual operand sections are retained for the production join parser.
+    fn isolated_fallback_data() -> Vec<u8> {
+        let owner = object(FALLBACK, InitializerRole::PackageFallback);
+        let (_, symbol) = named(&owner.elf, "fallback_entry").unwrap();
+        let elf = &owner.elf;
+        let shoff = elf.header.e_shoff as usize;
+        let strings_index = elf.header.e_shstrndx as usize;
+        let strings = section_file_bytes(&elf.section_headers[strings_index], FALLBACK).unwrap();
+        let mut raw = FALLBACK.to_vec();
+        let strings_at = raw.len();
+        raw.extend_from_slice(strings);
+        raw.extend_from_slice(FALLBACK_SECTION.as_bytes());
+        raw.push(0);
+        put(
+            &mut raw,
+            shoff + strings_index * 64 + 24,
+            8,
+            strings_at as u64,
+        );
+        put(
+            &mut raw,
+            shoff + strings_index * 64 + 32,
+            8,
+            (strings.len() + FALLBACK_SECTION.len() + 1) as u64,
+        );
+        put(
+            &mut raw,
+            shoff + symbol.st_shndx * 64,
+            4,
+            strings.len() as u64,
+        );
+        put(&mut raw, shoff + symbol.st_shndx * 64 + 32, 8, 48);
+        let table = elf.section_headers.iter().find(|s| s.sh_type == 2).unwrap();
+        for (index, s) in elf.syms.iter().enumerate() {
+            if s.st_shndx == symbol.st_shndx
+                && !matches!(
+                    elf.strtab.get_at(s.st_name),
+                    Some(
+                        "fallback_entry"
+                            | "fallback_completion_syscall"
+                            | "fallback_completion_return"
+                    )
+                )
+            {
+                // The synthetic contribution has no neighboring definitions.
+                put(
+                    &mut raw,
+                    table.sh_offset as usize + index * 24 + 6,
+                    2,
+                    section_header::SHN_ABS as u64,
+                );
+            }
+        }
+        let (rel_index, rel) = elf
+            .section_headers
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.sh_type == 4 && s.sh_info as usize == symbol.st_shndx)
+            .unwrap();
+        raw.resize((raw.len() + 7) & !7, 0);
+        let rel_at = raw.len();
+        for i in 0..rel.sh_size as usize / 24 {
+            let at = rel.sh_offset as usize + i * 24;
+            if u64::from_le_bytes(FALLBACK[at..at + 8].try_into().unwrap()) < 48 {
+                raw.extend_from_slice(&FALLBACK[at..at + 24]);
+            }
+        }
+        assert_eq!(raw.len() - rel_at, 72);
+        put(&mut raw, shoff + rel_index * 64 + 24, 8, rel_at as u64);
+        put(&mut raw, shoff + rel_index * 64 + 32, 8, 72);
+        raw
+    }
+
+    #[test]
+    fn package_roles_isolated_fallback_owns_the_complete_function_and_three_operands() {
+        let data = isolated_fallback_data();
+        let owner = object(&data, InitializerRole::PackageFallback);
+        let symbol = fallback_input(&owner).unwrap();
+        assert_eq!(owner.elf.section_headers[symbol.st_shndx].sh_size, 48);
+        let (raw, map) = fallback_image_from(&data);
+        let elf = Elf::parse(&raw).unwrap();
+        let observed = role_body(
+            InitializerRole::PackageFallback,
+            &owner,
+            std::slice::from_ref(&owner),
+            &map,
+            &elf,
+            &raw,
+        )
+        .unwrap();
+        assert_eq!(
+            (observed.complete_bytes, observed.relocations.len()),
+            (48, 3)
+        );
+        assert_eq!(observed.aliases["fallback_completion_return"], 46);
+        let section_at = owner.elf.header.e_shoff as usize + symbol.st_shndx * 64;
+        for size in [47, 49, 103, 289] {
+            let mut bad = data.clone();
+            put(&mut bad, section_at + 32, 8, size);
+            assert!(
+                fallback_input(&object(&bad, InitializerRole::PackageFallback))
+                    .unwrap_err()
+                    .contains("complete function/contribution")
+            );
+        }
+        let (_, rel) = owner
+            .elf
+            .section_headers
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.sh_type == 4 && s.sh_info as usize == symbol.st_shndx)
+            .unwrap();
+        for offset in [24, 47] {
+            let mut bad = data.clone();
+            put(&mut bad, rel.sh_offset as usize, 8, offset);
+            assert!(fallback_input(&object(&bad, InitializerRole::PackageFallback)).is_err());
+        }
+        let mut bad = raw.clone();
+        // An unexpected local alias in the function cannot be hidden by a
+        // neighboring contribution or by otherwise correct relocation bytes.
+        put(&mut bad, 0x8000 + 5 * 24 + 8, 8, 0x401001);
+        let bad_elf = Elf::parse(&bad).unwrap();
+        assert!(
+            join_fallback(&owner, std::slice::from_ref(&owner), &map, &bad_elf, &bad)
+                .unwrap_err()
+                .contains("extra aliases")
+        );
     }
     #[test]
     fn package_roles_fallback_joins_actual_48b_and_all_three_source_operands() {

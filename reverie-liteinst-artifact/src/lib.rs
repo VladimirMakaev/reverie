@@ -743,8 +743,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 77] = [
     // Bind the signal-mask gate and every changed native-source premise of it.
     (
         "reverie-inguest/src/guest/continuation.rs",
-        53099,
-        "719b247049963a3a2f2c9eaf730cb7058d308b10cb002e0278f2c46e31207f60",
+        53174,
+        "e44feb7ac38976340ebef89433e24bf8303bdbc967e55c68408686ef1351fbeb",
     ),
     (
         "reverie-inguest/src/guest/instruction.rs",
@@ -838,8 +838,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 77] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs",
-        74330,
-        "a88dadba3226d536e988490b23b57eb8c825f7de30884f21ba9f8c717a5662ec",
+        81170,
+        "148d46702286ef359c7613c490083877d4bbc134972b2ae509760b2bb51bb55e",
     ),
     (
         "reverie-liteinst-artifact/tests/fixtures/package_roles_fallback_member.rs",
@@ -898,8 +898,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 77] = [
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/ordinary_gate.rs",
-        63386,
-        "a9229d250646b370024ce9f14f060b371b68cc33614099d408b02166545ea09d",
+        73521,
+        "93482ce58a17a14e93c0adeade3502fab3bad31f849c779e1e9bbd590582a847",
     ),
     (
         "reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
