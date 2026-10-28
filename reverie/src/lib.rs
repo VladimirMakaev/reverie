@@ -103,6 +103,7 @@ mod tool_process;
 mod unsupported;
 mod user_address;
 pub mod vdso;
+mod watchpoint;
 
 pub use auxv::*;
 pub use backend::*;
@@ -134,6 +135,7 @@ pub use tool_process::ToolProcess;
 pub use unsupported::*;
 pub use user_address::UserAddressLimit;
 pub use user_address::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT;
+pub use watchpoint::*;
 
 /// The identifier for a specific thread, corresponding to the output of gettid.
 /// In many cases, Linux blurs the Pid/Tid distinction, but Reverie should
