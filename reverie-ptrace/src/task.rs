@@ -11,10 +11,12 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+#[cfg(target_arch = "x86_64")]
 use std::ffi::OsString;
 use std::fmt;
 use std::io::Write;
 use std::ops::DerefMut;
+#[cfg(target_arch = "x86_64")]
 use std::os::unix::ffi::OsStringExt;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
@@ -111,6 +113,7 @@ use crate::regs::Reg;
 use crate::regs::RegAccess;
 use crate::segv_state::SIGSEGV_BIT;
 use crate::segv_state::SegvRun;
+#[cfg(target_arch = "x86_64")]
 use crate::segv_state::segv_repair;
 use crate::sigtrap_state::BLOCKABLE_SIGNAL_BITS;
 use crate::sigtrap_state::KernelSigaction;
@@ -278,6 +281,8 @@ pub enum PreinitOutcome {
     Ready(Stopped),
     /// Initialization published a named fatal-session failure. Keep its stop
     /// owned until the ordinary task-tree driver completes consuming cleanup.
+    // Only the x86_64 CPUID-faulting setup refuses.
+    #[cfg(target_arch = "x86_64")]
     Refused(Stopped),
     /// A wait during initialization returned the tracee's final status. A
     /// SIGKILLed tracee first stops at `PTRACE_EVENT_EXIT`, but that stop is
@@ -1974,6 +1979,14 @@ fn swaps_signal_mask(nr: Sysno) -> bool {
     )
 }
 
+// The trap's ABI is x86_64's (see `TracerBuilder::injected_syscall_trap`).
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(
+        dead_code,
+        reason = "only x86_64 handles the trap; elsewhere only its presence is read"
+    )
+)]
 #[derive(Clone)]
 pub(crate) struct InjectedSyscallTrap {
     pub(crate) marker: u64,
@@ -1981,6 +1994,10 @@ pub(crate) struct InjectedSyscallTrap {
     pub(crate) provenance: Option<InjectedSyscallProvenance>,
 }
 
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(dead_code, reason = "only x86_64 validates a trap's site")
+)]
 #[derive(Clone)]
 pub(crate) struct InjectedSyscallProvenance {
     pub(crate) image: PathBuf,
@@ -1989,6 +2006,8 @@ pub(crate) struct InjectedSyscallProvenance {
     pub(crate) patched_site_addresses: Arc<[u64]>,
 }
 
+// The maps and auxv reads below serve only `validates_site_provenance`.
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Debug)]
 struct GuestMap {
     start: u64,
@@ -1998,12 +2017,14 @@ struct GuestMap {
     path: Option<PathBuf>,
 }
 
+#[cfg(target_arch = "x86_64")]
 impl GuestMap {
     fn contains(&self, address: u64) -> bool {
         self.start <= address && address < self.end
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn read_guest_maps(pid: Pid) -> std::io::Result<Vec<GuestMap>> {
     let maps = crate::launch_window::read(format!("/proc/{pid}/maps"))?;
     Ok(maps
@@ -2012,10 +2033,12 @@ fn read_guest_maps(pid: Pid) -> std::io::Result<Vec<GuestMap>> {
         .collect())
 }
 
+#[cfg(target_arch = "x86_64")]
 fn guest_maps(pid: Pid) -> Option<Vec<GuestMap>> {
     read_guest_maps(pid).ok()
 }
 
+#[cfg(target_arch = "x86_64")]
 fn next_proc_maps_field<'a>(line: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
     while line.get(*cursor).is_some_and(u8::is_ascii_whitespace) {
         *cursor += 1;
@@ -2030,6 +2053,7 @@ fn next_proc_maps_field<'a>(line: &'a [u8], cursor: &mut usize) -> Option<&'a [u
     (start < *cursor).then(|| &line[start..*cursor])
 }
 
+#[cfg(target_arch = "x86_64")]
 fn parse_guest_map(line: &[u8]) -> Option<GuestMap> {
     let mut cursor = 0;
     let range = std::str::from_utf8(next_proc_maps_field(line, &mut cursor)?).ok()?;
@@ -2060,6 +2084,7 @@ fn parse_guest_map(line: &[u8]) -> Option<GuestMap> {
     })
 }
 
+#[cfg(target_arch = "x86_64")]
 fn decode_proc_maps_path(bytes: &[u8]) -> PathBuf {
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -2085,6 +2110,7 @@ fn decode_proc_maps_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(OsString::from_vec(decoded))
 }
 
+#[cfg(target_arch = "x86_64")]
 fn guest_auxv_entry(pid: Pid, key: u64) -> Option<u64> {
     let bytes = crate::launch_window::read(format!("/proc/{pid}/auxv")).ok()?;
     bytes.as_chunks::<16>().0.iter().find_map(|entry| {
@@ -3510,7 +3536,7 @@ thread_local! {
 
 /// Timer steps over a guest `rt_sigreturn` whose frame blocked SIGTRAP
 /// (`TimerStepShield::prepare`), counted for the test that must know one ran.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) static FRAME_SHIELDS_FOR_TEST: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -3526,7 +3552,7 @@ pub(crate) fn record_step_for_test(tid: Pid) {
 }
 
 /// Test-only: the number of single-step requests issued for `tid` so far.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) fn step_count_for_test(tid: Pid) -> u64 {
     STEP_COUNTS_GLOBAL
         .lock()
@@ -3554,7 +3580,7 @@ pub(crate) fn record_stepped_seccomp_for_test(tid: Pid) {
 
 /// Test-only: the number of timer single-steps of `tid` so far that ended
 /// at a seccomp stop.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) fn stepped_seccomp_count_for_test(tid: Pid) -> u64 {
     STEPPED_SECCOMP_GLOBAL
         .lock()
@@ -5299,7 +5325,9 @@ impl<L: Tool + 'static> TracedTask<L> {
         .await;
         let mut task = match outcome? {
             PreinitOutcome::Ready(task) => task,
-            ended @ (PreinitOutcome::Exited(..) | PreinitOutcome::Refused(_)) => return Ok(ended),
+            ended @ PreinitOutcome::Exited(..) => return Ok(ended),
+            #[cfg(target_arch = "x86_64")]
+            ended @ PreinitOutcome::Refused(_) => return Ok(ended),
         };
         #[cfg(test)]
         at_preinit_point(
@@ -5952,6 +5980,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// a notification an injection took (`Timer::take_notification`), by
     /// driving it from this stop. A guest signal held for the resume instead
     /// retires the event (`Timer::retire`); see `handle_injected_syscall`.
+    #[cfg(target_arch = "x86_64")]
     async fn finish_disregarded_timer(
         &mut self,
         task: Stopped,
@@ -7478,6 +7507,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         );
         let task = match self.tracee_preinit(task, PreinitPlace::AtExec).await? {
             PreinitOutcome::Ready(task) => task,
+            #[cfg(target_arch = "x86_64")]
             PreinitOutcome::Refused(_task) => return Err(Errno::ECANCELED.into()),
             PreinitOutcome::Exited(pid, exit_status) => {
                 self.exec_sigtrap_quiet = false;
@@ -10972,6 +11002,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// action before the stop (`force_sig_info_to_task`), so the action is
     /// forgotten unless it is known that neither was so. One a process sent
     /// reset nothing.
+    #[cfg(target_arch = "x86_64")]
     fn note_segv_delivered_to_guest(&self, task: &Stopped) {
         if !self.global_state.keeps_segv_state {
             return;
@@ -11034,6 +11065,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// left it, as before, and is logged; an action that may have been reset
     /// and was not written back is forgotten. The common case, SIGSEGV
     /// unblocked and not ignored, makes no request.
+    #[cfg(target_arch = "x86_64")]
     async fn restore_segv_after_trap(&mut self, task: Stopped) -> Result<Stopped, TraceError> {
         if !self.keeps_segv_state() {
             return Ok(task);
@@ -14372,7 +14404,7 @@ mod restored_regs_tests {
 #[cfg(test)]
 #[path = "task_deliver_signal_tests.rs"]
 mod deliver_signal_tests;
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 #[path = "task_exec_owner_tests.rs"]
 mod exec_owner_tests;
 #[cfg(test)]
@@ -14621,6 +14653,7 @@ mod tests {
     /// The maps read reports a failure instead of returning no mappings
     /// (review finding F1 on
     /// <https://github.com/rrnewton/reverie/pull/818>).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn reading_the_maps_of_a_missing_process_is_an_error() {
         // Linux caps pid_max at 2^22, so this pid never exists.
@@ -14632,6 +14665,7 @@ mod tests {
         assert!(own.iter().any(|map| map.executable && map.inode != 0));
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn proc_maps_paths_preserve_literal_whitespace_and_decode_octal_escapes() {
         let mapping = parse_guest_map(
