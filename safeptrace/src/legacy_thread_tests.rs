@@ -127,6 +127,19 @@ fn spawn_legacy_thread_tracee_with_method(
     options: Options,
     method: LegacyAttachMethod,
 ) -> (Pid, Stopped, TraceeCleanupGuard, LegacyThreadGroup) {
+    spawn_legacy_threads(if pause_thread { &[0] } else { &[17, 23] }, options, method)
+}
+
+/// A traced process whose main thread runs one pthread per entry of
+/// `modes`, each joined before the next starts: 0 pauses forever, 1 spins
+/// for about 300 µs between getppid calls forever, 17 raises SIGTRAP and
+/// exits 17, any other value exits with it.
+#[cfg(not(sanitized))]
+fn spawn_legacy_threads(
+    modes: &'static [usize],
+    options: Options,
+    method: LegacyAttachMethod,
+) -> (Pid, Stopped, TraceeCleanupGuard, LegacyThreadGroup) {
     let mut start = [-1, -1];
     if method != LegacyAttachMethod::Traceme {
         assert_eq!(
@@ -156,21 +169,36 @@ fn spawn_legacy_thread_tracee_with_method(
                         unsafe { libc::pause() };
                     }
                 }
+                if mode == 1 {
+                    let now = || {
+                        let mut now = libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 0,
+                        };
+                        // The vDSO answers without a syscall stop.
+                        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+                        now.tv_sec * 1_000_000_000 + now.tv_nsec
+                    };
+                    loop {
+                        let start = now();
+                        while now() - start < 300_000 {}
+                        unsafe { libc::syscall(libc::SYS_getppid) };
+                    }
+                }
                 if mode == 17 {
                     unsafe { libc::raise(libc::SIGTRAP) };
                 }
                 unsafe { libc::syscall(libc::SYS_exit, mode as i32) };
                 std::ptr::null_mut()
             }
-            let exits: &[usize] = if pause_thread { &[0] } else { &[17, 23] };
-            for exit in exits {
+            for mode in modes {
                 let mut thread = mem::MaybeUninit::<libc::pthread_t>::uninit();
                 let created = unsafe {
                     libc::pthread_create(
                         thread.as_mut_ptr(),
                         std::ptr::null(),
                         guest_thread,
-                        *exit as *mut libc::c_void,
+                        *mode as *mut libc::c_void,
                     )
                 };
                 if created != 0 {
@@ -1432,4 +1460,85 @@ async fn forced_legacy_nonleader_reattach_joins_retired_owner() {
         root_cleanup.disarm();
         drop((detached, running));
     }
+}
+
+// A legacy non-leader's stops reach its waiter without waiting out the
+// worker's poll period. Fast single steps: the ptracer's consume wakes the
+// worker to publish. Syscall stops resumed after the ptracer was busy for
+// longer than the period, each entry about 300 µs after the resumption:
+// the resumption wakes the worker to observe. With 1 ms polling, every one
+// of these stops took up to two whole periods.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_nonleader_steps_are_not_paced_by_the_poll_period() {
+    if run_legacy_test_outer("forced_legacy_nonleader_steps_are_not_paced_by_the_poll_period") {
+        return;
+    }
+    const FAST_STEPS: usize = 200;
+    const BUSY_SYSCALLS: usize = 20;
+    let (_root, stopped, _root_cleanup, _force) = spawn_legacy_threads(
+        &[1],
+        legacy_thread_options() | Options::PTRACE_O_TRACESYSGOOD,
+        LegacyAttachMethod::Traceme,
+    );
+    let (_parent, crate::Event::NewChild(crate::ChildOp::Clone, child)) = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        stopped.resume(None).unwrap().wait_owned_on_ptracer_thread(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .assume_stopped() else {
+        panic!("missing spinning pthread clone");
+    };
+    let _child_cleanup = legacy_child_cleanup(&child);
+    let event = Arc::clone(child.terminal_cleanup().event.event());
+    let (mut child, sigstop) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, child.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(sigstop, crate::Event::Signal(Signal::SIGSTOP));
+    let late_turns = || event.legacy_late_turns.load(Ordering::Relaxed);
+    let before = late_turns();
+    for _ in 0..FAST_STEPS {
+        let (stepped, trap) = tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            child.step(None).unwrap().wait_owned_on_ptracer_thread(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_stopped();
+        assert_eq!(trap, crate::Event::Signal(Signal::SIGTRAP));
+        child = stepped;
+    }
+    let fast_late = late_turns() - before;
+    assert!(
+        fast_late < FAST_STEPS / 4,
+        "{fast_late} of {FAST_STEPS} fast steps waited out the poll period"
+    );
+    let before = late_turns();
+    // Entry and exit stops: every entry comes about 300 µs after its resumption.
+    for _ in 0..2 * BUSY_SYSCALLS {
+        // Long enough for the worker to back off to the whole period.
+        thread::sleep(LEGACY_POLL_PERIOD * 3);
+        let (next, stop) = tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            child.syscall(None).unwrap().wait_owned_on_ptracer_thread(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_stopped();
+        assert_eq!(stop, crate::Event::Syscall);
+        child = next;
+    }
+    let busy_late = late_turns() - before;
+    assert!(
+        busy_late < BUSY_SYSCALLS,
+        "{busy_late} of {} syscall stops after a busy ptracer waited out the poll period",
+        2 * BUSY_SYSCALLS
+    );
 }
