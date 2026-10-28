@@ -8,11 +8,12 @@
 
 //! End-to-end checks for the exact example `Tool` types on LiteInst, with
 //! Counter1 allocator coverage through the shared backend launcher.
-//! DBT Counter1, Counter2, Strace and ChromeTrace require their explicit caller
-//! producers for the same Cargo profile; they use the standard manifest layout.
-//! The ChromeTrace negative control also requires the basics-noop caller. The separate
-//! Counter1 local-Global case requires the no-argument prototype producer
-//! `reverie-dbt/scripts/build-client.sh`, or `REVERIE_DBT_CLIENT`.
+//! DBT Counter1, Counter2, Strace, ChromeTrace and ChunkyPrint require their
+//! explicit caller producers for the same Cargo profile and standard manifest
+//! layout.
+//! The ChromeTrace and ChunkyPrint negative controls also require the basics-noop
+//! caller. The separate Counter1 local-Global case requires the no-argument
+//! prototype producer `reverie-dbt/scripts/build-client.sh`, or `REVERIE_DBT_CLIENT`.
 
 use std::fs::File;
 use std::io::Write;
@@ -605,6 +606,136 @@ fn exact_chunky_print_delays_buffered_write_behind_later_alias_write() {
         observed_buffering |= pass_through_at < buffered_at;
     }
     assert!(observed_buffering, "output was pure pass-through: {stdout}");
+}
+
+fn assert_chunky_print_guest_bytes(output: &Output) {
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    assert_eq!(stdout.len(), 16 * 8, "{stdout}");
+    for index in 0..16 {
+        for kind in ['B', 'P'] {
+            let token = format!("{kind}{index:02};");
+            assert_eq!(stdout.matches(&token).count(), 1, "{stdout}");
+        }
+    }
+}
+
+fn assert_chunky_print_buffering(output: Output) -> String {
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.len(), 16 * 8, "{stdout}");
+    let mut observed_buffering = false;
+    for index in 0..16 {
+        let buffered = format!("B{index:02};");
+        let pass_through = format!("P{index:02};");
+        assert_eq!(stdout.matches(&buffered).count(), 1, "{stdout}");
+        assert_eq!(stdout.matches(&pass_through).count(), 1, "{stdout}");
+        let buffered_at = stdout.find(&buffered).unwrap();
+        let pass_through_at = stdout.find(&pass_through).unwrap();
+        observed_buffering |= pass_through_at < buffered_at;
+    }
+    assert!(observed_buffering, "output was pure pass-through: {stdout}");
+    stdout
+}
+
+fn assert_chunky_print_causal_order(stdout: &str) {
+    for index in 0..15 {
+        let pass_through = format!("P{index:02};");
+        let later_buffered = format!("B{:02};", index + 1);
+        // This alias write completes before the guest can issue the next
+        // buffered write, regardless of which syscall closes an epoch.
+        assert!(
+            stdout.find(&pass_through).unwrap() < stdout.find(&later_buffered).unwrap(),
+            "completed alias write {pass_through} followed later {later_buffered}: {stdout}"
+        );
+    }
+}
+
+fn chunky_print_preserves_buffering_and_causal_order(backend: &str) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_chunky_print"));
+    command
+        .args(["--backend", backend, "--preload"])
+        .arg(preload())
+        .arg("--")
+        .args([
+            env!("CARGO_BIN_EXE_reverie-liteinst-env-guest"),
+            "chunky-alias-order",
+        ]);
+    let output = output_with_timeout(&mut command);
+    eprintln!("{backend} ChunkyPrint child: {output:?}");
+    assert_chunky_print_guest_bytes(&output);
+    let stdout = assert_chunky_print_buffering(output);
+    assert_chunky_print_causal_order(&stdout);
+}
+
+#[test]
+fn ptrace_chunky_print_preserves_buffering_and_causal_order() {
+    chunky_print_preserves_buffering_and_causal_order("ptrace");
+}
+
+#[test]
+fn dbt_chunky_print_preserves_buffering_and_causal_order() {
+    chunky_print_preserves_buffering_and_causal_order("dbt");
+}
+
+#[test]
+fn dbt_chunky_print_oracle_requires_actual_tool() {
+    let noop = Path::new(env!("CARGO_BIN_EXE_chunky_print"))
+        .parent()
+        .unwrap()
+        .join("reverie-dbt-callers/basics-noop/manifest.json");
+    reverie_dbt::CallerArtifact::load(&noop).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_chunky_print"));
+    command
+        .args(["--backend", "dbt", "--preload"])
+        .arg(preload())
+        .arg("--dbt-artifact")
+        .arg(noop)
+        .arg("--")
+        .args([
+            env!("CARGO_BIN_EXE_reverie-liteinst-env-guest"),
+            "chunky-alias-order",
+        ]);
+    let output = output_with_timeout(&mut command);
+    eprintln!("ChunkyPrint Noop child: {output:?}");
+    // A successful real Noop guest with every token is required before the
+    // unchanged buffering oracle's rejection can demonstrate sensitivity.
+    assert_chunky_print_guest_bytes(&output);
+    assert!(std::panic::catch_unwind(|| assert_chunky_print_buffering(output)).is_err());
+}
+
+#[test]
+fn dbt_chunky_print_missing_artifact_refuses() {
+    let default = Path::new(env!("CARGO_BIN_EXE_chunky_print"))
+        .parent()
+        .unwrap()
+        .join("reverie-dbt-callers/chunky-print/manifest.json");
+    reverie_dbt::CallerArtifact::load(&default).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.json");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_chunky_print"));
+    command
+        .args(["--backend", "dbt", "--preload"])
+        .arg(preload())
+        .arg("--dbt-artifact")
+        .arg(&missing)
+        .arg("--")
+        .args([
+            env!("CARGO_BIN_EXE_reverie-liteinst-env-guest"),
+            "chunky-alias-order",
+        ]);
+    let output = output_with_timeout(&mut command);
+    eprintln!("ChunkyPrint missing-artifact child: {output:?}");
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot load DBT caller artifact"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(missing.to_str().unwrap()), "{stderr}");
 }
 
 #[test]

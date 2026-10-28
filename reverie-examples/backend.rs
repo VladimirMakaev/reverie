@@ -14,9 +14,11 @@
 //! The in-guest backends (LiteInst, in-guest-trap, e9patch) host a tool
 //! through a preload that compiles it in: the example preload,
 //! `libreverie_examples.so` (`src/lib.rs`), selects the tool by the name the
-//! caller passes. Counter1, Counter2, Strace and ChromeTrace select verified DBT caller
-//! artifacts through `run_blocking_with_caller`, with the tool's GlobalState
-//! served here by the caller owner. These callers inherit the CLI's stdin.
+//! caller passes. Counter1, Counter2, Strace, ChromeTrace and ChunkyPrint select
+//! verified DBT caller artifacts through `run_blocking_with_caller`, with the tool's GlobalState
+//! served here by the caller owner. These public DBT callers inherit stdin,
+//! stdout and stderr, so guest and controller writes reach the same streams
+//! when issued. Captured-output APIs keep their separate capture contract.
 //! Other examples use DBT's prototype runtime
 //! (reverie-dbt), which selects a compiled-in tool by the same name
 //! (`reverie_dbt::TOOL_ENV`) and serves its GlobalState here over DBT's
@@ -405,32 +407,17 @@ where
         command.env("PATH", "/bin/:/usr/bin");
     }
     command.envs(args.envs.iter().cloned());
-    let (output, global_state) = runner
-        .output_with_inherited_stdin_and_caller_tool::<T::GlobalState>(&command, config)
+    let (status, global_state) = runner
+        .status_with_caller_tool::<T::GlobalState>(&command, config)
         .await
-        .map_err(|error| {
-            if let Some(output) = reverie_dbt::failed_run_output(&error) {
-                use std::io::Write as _;
-                // These are the already captured launch streams. A separately
-                // configured diagnostic file remains separate; no guest fd is
-                // changed and the failed launch remains an error.
-                let stdout = std::io::stdout().write_all(&output.stdout);
-                let stderr = std::io::stderr().write_all(&output.stderr);
-                if let Err(report_error) = stdout.and(stderr) {
-                    return anyhow::Error::new(error).context(format!(
-                        "could not forward captured caller output: {report_error}"
-                    ));
-                }
-            }
-            anyhow::Error::new(error)
-        })?;
+        .map_err(anyhow::Error::new)?;
     use std::os::unix::process::ExitStatusExt as _;
-    let status = ExitStatus::from_raw(output.status.into_raw());
+    let status = ExitStatus::from_raw(status.into_raw());
     Ok(Run {
         status,
         exit_code: exit_code(status),
         global_state,
-        captured: Some((output.stdout, output.stderr)),
+        captured: None,
     })
 }
 

@@ -22,6 +22,22 @@ native DynamoRIO client:
   guest environment; and
 - optionally reports process totals when the application exits.
 
+## Authenticated caller Tool streams
+
+`DbtRunner::status_with_caller_tool` runs a paired caller Tool with inherited
+stdin, stdout and stderr through the existing coordinated status path. It
+requires the same authenticated activation and consuming Finished receipt as
+the caller output APIs, and returns the actual GlobalState. A protocol failure
+after waiting retains the reaped status with empty captured-output buffers;
+inherited bytes have already reached their streams.
+
+The public Counter1, Counter2, Strace, ChromeTrace and ChunkyPrint examples use
+this method, so guest writes and GlobalState RPC writes are delivered when
+issued. Only this public DBT caller route changes output delivery; the separate
+captured-output APIs still return their buffers. Caller signal termination
+remains an error, and initial-process, lifecycle and private RPC environment
+limits are unchanged. Legacy prototype Tool implementations remain separate.
+
 ## Caller-owned environment privacy
 
 `DbtRunner` leaves ordinary guest variables visible, including application

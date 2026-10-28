@@ -22,10 +22,12 @@ printf 'hello\n' | target/debug/chrome_trace --backend dbt --out trace.json -- /
 
 Ptrace remains the default. `--dbt-artifact` or `REVERIE_DBT_CALLER_ARTIFACT`
 selects a verified caller manifest; an invalid selection fails without fallback.
-The shared Counter1, Counter2, Strace and ChromeTrace caller launcher inherits
-stdin. It still forwards captured stdout/stderr after completion, reports
-signal termination as an error, and retains the caller's existing lifecycle
-and private RPC environment limits.
+The shared Counter1, Counter2, Strace, ChromeTrace and ChunkyPrint public DBT
+caller launcher inherits stdin, stdout and stderr. Guest and controller writes
+reach those streams when issued instead of being replayed after completion.
+The separate captured-output APIs keep their capture contract. Signal
+termination remains an error, and the caller's existing lifecycle and private
+RPC environment limits remain.
 
 The separate `HERMIT_DBT_CHROME_TRACE` prototype remains an unconverted
 implementation with its existing script consumers. It does not use this
@@ -77,6 +79,22 @@ useful for observing the overhead of interception, and as a starting point.
 This example tool intercepts write events on stdout and stderr and
 manipulates either when those outputs are released, or the scheduling order
 that determines the order of printed output.
+
+The public DBT command runs the actual shared ChunkyPrint Tool and returns its
+GlobalState without changing its epoch policy or final flush. Produce the caller
+for the command's Cargo profile:
+
+```bash
+reverie-dbt/scripts/build-client.sh \
+  --caller-manifest reverie-examples/chunky-print-dbt-runtime/Cargo.toml \
+  --profile debug --jobs 8 --check
+target/debug/chunky_print --backend dbt -- /bin/echo hello
+```
+
+Ptrace remains the default. The normal `--dbt-artifact` override selects a
+verified caller without prototype fallback. The separate
+`HERMIT_DBT_CHUNKY_PRINT` prototype and its script consumers remain unconverted;
+this public caller does not expand their fork, exec or signal support.
 
 # strace: Reverie Echo Tool
 

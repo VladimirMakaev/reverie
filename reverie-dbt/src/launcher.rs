@@ -770,6 +770,28 @@ impl DbtRunner {
         }
     }
 
+    /// Runs a paired caller Tool with inherited stdin, stdout and stderr.
+    ///
+    /// Activation, consuming completion and the initial-process domain are
+    /// the same as [`Self::output_with_caller_tool`]. Guest writes reach the
+    /// inherited streams as issued, alongside writes from the coordinator global
+    /// state. Signal termination remains a caller launch error.
+    ///
+    /// A protocol failure after waiting retains the real child status through
+    /// [`failed_run_output`], with empty buffers because output was inherited.
+    pub async fn status_with_caller_tool<G>(
+        &self,
+        guest: &Command,
+        config: G::Config,
+    ) -> io::Result<(ExitStatus, G)>
+    where
+        G: GlobalTool + 'static,
+    {
+        let mut runner = self.clone();
+        runner.caller_tool = true;
+        runner.status_with_global::<G>(guest, config).await
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(impl-dbi-gap-closure): Review exact-environment DBT status launch.
     /// Runs `guest` with one shared global and an exact environment.
@@ -1565,9 +1587,9 @@ pub struct DbtFailedRunOutput {
     /// Actual reaped child status, when failure followed a completed wait.
     /// Earlier wait/evidence failures may not retain a status.
     pub status: Option<ExitStatus>,
-    /// Everything the guest tree wrote to stdout.
+    /// Captured stdout; empty for inherited-output status runs.
     pub stdout: Vec<u8>,
-    /// Everything the guest tree wrote to stderr.
+    /// Captured stderr; empty for inherited-output status runs.
     pub stderr: Vec<u8>,
     error: io::Error,
 }
@@ -4470,6 +4492,193 @@ mod tests {
         assert_eq!(output.status.unwrap().code(), Some(7));
         assert_eq!(output.stdout, b"native-out\n");
         assert_eq!(output.stderr, b"native-diagnostic\n");
+    }
+
+    #[tokio::test]
+    async fn caller_status_requires_activation_and_reaps_child() {
+        const CHILD: &str = "REVERIE_DBT_TEST_CALLER_STATUS_CHILD";
+        const DIRECTORY: &str = "REVERIE_DBT_TEST_CALLER_STATUS_DIRECTORY";
+        let mode = std::env::var_os(CHILD);
+        if mode.is_none() {
+            // Capture only an owned subprocess. Redirecting this libtest
+            // process's descriptors would race unrelated parallel tests.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            for mode in ["normal", "pipe-holder"] {
+                let directory = tempfile::tempdir().unwrap();
+                let pid_file = directory.path().join("child-pid");
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "launcher::tests::caller_status_requires_activation_and_reaps_child",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, mode)
+                    .env(DIRECTORY, directory.path())
+                    .process_group(0)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let group = child.id() as i32;
+                let mut descendant = None;
+                let mut ready_deadline = None;
+                // Errors return into unconditional cleanup below, not out of
+                // the test. WNOWAIT keeps the group leader's identity owned.
+                let observed = (|| -> io::Result<bool> {
+                    loop {
+                        if std::time::Instant::now() >= ready_deadline.unwrap_or(deadline) {
+                            return Ok(true);
+                        }
+                        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+                        // SAFETY: writable storage and our unreaped child PID.
+                        let waited = unsafe {
+                            libc::waitid(
+                                libc::P_PID,
+                                child.id() as libc::id_t,
+                                info.as_mut_ptr(),
+                                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                            )
+                        };
+                        if waited == -1 {
+                            let error = io::Error::last_os_error();
+                            if error.kind() == io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            return Err(error);
+                        }
+                        // SAFETY: waitid succeeded; zero si_pid means running.
+                        if unsafe { info.assume_init().si_pid() } != 0 {
+                            return Ok(false);
+                        }
+                        if mode == "pipe-holder" && descendant.is_none() {
+                            match std::fs::read_to_string(&pid_file) {
+                                Ok(pid) if pid.ends_with('\n') => {
+                                    let pid = pid.trim().parse::<i32>().map_err(|error| {
+                                        io::Error::new(io::ErrorKind::InvalidData, error)
+                                    })?;
+                                    // SAFETY: getpgid only observes this PID.
+                                    if pid <= 1 || unsafe { libc::getpgid(pid) } != group {
+                                        return Err(io::Error::other(
+                                            "pipe-holding descendant escaped the owned group",
+                                        ));
+                                    }
+                                    descendant = Some(pid);
+                                    ready_deadline = Some(
+                                        (std::time::Instant::now()
+                                            + std::time::Duration::from_millis(100))
+                                        .min(deadline),
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                })();
+                // The negative case must still have a live descendant when
+                // cleanup starts, rather than merely observe a normal exit.
+                let live_descendant = (|| -> io::Result<bool> {
+                    let Some(pid) = descendant else {
+                        return Ok(false);
+                    };
+                    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+                    let (_, fields) = stat
+                        .rsplit_once(')')
+                        .ok_or_else(|| io::Error::other("malformed descendant process stat"))?;
+                    let state = fields.split_ascii_whitespace().next();
+                    // SAFETY: getpgid only observes the published child PID.
+                    Ok(matches!(state, Some(state) if state != "Z" && state != "X")
+                        && unsafe { libc::getpgid(pid) == group })
+                })();
+                let killed = terminate_process_group(group);
+                let _ = child.kill();
+                let emptied = wait_for_process_group_no_live_members_until(group, deadline);
+                if emptied.is_err() {
+                    // A cleanup error must not turn into an unbounded pipe
+                    // drain. The worker has also received its own kill attempt.
+                    drop(child.stdout.take());
+                    drop(child.stderr.take());
+                }
+                let output = child.wait_with_output();
+                // SAFETY: query the worker only after its owned wait.
+                let waited = unsafe { libc::waitpid(group, std::ptr::null_mut(), libc::WNOHANG) };
+                let wait_error = io::Error::last_os_error().raw_os_error();
+                // All assertions and error propagation follow cleanup/reap.
+                let output = output.unwrap();
+                eprintln!(
+                    "isolated caller status {mode}: {output:?}; live descendant={live_descendant:?}"
+                );
+                killed.unwrap();
+                emptied.unwrap();
+                let timed_out = observed.unwrap();
+                let live_descendant = live_descendant.unwrap();
+                assert_eq!(timed_out, mode == "pipe-holder", "{output:?}");
+                if mode == "pipe-holder" {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    assert!(live_descendant);
+                    assert_eq!(output.status.signal(), Some(libc::SIGKILL));
+                } else {
+                    assert!(output.status.success(), "{output:?}");
+                }
+                assert_eq!(waited, -1);
+                assert_eq!(wait_error, Some(libc::ECHILD));
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .matches("status-out\n")
+                        .count(),
+                    1,
+                    "{output:?}"
+                );
+                assert_eq!(output.stderr, b"status-diagnostic\n", "{output:?}");
+            }
+            return;
+        }
+
+        let mode = mode.unwrap();
+        assert!(mode == "normal" || mode == "pipe-holder");
+        let directory = PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
+        let pid_file = directory.join("child-pid");
+        // Keep the stand-in in its supervising worker's group. It never changes
+        // groups or sessions, and the parent owns both cleanup and the deadline.
+        let runner = fixture_runner(fake_drrun(&directory), fake_client()).unwrap();
+        let mut guest = Command::new("/bin/bash");
+        guest.args([
+            "-c",
+            "printf 'status-out\\n'; printf 'status-diagnostic\\n' >&198; printf '%s\\n' \"$$\" > \"$1\"; if [ \"$2\" = pipe-holder ]; then exec /bin/sleep 60; fi; exit 7",
+            "caller-status-fixture",
+        ]);
+        guest.arg(&pid_file).arg(mode);
+        let error = runner
+            .status_with_caller_tool::<crate::Counter2Global>(&guest, ())
+            .await
+            .unwrap_err();
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // This stand-in sends no activation/Finished receipt. It exercises
+        // the real wait and inherited streams, not a native Tool host.
+        let waited = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(waited, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("Tool activation lacks committed Started and Finished acknowledgements"),
+            "{error}"
+        );
+        let output = failed_run_output(&error)
+            .unwrap_or_else(|| panic!("caller protocol error dropped reaped status: {error}"));
+        assert_eq!(output.status.unwrap().code(), Some(7));
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
     }
 
     #[test]

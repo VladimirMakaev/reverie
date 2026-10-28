@@ -126,6 +126,15 @@ jobs:
         reverie-dbt/scripts/build-client.sh
         --caller-manifest reverie-examples/strace-dbt-runtime/Cargo.toml
         --profile debug --jobs 8 --check
+    - name: DBT ChunkyPrint caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest reverie-examples/chunky-print-dbt-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
     - name: DBT ChromeTrace caller artifact and standalone gates
       timeout-minutes: 15
       env:
@@ -344,6 +353,15 @@ jobs:
       run: >-
         reverie-dbt/scripts/build-client.sh
         --caller-manifest reverie-examples/strace-dbt-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
+    - name: DBT ChunkyPrint caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest reverie-examples/chunky-print-dbt-runtime/Cargo.toml
         --profile debug --jobs 8 --check
     - name: DBT ChromeTrace caller artifact and standalone gates
       timeout-minutes: 15
