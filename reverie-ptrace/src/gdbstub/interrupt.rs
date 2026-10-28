@@ -133,6 +133,7 @@ impl Interrupt {
     /// The session waits for the stops of threads `tids`.
     pub fn wait_for(&self, tids: impl IntoIterator<Item = Pid>) {
         *self.lock(&self.0.waiting) = tids.into_iter().collect();
+        self.changed();
     }
 
     /// The Tool runs one thread at a time: a thread that waits inside a
@@ -232,6 +233,19 @@ impl Interrupt {
     pub async fn requested_in_place(&self) {
         self.until(|interrupt| {
             interrupt.is_requested() && interrupt.0.in_place.load(Ordering::SeqCst)
+        })
+        .await
+    }
+
+    /// Waits for a request that thread `tid` may take where it waits: the
+    /// request is pending, in-place taking is allowed, and the session
+    /// waits for `tid`'s stop. A thread the session does not wait for never
+    /// resolves this, so polling it cannot spin on a ready future.
+    pub async fn requested_in_place_for(&self, tid: Pid) {
+        self.until(|interrupt| {
+            interrupt.is_requested()
+                && interrupt.0.in_place.load(Ordering::SeqCst)
+                && interrupt.lock(&interrupt.0.waiting).contains(&tid)
         })
         .await
     }
@@ -396,6 +410,36 @@ mod tests {
             "its stop would reach no one"
         );
         assert!(interrupt.take(t()));
+    }
+
+    #[test]
+    fn in_place_taking_waits_for_a_thread_the_session_waits_for() {
+        let interrupt = interrupt();
+        rearm(&interrupt, 1);
+        interrupt.request(1);
+        interrupt.allow_in_place();
+        let other = Pid::from_raw(8);
+        assert!(
+            interrupt
+                .requested_in_place_for(other)
+                .now_or_never()
+                .is_none(),
+            "a thread outside the waiting set cannot take it in place"
+        );
+        assert!(
+            interrupt
+                .requested_in_place_for(t())
+                .now_or_never()
+                .is_some()
+        );
+        interrupt.wait_for([other]);
+        assert!(
+            interrupt
+                .requested_in_place_for(other)
+                .now_or_never()
+                .is_some(),
+            "joining the waiting set lets the thread take it in place"
+        );
     }
 
     #[test]

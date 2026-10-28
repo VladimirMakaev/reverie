@@ -409,7 +409,7 @@ impl ParkedForGdb {
         let output = {
             let mut callback = std::pin::pin!(callback);
             loop {
-                let in_place = std::pin::pin!(interrupt.requested_in_place());
+                let in_place = std::pin::pin!(interrupt.requested_in_place_for(parked.tid));
                 match future::select(callback.as_mut(), in_place).await {
                     Either::Left((output, _)) => break output,
                     // Only while the tracee is in a ptrace stop, where gdb can
@@ -421,6 +421,18 @@ impl ParkedForGdb {
                                 "gdb's interrupt taken where the thread waits in a Tool callback"
                             );
                             parked.stop_for_interrupt().await;
+                        } else {
+                            // The request is still pending but this thread
+                            // cannot take it now (its ports are busy). Wait
+                            // for the request to settle, polling only the
+                            // callback: rebuilding the in-place future here
+                            // would spin, as it is already ready.
+                            let settled = std::pin::pin!(interrupt.settled());
+                            if let Either::Left((output, _)) =
+                                future::select(callback.as_mut(), settled).await
+                            {
+                                break output;
+                            }
                         }
                     }
                     // The callback has the tracee run a syscall, such as one
