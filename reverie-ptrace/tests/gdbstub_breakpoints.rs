@@ -41,8 +41,12 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use reverie::ExitStatus;
+use reverie::Guest as TracedGuest;
+use reverie::Signal;
 use reverie::Tool;
 use reverie::process::Command;
+use reverie::syscalls::Errno;
+use reverie::syscalls::Getpid;
 use reverie_ptrace::TracerBuilder;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -331,14 +335,24 @@ where
     F: FnOnce(Remote) -> Fut,
     Fut: Future<Output = ()>,
 {
+    debug_command_to_end::<NoopTool, _, _>(Command::new(path), name, client).await
+}
+
+/// Runs `command` under Reverie's GDB server with Tool `T`, with `client`
+/// as GDB, and returns how the guest ended.
+async fn debug_command_to_end<T, F, Fut>(command: Command, name: &str, client: F) -> ExitStatus
+where
+    T: Tool + 'static,
+    F: FnOnce(Remote) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let socket = std::env::temp_dir().join(format!(
         "reverie-gdbstub-{name}-{}.sock",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&socket);
-    let command = Command::new(path);
     let tracer = async {
-        TracerBuilder::<NoopTool>::new(command)
+        TracerBuilder::<T>::new(command)
             .gdbserver(socket.clone())
             .spawn()
             .await
@@ -568,4 +582,110 @@ async fn a_guest_int3_that_gdb_passes_on_kills_the_guest() {
         matches!(status, ExitStatus::Signaled(reverie::Signal::SIGTRAP, _)),
         "{status:?}"
     );
+}
+
+/// A Tool whose signal callback injects `getpid` before it delivers SIGUSR1,
+/// so that the thread's latest stop is the injection's, not the signal's.
+#[derive(Default)]
+struct InjectInSignal;
+
+#[reverie::tool]
+impl Tool for InjectInSignal {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_signal_event<G: TracedGuest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: Signal,
+    ) -> Result<Option<Signal>, Errno> {
+        if signal == Signal::SIGUSR1 {
+            guest.inject(Getpid::new()).await?;
+        }
+        Ok(Some(signal))
+    }
+}
+
+/// As `InjectInSignal`, but the callback first chooses SIGUSR1's siginfo
+/// (`Guest::set_signal_info`): `SI_QUEUE` with value 4242.
+#[derive(Default)]
+struct ReplaceInSignal;
+
+#[reverie::tool]
+impl Tool for ReplaceInSignal {
+    type GlobalState = ();
+    type ThreadState = ();
+
+    async fn handle_signal_event<G: TracedGuest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: Signal,
+    ) -> Result<Option<Signal>, Errno> {
+        if signal == Signal::SIGUSR1 {
+            // SAFETY: an all-zero siginfo is valid.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            info.si_signo = libc::SIGUSR1;
+            info.si_code = libc::SI_QUEUE;
+            // SAFETY: both are 128 bytes of plain integers on Linux.
+            let mut bytes: [u8; reverie::SIGNAL_INFO_SIZE] = unsafe { std::mem::transmute(info) };
+            // `si_value` follows the sender's pid and uid in the queue
+            // member, after the three leading ints and their padding.
+            bytes[24..28].copy_from_slice(&4242i32.to_ne_bytes());
+            guest.set_signal_info(bytes)?;
+            guest.inject(Getpid::new()).await?;
+        }
+        Ok(Some(signal))
+    }
+}
+
+/// The guest that queues itself SIGUSR1 and checks the siginfo its handler
+/// gets.
+fn signal_guest() -> &'static Path {
+    static GUEST: LazyLock<PathBuf> =
+        LazyLock::new(|| build_guest("gdbstub_guest_signal", &[], &[]).0);
+    &GUEST
+}
+
+/// GDB's `stepi` at a signal stop: SIGUSR1 stops the guest and is reported
+/// as `T1e` (gdb's number for it), and GDB steps with it (`vCont;S1e`).
+/// The step takes the same resume as a continue, so the handler gets
+/// `want`'s siginfo: the signal's own after the callback's injection, or the
+/// one the callback chose. Before, a step skipped that resume, and the
+/// handler got a siginfo the kernel made up.
+async fn step_with_a_signal_keeps_its_siginfo<T>(name: &str, want: &str)
+where
+    T: Tool + 'static,
+{
+    let mut command = Command::new(signal_guest());
+    command.arg(want);
+    let status = debug_command_to_end::<T, _, _>(command, name, |mut remote| async move {
+        let stop = remote.resume().await;
+        assert!(
+            stop.starts_with("T1e"),
+            "expected a SIGUSR1 stop, got {stop:?}"
+        );
+        let thread = remote.thread.clone();
+        let stepped = remote.request(&format!("vCont;S1e:{thread}")).await;
+        assert!(
+            stepped.starts_with("T05"),
+            "expected the step's SIGTRAP stop, got {stepped:?}"
+        );
+        assert_exited_zero(&remote.resume().await, "after stepping into the handler");
+    })
+    .await;
+    assert_eq!(
+        status,
+        ExitStatus::Exited(0),
+        "the handler saw another siginfo"
+    );
+}
+
+#[tokio::test]
+async fn a_step_with_a_signal_keeps_its_own_siginfo_after_an_injection() {
+    step_with_a_signal_keeps_its_siginfo::<InjectInSignal>("step-signal-own", "own").await;
+}
+
+#[tokio::test]
+async fn a_step_with_a_signal_keeps_the_siginfo_the_tool_chose() {
+    step_with_a_signal_keeps_its_siginfo::<ReplaceInSignal>("step-signal-tool", "tool").await;
 }
