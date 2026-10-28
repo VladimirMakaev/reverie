@@ -1433,3 +1433,269 @@ async fn forced_legacy_nonleader_reattach_joins_retired_owner() {
         drop((detached, running));
     }
 }
+
+// A legacy non-leader's stops reach its waiter without waiting out the
+// worker's poll period. Fast single steps: the ptracer's consume wakes the
+// worker to publish. Syscall stops resumed after the ptracer was busy for
+// longer than the period, each entry about 300 µs after the resumption:
+// the resumption wakes the worker to observe. With 1 ms polling, every one
+// of these stops took up to two whole periods.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_nonleader_steps_are_not_paced_by_the_poll_period() {
+    if run_legacy_test_outer("forced_legacy_nonleader_steps_are_not_paced_by_the_poll_period") {
+        return;
+    }
+    const FAST_STEPS: usize = 200;
+    const BUSY_SYSCALLS: usize = 20;
+    let (_root, stopped, _root_cleanup, _force) = spawn_legacy_threads(
+        &[1],
+        legacy_thread_options() | Options::PTRACE_O_TRACESYSGOOD,
+        LegacyAttachMethod::Traceme,
+    );
+    let (_parent, crate::Event::NewChild(crate::ChildOp::Clone, child)) = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        stopped.resume(None).unwrap().wait_owned_on_ptracer_thread(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .assume_stopped() else {
+        panic!("missing spinning pthread clone");
+    };
+    let _child_cleanup = legacy_child_cleanup(&child);
+    let event = Arc::clone(child.terminal_cleanup().event.event());
+    let (mut child, sigstop) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, child.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(sigstop, crate::Event::Signal(Signal::SIGSTOP));
+    let late_turns = || event.legacy_late_turns.load(Ordering::Relaxed);
+    let before = late_turns();
+    for _ in 0..FAST_STEPS {
+        let (stepped, trap) = tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            child.step(None).unwrap().wait_owned_on_ptracer_thread(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_stopped();
+        assert_eq!(trap, crate::Event::Signal(Signal::SIGTRAP));
+        child = stepped;
+    }
+    let fast_late = late_turns() - before;
+    assert!(
+        fast_late < FAST_STEPS / 4,
+        "{fast_late} of {FAST_STEPS} fast steps waited out the poll period"
+    );
+    let before = late_turns();
+    // Entry and exit stops: every entry comes about 300 µs after its resumption.
+    for _ in 0..2 * BUSY_SYSCALLS {
+        // Long enough for the worker to back off to the whole period.
+        thread::sleep(LEGACY_POLL_PERIOD * 3);
+        let (next, stop) = tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            child.syscall(None).unwrap().wait_owned_on_ptracer_thread(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_stopped();
+        assert_eq!(stop, crate::Event::Syscall);
+        child = next;
+    }
+    let busy_late = late_turns() - before;
+    assert!(
+        busy_late < BUSY_SYSCALLS,
+        "{busy_late} of {} syscall stops after a busy ptracer waited out the poll period",
+        2 * BUSY_SYSCALLS
+    );
+}
+/// Counts this thread's retained status reads during each legacy consuming
+/// attempt until `done`, asserting that no attempt reads more than once, and
+/// returns how many attempts read.
+fn legacy_attempt_reads(terminal: &TerminalCleanup, done: impl Fn() -> bool) -> usize {
+    let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
+    let mut attempts_that_read = 0;
+    loop {
+        let before = RETAINED_STATUS_READS.with(Cell::get);
+        terminal.event.try_assist_legacy_wait().unwrap();
+        let reads = RETAINED_STATUS_READS.with(Cell::get) - before;
+        assert!(
+            reads <= 1,
+            "one legacy consuming attempt read status {reads} times"
+        );
+        attempts_that_read += reads;
+        if done() {
+            return attempts_that_read;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "legacy consuming attempts never finished"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A consuming attempt on the legacy path reads the target's retained status
+/// once, whether it finds nothing or consumes a stop: the read follows the
+/// numeric observation, so it is both that observation's postcheck and the
+/// owner's authentication. The observation worker's turns that find nothing
+/// read it at most once per LEGACY_CHECK_PERIOD.
+#[tokio::test(flavor = "current_thread")]
+#[cfg(not(sanitized))]
+async fn forced_legacy_waits_read_target_status_once_per_attempt_or_period() {
+    if run_legacy_test_outer("forced_legacy_waits_read_target_status_once_per_attempt_or_period") {
+        return;
+    }
+    let (root, stopped, mut root_cleanup, _force) = spawn_legacy_thread_tracee(true);
+    let root_exit = root_cleanup.exit_event_on_ptracer_thread(&stopped).unwrap();
+    let root_terminal = stopped.terminal_cleanup();
+    let (parent, crate::Event::NewChild(crate::ChildOp::Clone, child)) = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        stopped.resume(None).unwrap().wait_owned_on_ptracer_thread(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .assume_stopped() else {
+        panic!("missing paused pthread clone");
+    };
+    let child_tid = child.pid();
+    let mut child_cleanup = legacy_child_cleanup(&child);
+    let terminal = child.terminal_cleanup();
+    let (child, event) =
+        tokio::time::timeout(TRACEE_WAIT_TIMEOUT, child.wait_owned_on_ptracer_thread())
+            .await
+            .unwrap()
+            .unwrap()
+            .assume_stopped();
+    assert_eq!(event, crate::Event::Signal(Signal::SIGSTOP));
+    let parent_running = parent.resume(None).unwrap();
+    let child_running = child.resume(None).unwrap();
+
+    // The thread sleeps in pause(), so every worker turn finds nothing.
+    // Each turn used to read status; now one read covers LEGACY_CHECK_PERIOD.
+    let worker = terminal.event.event().clone();
+    let counts = || {
+        (
+            worker.legacy_worker_turns.load(Ordering::Relaxed),
+            worker.legacy_worker_status_reads.load(Ordering::Relaxed),
+        )
+    };
+    let (turns_before, reads_before) = counts();
+    let start = Instant::now();
+    let deadline = start + TRACEE_WAIT_TIMEOUT;
+    loop {
+        thread::sleep(Duration::from_millis(20));
+        let (turns, reads) = counts();
+        let elapsed = start.elapsed();
+        let (turns, reads) = (turns - turns_before, reads - reads_before);
+        let period_bound = (elapsed.as_millis() / LEGACY_CHECK_PERIOD.as_millis()) as usize + 2;
+        assert!(
+            reads <= period_bound,
+            "empty worker turns read status {reads} times in {turns} turns over {elapsed:?}"
+        );
+        // More turns than the period allows checks: some turns skipped it.
+        if turns > period_bound {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker took only {turns} turns over {elapsed:?}"
+        );
+    }
+
+    // Every ptracer attempt finds nothing as well.
+    let attempts = std::cell::Cell::new(0);
+    let empty = legacy_attempt_reads(&terminal, || {
+        attempts.set(attempts.get() + 1);
+        attempts.get() == 32
+    });
+    assert!(empty > 0, "no empty attempt reached its authentication");
+    assert!(terminal.event.event().pending_is_empty());
+
+    let state = || {
+        fs::read_to_string(format!("/proc/{root}/task/{child_tid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                Some(
+                    stat.rsplit_once(')')?
+                        .1
+                        .split_whitespace()
+                        .next()?
+                        .to_owned(),
+                )
+            })
+    };
+    request_fixture_thread_sigstop(root, child_tid);
+    let deadline = Instant::now() + TRACEE_WAIT_TIMEOUT;
+    while state().as_deref() != Some("t") {
+        assert!(Instant::now() < deadline, "thread never reached its stop");
+        thread::sleep(Duration::from_millis(1));
+    }
+    let event = terminal.event.event().clone();
+    let consumed = || !event.legacy_wait.lock().consumed.is_empty() || !event.pending_is_empty();
+    assert!(legacy_attempt_reads(&terminal, consumed) > 0);
+    let (child, event) = tokio::time::timeout(
+        TRACEE_WAIT_TIMEOUT,
+        child_running.wait_owned_on_ptracer_thread(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .assume_stopped();
+    assert_eq!(child.pid(), child_tid);
+    assert_eq!(event, crate::Event::Signal(Signal::SIGSTOP));
+
+    let exit = child_cleanup.exit_event_on_ptracer_thread(&child).unwrap();
+    terminal.request_sigkill().unwrap();
+    drop(child);
+    let child = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, exit)
+        .await
+        .unwrap()
+        .unwrap();
+    child_cleanup.mark_claimed_exit();
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            child.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (
+            child_tid,
+            crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+        ),
+    );
+    assert!(terminal.wait(TRACEE_WAIT_TIMEOUT));
+    child_cleanup.disarm();
+
+    let parent = tokio::time::timeout(TRACEE_WAIT_TIMEOUT, root_exit)
+        .await
+        .unwrap()
+        .unwrap();
+    root_cleanup.mark_claimed_exit();
+    drop(parent_running);
+    assert_eq!(
+        tokio::time::timeout(
+            TRACEE_WAIT_TIMEOUT,
+            parent.resume(None).unwrap().wait_owned_on_ptracer_thread()
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .assume_exited(),
+        (
+            root.into(),
+            crate::ExitStatus::Signaled(Signal::SIGKILL, false)
+        ),
+    );
+    assert!(root_terminal.wait(TRACEE_WAIT_TIMEOUT));
+    root_cleanup.disarm();
+}
