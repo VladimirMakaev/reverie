@@ -83,6 +83,8 @@ pub use pty::PtyChild;
 pub use stdio::ChildStderr;
 pub use stdio::ChildStdin;
 pub use stdio::ChildStdout;
+pub use stdio::ParentStdio;
+pub use stdio::PreparedStdio;
 pub use stdio::Stdio;
 use syscalls::Errno;
 
