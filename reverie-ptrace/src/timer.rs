@@ -3227,7 +3227,11 @@ impl TimerImpl {
             #[cfg(target_arch = "x86_64")]
             trace!(
                 "[instruction]\n{}\n{}",
-                crate::decoder::decode_instruction(&task)?,
+                // A log line must not fail the step: the code can be
+                // unreadable to `process_vm_readv`, as in an execute-only
+                // page.
+                crate::decoder::decode_instruction(&task)
+                    .unwrap_or_else(|err| format!("(unreadable: {err})")),
                 regs.display_with_options(RegDisplayOptions { multiline: true })
             );
             #[cfg(target_arch = "x86_64")]
