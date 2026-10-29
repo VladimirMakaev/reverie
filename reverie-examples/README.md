@@ -22,8 +22,8 @@ printf 'hello\n' | target/debug/chrome_trace --backend dbt --out trace.json -- /
 
 Ptrace remains the default. `--dbt-artifact` or `REVERIE_DBT_CALLER_ARTIFACT`
 selects a verified caller manifest; an invalid selection fails without fallback.
-The shared Counter1, Counter2, Strace, ChromeTrace and ChunkyPrint public DBT
-caller launcher inherits stdin, stdout and stderr. Guest and controller writes
+The shared Counter1, Counter2, Strace, minimal Strace, ChromeTrace and ChunkyPrint
+public DBT caller launcher inherits stdin, stdout and stderr. Guest and controller writes
 reach those streams when issued instead of being replayed after completion.
 The separate captured-output APIs keep their capture contract. Signal
 termination remains an error, and the caller's existing lifecycle and private
@@ -99,6 +99,25 @@ this public caller does not expand their fork, exec or signal support.
 # strace: Reverie Echo Tool
 
 This instrumentation tool simply echos intercepted events, like strace.
+
+# strace_minimal: Minimal Strace Tool
+
+The shared `StraceTool` prints syscall arguments with ` = ?` before tail
+injection. The public DBT command uses that Tool through an authenticated caller:
+
+```bash
+reverie-dbt/scripts/build-client.sh \
+  --caller-manifest reverie-examples/strace-minimal-dbt-runtime/Cargo.toml \
+  --profile debug --jobs 8 --check
+target/debug/strace_minimal --backend dbt -- /bin/echo hello
+```
+
+Ptrace remains the default. `--dbt-artifact` or `REVERIE_DBT_CALLER_ARTIFACT`
+selects a verified manifest; missing or invalid artifacts fail without fallback.
+The DBT caller retains its initial-process and signal-error limits. Its shared
+Tool prints from inside the client: the echo test does not establish safety for
+stderr closure/reuse or syscall-hook reentrancy. The separate
+`HERMIT_DBT_STRACE` prototype and its consumers remain unchanged.
 
 # chaos: Chaos Tool
 

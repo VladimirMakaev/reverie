@@ -8,11 +8,11 @@
 
 //! End-to-end checks for the exact example `Tool` types on LiteInst, with
 //! Counter1 allocator coverage through the shared backend launcher.
-//! DBT Counter1, Counter2, Strace, ChromeTrace and ChunkyPrint require their
-//! explicit caller producers for the same Cargo profile and standard manifest
-//! layout.
-//! The ChromeTrace and ChunkyPrint negative controls also require the basics-noop
-//! caller. The separate Counter1 local-Global case requires the no-argument
+//! DBT Counter1, Counter2, Strace, minimal Strace, ChromeTrace and ChunkyPrint
+//! require their explicit caller producers for the same Cargo profile and
+//! standard manifest layout.
+//! The ChromeTrace, ChunkyPrint and minimal Strace negative controls also require
+//! the basics-noop caller. The separate Counter1 local-Global case requires the no-argument
 //! prototype producer `reverie-dbt/scripts/build-client.sh`, or `REVERIE_DBT_CLIENT`.
 
 use std::fs::File;
@@ -1660,6 +1660,92 @@ fn exact_strace_minimal_tool_observes_write() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("write(1,"), "{stderr}");
     assert!(stderr.contains(" = ?"), "{stderr}");
+}
+
+fn assert_strace_minimal_write(output: Output) {
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"hello\n");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("write(1,"), "{stderr}");
+    assert!(stderr.contains(" = ?"), "{stderr}");
+}
+
+fn strace_minimal_tool_observes_write(backend: &str) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_strace_minimal"));
+    command
+        .args(["--backend", backend, "--preload"])
+        .arg(preload())
+        .args(["--", "/bin/echo", "hello"]);
+    let output = output_with_timeout(&mut command);
+    eprintln!("strace-minimal {backend} child output: {output:?}");
+
+    assert_strace_minimal_write(output);
+}
+
+#[test]
+fn ptrace_strace_minimal_tool_observes_write() {
+    strace_minimal_tool_observes_write("ptrace");
+}
+
+#[test]
+fn dbt_strace_minimal_tool_observes_write() {
+    strace_minimal_tool_observes_write("dbt");
+}
+
+#[test]
+fn dbt_strace_minimal_oracle_requires_actual_tool() {
+    let noop = Path::new(env!("CARGO_BIN_EXE_strace_minimal"))
+        .parent()
+        .unwrap()
+        .join("reverie-dbt-callers/basics-noop/manifest.json");
+    reverie_dbt::CallerArtifact::load(&noop).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_strace_minimal"));
+    command
+        .args(["--backend", "dbt", "--preload"])
+        .arg(preload())
+        .arg("--dbt-artifact")
+        .arg(noop)
+        .args(["--", "/bin/echo", "hello"]);
+    let output = output_with_timeout(&mut command);
+    eprintln!("strace-minimal Noop child output: {output:?}");
+    // Successful execution of the real Noop guest is required before missing
+    // diagnostics can demonstrate the unchanged full oracle's sensitivity.
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"hello\n");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(std::panic::catch_unwind(|| assert_strace_minimal_write(output)).is_err());
+}
+
+#[test]
+fn dbt_strace_minimal_missing_artifact_refuses() {
+    let default = Path::new(env!("CARGO_BIN_EXE_strace_minimal"))
+        .parent()
+        .unwrap()
+        .join("reverie-dbt-callers/strace-minimal/manifest.json");
+    reverie_dbt::CallerArtifact::load(&default).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.json");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_strace_minimal"));
+    command
+        .args(["--backend", "dbt", "--preload"])
+        .arg(preload())
+        .arg("--dbt-artifact")
+        .arg(&missing)
+        .args(["--", "/bin/echo", "hello"]);
+    let output = output_with_timeout(&mut command);
+    eprintln!("strace-minimal missing-artifact child output: {output:?}");
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("cannot load DBT caller artifact"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(missing.to_str().unwrap()), "{stderr}");
+    assert!(
+        stderr.contains("run reverie-dbt/scripts/build-client.sh --caller-manifest reverie-examples/strace-minimal-dbt-runtime/Cargo.toml"),
+        "{stderr}"
+    );
 }
 
 #[test]

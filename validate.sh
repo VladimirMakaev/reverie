@@ -770,6 +770,10 @@ run_check "Build workspace" cargo build --workspace --all-features
 run_check "LiteInst allocator fixtures" build_liteinst_allocator_fixtures
 run_check "DBT virtual identity and pidfd_open policy" \
     "$ROOT_DIR/reverie-dbt/scripts/test-identity-policy.sh"
+run_check "DBT minimal Strace caller artifact and standalone gates" \
+    "$ROOT_DIR/reverie-dbt/scripts/build-client.sh" \
+    --caller-manifest "$ROOT_DIR/reverie-examples/strace-minimal-dbt-runtime/Cargo.toml" \
+    --profile debug --jobs 8 --check
 run_check "DBT ChunkyPrint caller artifact and standalone gates" \
     "$ROOT_DIR/reverie-dbt/scripts/build-client.sh" \
     --caller-manifest "$ROOT_DIR/reverie-examples/chunky-print-dbt-runtime/Cargo.toml" \
