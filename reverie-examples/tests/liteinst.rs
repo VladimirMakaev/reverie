@@ -1880,3 +1880,212 @@ fn dbt_strace_bad_override_never_uses_the_valid_default_pair() {
         }
     }
 }
+
+fn run_public_chaos(backend: &str, extra: &[&str], mode: &str) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_chaos"));
+    command
+        .args(["--backend", backend, "--preload"])
+        .arg(preload())
+        .args(extra)
+        .arg("--")
+        .arg(env!("CARGO_BIN_EXE_reverie-liteinst-env-guest"))
+        .arg(mode);
+    let output = output_with_timeout(&mut command);
+    eprintln!(
+        "chaos {backend} {mode} child status: {:?}; stdout bytes: {:?}; stderr bytes: {:?}",
+        output.status, output.stdout, output.stderr
+    );
+    output
+}
+
+fn assert_chaos_limits_reads_after_skip(output: Output) {
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"chaos-read-one\n");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("read("), "{stderr}");
+    assert!(stderr.contains(", 1) = 1"), "{stderr}");
+}
+
+fn assert_chaos_skip_suppresses_intervention(output: Output) {
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"chaos-read-four\n");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("SKIPPED"), "{stderr}");
+    assert!(!stderr.contains(" = -512"), "{stderr}");
+}
+
+fn assert_chaos_interrupts_then_limits_retry(output: Output) {
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"chaos-interrupt-then-one\n");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(" = -4"), "{stderr}");
+    assert!(stderr.contains(", 1) = 1"), "{stderr}");
+}
+
+fn chaos_tool_limits_reads_after_skip(backend: &str) {
+    let output = run_public_chaos(
+        backend,
+        &["--skip", "32", "--no-interrupt"],
+        "exercise-chaos-read",
+    );
+    assert_chaos_limits_reads_after_skip(output);
+}
+
+fn chaos_skip_suppresses_intervention_before_boundary(backend: &str) {
+    let output = run_public_chaos(
+        backend,
+        &["--skip", "18446744073709551615", "--no-interrupt"],
+        "exercise-chaos-full-read",
+    );
+    assert_chaos_skip_suppresses_intervention(output);
+}
+
+fn chaos_raw_interrupt_guest() -> PathBuf {
+    const SOURCE: &str = include_str!("fixtures/chaos-raw-interrupt.S");
+    static GUEST: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let directory = GUEST.get_or_init(|| {
+        let checked_source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/chaos-raw-interrupt.S");
+        assert_eq!(std::fs::read_to_string(checked_source).unwrap(), SOURCE);
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        std::fs::create_dir_all(root).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("chaos-raw-interrupt-")
+            .tempdir_in(root)
+            .unwrap();
+        let source = directory.path().join("guest.S");
+        std::fs::write(&source, SOURCE).unwrap();
+        // Follow caller_lifecycle_live's native fixture: compilation precedes
+        // the guest's ten-second bound, within the enclosing test deadline.
+        let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+        let mut command = Command::new(compiler);
+        command
+            .args([
+                "-nostdlib",
+                "-static",
+                "-no-pie",
+                "-Wl,-e,_start",
+                "-Wl,--build-id=none",
+                "-o",
+            ])
+            .arg(directory.path().join("guest"))
+            .arg(&source);
+        eprintln!(
+            "chaos raw compiler: {command:?}; source bytes: {:?}",
+            SOURCE.as_bytes()
+        );
+        let output = command.output().unwrap();
+        eprintln!("chaos raw compiler output: {output:?}");
+        assert!(output.status.success(), "guest compiler failed: {output:?}");
+        directory
+    });
+    directory.path().join("guest")
+}
+
+fn chaos_raw_interrupts_then_limits_retry(backend: &str) {
+    let guest = chaos_raw_interrupt_guest();
+    // Retain the exact compiled image, not just the checked-in assembly. The
+    // evidence reader can hash these bytes even after the temporary path goes.
+    let image = std::fs::read(&guest).unwrap();
+    eprintln!("chaos raw guest path: {guest:?}; image bytes: {image:?}");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_chaos"));
+    command
+        .args(["--backend", backend, "--preload"])
+        .arg(preload())
+        .args(["--skip", "32", "--"])
+        .arg(&guest);
+    let output = output_with_timeout(&mut command);
+    eprintln!(
+        "chaos {backend} raw-interrupt child status: {:?}; stdout bytes: {:?}; stderr bytes: {:?}",
+        output.status, output.stdout, output.stderr
+    );
+    assert_eq!(std::fs::read(&guest).unwrap(), image, "guest image changed");
+    assert_chaos_interrupts_then_limits_retry(output);
+}
+
+#[test]
+fn ptrace_chaos_tool_limits_reads_after_skip() {
+    chaos_tool_limits_reads_after_skip("ptrace");
+}
+
+#[test]
+fn dbt_chaos_tool_limits_reads_after_skip() {
+    chaos_tool_limits_reads_after_skip("dbt");
+}
+
+#[test]
+fn ptrace_chaos_skip_suppresses_intervention_before_boundary() {
+    chaos_skip_suppresses_intervention_before_boundary("ptrace");
+}
+
+#[test]
+fn dbt_chaos_skip_suppresses_intervention_before_boundary() {
+    chaos_skip_suppresses_intervention_before_boundary("dbt");
+}
+
+#[test]
+fn ptrace_chaos_raw_interrupts_then_limits_retry() {
+    chaos_raw_interrupts_then_limits_retry("ptrace");
+}
+
+#[test]
+fn dbt_chaos_raw_interrupts_then_limits_retry() {
+    chaos_raw_interrupts_then_limits_retry("dbt");
+}
+
+#[test]
+fn dbt_chaos_skip_oracle_requires_skip_configuration() {
+    let output = run_public_chaos(
+        "dbt",
+        &["--skip", "0", "--no-read", "--no-interrupt"],
+        "exercise-chaos-full-read",
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"chaos-read-four\n");
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(stderr.contains("read("), "{stderr}");
+    assert!(stderr.contains(", 4) = 4"), "{stderr}");
+    assert!(!stderr.contains("SKIPPED"), "{stderr}");
+    assert!(!stderr.contains(" = -512"), "{stderr}");
+    // Every other predicate of the same full positive oracle already holds.
+    assert!(
+        std::panic::catch_unwind(|| assert_chaos_skip_suppresses_intervention(output)).is_err()
+    );
+}
+
+#[test]
+fn dbt_chaos_missing_artifact_refuses() {
+    let default = Path::new(env!("CARGO_BIN_EXE_chaos"))
+        .parent()
+        .unwrap()
+        .join("reverie-dbt-callers/chaos/manifest.json");
+    reverie_dbt::CallerArtifact::load(&default).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.json");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_chaos"));
+    command
+        .args(["--backend", "dbt", "--preload"])
+        .arg(preload())
+        .arg("--dbt-artifact")
+        .arg(&missing)
+        .args(["--skip", "32", "--no-interrupt", "--"])
+        .arg(env!("CARGO_BIN_EXE_reverie-liteinst-env-guest"))
+        .arg("exercise-chaos-read");
+    let output = output_with_timeout(&mut command);
+    eprintln!(
+        "chaos missing-artifact child status: {:?}; stdout bytes: {:?}; stderr bytes: {:?}",
+        output.status, output.stdout, output.stderr
+    );
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("cannot load DBT caller artifact"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(missing.to_str().unwrap()), "{stderr}");
+    assert!(
+        stderr.contains("run reverie-dbt/scripts/build-client.sh --caller-manifest reverie-examples/chaos-dbt-runtime/Cargo.toml"),
+        "{stderr}"
+    );
+}

@@ -129,6 +129,29 @@ This tool is meant to emulate a pathological kernel where:
  2. `EINTR` is returned instead of running the real syscall for every other
     read.
 
+The public DBT command runs the same `ChaosTool` and `ChaosOpts` as ptrace.
+Produce the authenticated caller for the command's Cargo profile:
+
+```bash
+reverie-dbt/scripts/build-client.sh \
+  --caller-manifest reverie-examples/chaos-dbt-runtime/Cargo.toml \
+  --profile debug --jobs 8 --check
+target/debug/chaos --backend dbt --no-interrupt -- /bin/echo hello
+```
+
+Ptrace remains the default. `--dbt-artifact` or `REVERIE_DBT_CALLER_ARTIFACT`
+selects a verified manifest; invalid or missing artifacts fail without fallback.
+`--skip` counts intercepted startup syscalls too. The per-thread EINTR/retry
+state spans eligible reads, so a loader or language-runtime read can consume the
+first interruption before application code starts. The raw-syscall EINTR fixture
+checks Linux's `-EINTR` result separately from libc's `-1`/`errno` contract; it
+does not establish that the public Rust pipe fixture is the first eligible read.
+
+The caller retains its initial-process, lifecycle and signal-error limits. These
+pipe tests do not establish `recvfrom`, concurrent-clone or general stderr
+close/reuse/reentrancy behavior. The separate `HERMIT_DBT_CHAOS` prototype and
+its different option defaults remain unchanged.
+
 ## LiteInst backend
 
 Build the shared example preload and its launcher:

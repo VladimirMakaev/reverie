@@ -14,7 +14,8 @@
 //! The in-guest backends (LiteInst, in-guest-trap, e9patch) host a tool
 //! through a preload that compiles it in: the example preload,
 //! `libreverie_examples.so` (`src/lib.rs`), selects the tool by the name the
-//! caller passes. Counter1, Counter2, Strace, ChromeTrace and ChunkyPrint select
+//! caller passes. Counter1, Counter2, Strace, minimal Strace, ChromeTrace,
+//! ChunkyPrint and Chaos select
 //! verified DBT caller artifacts through `run_blocking_with_caller`, with the tool's GlobalState
 //! served here by the caller owner. These public DBT callers inherit stdin,
 //! stdout and stderr, so guest and controller writes reach the same streams

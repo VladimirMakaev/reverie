@@ -41,6 +41,7 @@ exclude = [
     "public_autocargo/experimental",
     "reverie-examples/strace-dbt-runtime",
     "reverie-examples/strace-minimal-dbt-runtime",
+    "reverie-examples/chaos-dbt-runtime",
     "reverie-examples/chrome-trace-dbt-runtime",
     "reverie-examples/chunky-print-dbt-runtime",
     "reverie-examples/counter1-dbt-runtime",
