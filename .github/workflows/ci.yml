@@ -126,6 +126,15 @@ jobs:
         reverie-dbt/scripts/build-client.sh
         --caller-manifest reverie-examples/strace-dbt-runtime/Cargo.toml
         --profile debug --jobs 8 --check
+    - name: DBT Recorder caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest reverie-examples/recorder-dbt-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
     - name: DBT Chaos caller artifact and standalone gates
       timeout-minutes: 15
       env:
@@ -371,6 +380,15 @@ jobs:
       run: >-
         reverie-dbt/scripts/build-client.sh
         --caller-manifest reverie-examples/strace-dbt-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
+    - name: DBT Recorder caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest reverie-examples/recorder-dbt-runtime/Cargo.toml
         --profile debug --jobs 8 --check
     - name: DBT Chaos caller artifact and standalone gates
       timeout-minutes: 15

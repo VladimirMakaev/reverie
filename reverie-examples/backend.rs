@@ -20,7 +20,9 @@
 //! served here by the caller owner. These public DBT callers inherit stdin,
 //! stdout and stderr, so guest and controller writes reach the same streams
 //! when issued. Captured-output APIs keep their separate capture contract.
-//! Other examples use DBT's prototype runtime
+//! Recorder also accepts an explicit authenticated caller through
+//! `run_with_caller`, with the same inherited-stream contract. Its default
+//! route retains captured output and null stdin. Other examples use DBT's prototype runtime
 //! (reverie-dbt), which selects a compiled-in tool by the same name
 //! (`reverie_dbt::TOOL_ENV`) and serves its GlobalState here over DBT's
 //! coordinator socket. SaBRe's

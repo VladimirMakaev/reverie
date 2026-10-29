@@ -770,6 +770,10 @@ run_check "Build workspace" cargo build --workspace --all-features
 run_check "LiteInst allocator fixtures" build_liteinst_allocator_fixtures
 run_check "DBT virtual identity and pidfd_open policy" \
     "$ROOT_DIR/reverie-dbt/scripts/test-identity-policy.sh"
+run_check "DBT Recorder caller artifact and standalone gates" \
+    "$ROOT_DIR/reverie-dbt/scripts/build-client.sh" \
+    --caller-manifest "$ROOT_DIR/reverie-examples/recorder-dbt-runtime/Cargo.toml" \
+    --profile debug --jobs 8 --check
 run_check "DBT Chaos caller artifact and standalone gates" \
     "$ROOT_DIR/reverie-dbt/scripts/build-client.sh" \
     --caller-manifest "$ROOT_DIR/reverie-examples/chaos-dbt-runtime/Cargo.toml" \
