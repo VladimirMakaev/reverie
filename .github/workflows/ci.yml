@@ -225,6 +225,15 @@ jobs:
         reverie-dbt/scripts/build-client.sh
         --caller-manifest tests/fixtures/stat-dbt-runtime/Cargo.toml
         --profile debug --jobs 8 --check
+    - name: DBT generic vDSO caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest tests/fixtures/vdso-dbt-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
     - name: DBT lifecycle caller artifact and standalone gates
       timeout-minutes: 15
       env:
@@ -497,6 +506,15 @@ jobs:
       run: >-
         reverie-dbt/scripts/build-client.sh
         --caller-manifest tests/fixtures/stat-dbt-runtime/Cargo.toml
+        --profile debug --jobs 8 --check
+    - name: DBT generic vDSO caller artifact and standalone gates
+      timeout-minutes: 15
+      env:
+        CARGO_BUILD_JOBS: "8"
+        CARGO_INCREMENTAL: "0"
+      run: >-
+        reverie-dbt/scripts/build-client.sh
+        --caller-manifest tests/fixtures/vdso-dbt-runtime/Cargo.toml
         --profile debug --jobs 8 --check
     - name: DBT lifecycle caller artifact and standalone gates
       timeout-minutes: 15

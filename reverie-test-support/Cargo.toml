@@ -48,3 +48,7 @@ path = "../tests/exit.rs"
 [[test]]
 name = "stat"
 path = "../tests/stat.rs"
+
+[[test]]
+name = "vdso"
+path = "../tests/vdso.rs"

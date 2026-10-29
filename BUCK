@@ -222,6 +222,7 @@ rust_library(
                 {"name": "basics", "path": "../tests/basics.rs"},
                 {"name": "exit", "path": "../tests/exit.rs"},
                 {"name": "stat", "path": "../tests/stat.rs"},
+                {"name": "vdso", "path": "../tests/vdso.rs"},
                 {"name": "dbt_command", "path": "tests/dbt_command.rs", "required-features": ["dbt"]},
             ],
             "dependencies_override": {
@@ -304,6 +305,25 @@ rust_unittest(
         "tests/tool_fixtures/stat.rs",
     ],
     crate_root = "tests/stat.rs",
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:tempfile",
+        ":reverie",
+        ":reverie-ptrace",
+        ":reverie-test-support",
+    ],
+)
+
+rust_unittest(
+    name = "generic-vdso",
+    srcs = [
+        "tests/vdso.rs",
+        "tests/fixtures/vdso-command.c",
+        "tests/support/vdso_command.rs",
+        "tests/tool_fixtures/vdso.rs",
+    ],
+    crate_root = "tests/vdso.rs",
     rustc_flags = sanitized_feature,
     deps = [
         "fbsource//third-party/rust:libc",

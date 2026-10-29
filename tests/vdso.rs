@@ -6,62 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use reverie::Error;
-use reverie::Guest;
-use reverie::Tool;
-use reverie::syscalls::Errno;
-use reverie::syscalls::MemoryAccess;
-use reverie::syscalls::Syscall;
-use reverie::syscalls::Timespec;
+#[cfg(all(not(sanitized), test))]
+#[path = "tool_fixtures/vdso.rs"]
+mod vdso_tool;
 
-#[derive(Debug, Default, Clone)]
-struct LocalState;
-
-#[reverie::tool]
-impl Tool for LocalState {
-    type GlobalState = ();
-    type ThreadState = ();
-
-    async fn handle_syscall_event<T: Guest<Self>>(
-        &self,
-        guest: &mut T,
-        syscall: Syscall,
-    ) -> Result<i64, Error> {
-        match syscall {
-            Syscall::ClockGettime(_gettime) => Err(Errno::EINVAL.into()),
-            Syscall::Gettimeofday(gettimeofday) => {
-                let retval = guest.inject(syscall).await?;
-                if let Some(tod) = gettimeofday.tv() {
-                    let mut tv = guest.memory().read_value(tod)?;
-                    tv.tv_usec = (tv.tv_usec / 1000) * 1000 + 345;
-                    guest.memory().write_value(tod, &tv)?;
-                }
-
-                Ok(retval)
-            }
-            Syscall::Getcpu(getcpu) => {
-                if let Some(cpu) = getcpu.cpu() {
-                    guest.memory().write_value(cpu, &0)?;
-                }
-                Ok(0)
-            }
-            Syscall::ClockGetres(clock_getres) => {
-                if let Some(ts) = clock_getres.res() {
-                    guest.memory().write_value(
-                        ts,
-                        &Timespec {
-                            tv_sec: 0,
-                            tv_nsec: 42,
-                        },
-                    )?;
-                }
-
-                Ok(0)
-            }
-            otherwise => guest.tail_inject(otherwise).await,
-        }
-    }
-}
+#[cfg(all(not(sanitized), test))]
+use vdso_tool::LocalState;
 
 #[cfg(all(not(sanitized), test))]
 mod tests {
@@ -122,4 +72,85 @@ mod tests {
             assert_eq!(res.tv_nsec, 42);
         });
     }
+}
+
+#[cfg(all(not(sanitized), test))]
+#[path = "support/vdso_command.rs"]
+mod command;
+
+#[cfg(all(not(sanitized), test))]
+fn assert_command_output(label: &str, output: &reverie::process::Output) {
+    eprintln!(
+        "vdso command {label}: status={:?} stdout={:02x?} stderr={:02x?}",
+        output.status, output.stdout, output.stderr,
+    );
+    assert_eq!(output.status, reverie::ExitStatus::Exited(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(all(not(sanitized), test))]
+#[test]
+fn ptrace_vdso_command() {
+    let guest = command::GuestBinary::compile();
+    guest.assert_native();
+    guest.record_before_launch("ptrace");
+    let (output, ()) =
+        reverie_test_support::test_cmd::<LocalState>(guest.program(), &["tool"]).unwrap();
+    assert_command_output("ptrace", &output);
+}
+
+#[cfg(all(not(sanitized), test, feature = "dbt"))]
+fn caller_manifest() -> std::path::PathBuf {
+    let executable = std::env::current_exe().unwrap();
+    executable
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("reverie-dbt-callers")
+        .join("vdso")
+        .join("manifest.json")
+}
+
+#[cfg(all(not(sanitized), test, feature = "dbt"))]
+#[test]
+fn dbt_vdso_command() {
+    let manifest = caller_manifest();
+    reverie_dbt::CallerArtifact::load(&manifest).unwrap();
+    let guest = command::GuestBinary::compile();
+    guest.assert_native();
+    guest.record_before_launch("dbt");
+    let (output, ()) = reverie_test_support::test_dbt_cmd_with_config::<LocalState>(
+        guest.program(),
+        &["tool"],
+        (),
+        &manifest,
+    )
+    .unwrap();
+    assert_command_output("dbt", &output);
+}
+
+#[cfg(all(not(sanitized), test, feature = "dbt"))]
+#[test]
+fn dbt_vdso_missing_artifact_refuses() {
+    let manifest = caller_manifest();
+    let _valid_default = reverie_dbt::CallerArtifact::load(&manifest).unwrap();
+    let missing = manifest.with_file_name("missing-vdso-manifest.json");
+    assert!(!missing.exists());
+    let error = reverie_test_support::test_dbt_cmd_with_config::<LocalState>(
+        "/bin/true",
+        &[],
+        (),
+        &missing,
+    )
+    .unwrap_err();
+    eprintln!(
+        "explicit missing vdso artifact {}: {error}",
+        missing.display()
+    );
+    let reverie::Error::Io(error) = error else {
+        panic!("expected missing manifest I/O error: {error}");
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 }

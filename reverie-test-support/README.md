@@ -135,3 +135,41 @@ DBT or extend the caller's lifecycle/signal support. The default forwarding
 Tool is behaviorally equivalent to Noop for these assertions, so no wrong-Tool
 sensitivity is claimed. The existing helper installs `reverie=trace` logging;
 these tests have no local timeout.
+
+## vDSO commands
+
+The `vdso` target retains all four original ptrace function tests and shares
+their actual `LocalState` with a command fixture. The fixture resolves the
+versioned `LINUX_2.6` clock_gettime, gettimeofday, getcpu and clock_getres entries
+from `linux-vdso.so.1`, and checks their mapping against `AT_SYSINFO_EHDR`.
+Missing entries fail without substituting libc calls or raw syscalls.
+
+The Tool returns EINVAL for clock_gettime, changes gettimeofday's microsecond
+suffix to 345 after injection, writes CPU0, and supplies resolution `(0,42)`.
+The direct-entry command checks those exact results. Direct vDSO errors use
+negative errno, while the unchanged Rust Instant test still expects a panic.
+Its broad `should_panic` attribute is not a precise error-cause assertion.
+These tests do not compare timestamps or establish deterministic time.
+
+The embedded C fixture requires an x86-64 Linux C toolchain selected by `CC`
+or `cc`, libc headers and libdl, with assertions enabled. Its owned TempDir
+lives through both runs. Each compiled image first runs natively, checking
+successful calls and valid output ranges. The same image then runs through
+ptrace or authenticated DBT with the Tool-specific expectations. Each mode
+requires exit0 and empty streams. Native and traced values are not compared
+across processes; dynamic startup remains part of each run.
+
+```sh
+reverie-dbt/scripts/build-client.sh \
+  --caller-manifest tests/fixtures/vdso-dbt-runtime/Cargo.toml \
+  --profile debug --jobs 4 --check
+cargo test -p reverie-test-support --features dbt --test vdso -- \
+  --test-threads=1
+```
+
+The default target has five tests. The optional `dbt` feature adds the actual
+caller command and a missing-manifest guard, which authenticates the valid
+pair before checking refusal. Unit global state alone does not authenticate
+the selected Tool. No wrong-Tool sensitivity, DBT function-guest execution,
+or expanded lifecycle/signal support is claimed. The helper installs
+`reverie=trace` independently of `RUST_LOG`; these tests have no local timeout.
