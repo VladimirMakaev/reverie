@@ -221,6 +221,7 @@ rust_library(
             "test": [
                 {"name": "basics", "path": "../tests/basics.rs"},
                 {"name": "exit", "path": "../tests/exit.rs"},
+                {"name": "stat", "path": "../tests/stat.rs"},
                 {"name": "dbt_command", "path": "tests/dbt_command.rs", "required-features": ["dbt"]},
             ],
             "dependencies_override": {
@@ -283,6 +284,26 @@ rust_unittest(
         "tests/tool_fixtures/exit.rs",
     ],
     crate_root = "tests/exit.rs",
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:tempfile",
+        ":reverie",
+        ":reverie-ptrace",
+        ":reverie-test-support",
+    ],
+)
+
+rust_unittest(
+    name = "generic-stat",
+    srcs = [
+        "tests/stat.rs",
+        "tests/fixtures/stat-command.c",
+        "tests/fixtures/statx-command.c",
+        "tests/support/stat_command.rs",
+        "tests/tool_fixtures/stat.rs",
+    ],
+    crate_root = "tests/stat.rs",
     rustc_flags = sanitized_feature,
     deps = [
         "fbsource//third-party/rust:libc",

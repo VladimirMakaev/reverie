@@ -44,3 +44,7 @@ required-features = ["dbt"]
 [[test]]
 name = "exit"
 path = "../tests/exit.rs"
+
+[[test]]
+name = "stat"
+path = "../tests/stat.rs"

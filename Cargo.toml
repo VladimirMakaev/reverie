@@ -51,4 +51,5 @@ exclude = [
     "tests/fixtures/basics-noop-dbt-runtime",
     "tests/fixtures/basics-counter-dbt-runtime",
     "tests/fixtures/exit-dbt-runtime",
+    "tests/fixtures/stat-dbt-runtime",
 ]

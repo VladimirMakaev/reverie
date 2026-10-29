@@ -97,3 +97,41 @@ independently test each later RPC assertion. The missing-manifest guard first
 authenticates the valid exit pair and does not run a guest. Caller initial-process
 and signal-error restrictions remain. The helper installs `reverie=trace`
 logging independently of `RUST_LOG`; these tests have no local timeout.
+
+## Stat-family commands
+
+The `stat` target preserves the two original ptrace function tests and adds
+command forms using the same `LocalState` Tool. It subscribes to all syscalls
+and uses the default identical tail forwarding; these tests do not establish
+stat-to-fstatat conversion or a separate reinjection mechanism.
+
+The first C guest checks that `open("/proc/self/exe", O_RDONLY)` returns a
+positive descriptor, that `stat`, `lstat` and `fstat` succeed, and that the
+followed inode equals the descriptor inode but differs from the symlink inode.
+The second checks successful `fstatat` and raw `SYS_statx`, both with
+`AT_SYMLINK_NOFOLLOW`, and equal returned inodes using `STATX_INO`.
+These relations do not prove which executable `/proc/self/exe` names under
+instrumentation.
+
+The checked C sources are embedded and compiled in a test-owned TempDir using
+`CC` or `cc`. They require an x86-64 Linux C toolchain and libc headers,
+with assertions enabled. Dynamic loader and libc startup remain part of each
+command run. Each compiled image must first run natively with exit0 and empty
+streams, then satisfy the same guest assertions under ptrace or DBT with exit0
+and empty streams. No inode values are compared across processes.
+
+```sh
+reverie-dbt/scripts/build-client.sh \
+  --caller-manifest tests/fixtures/stat-dbt-runtime/Cargo.toml \
+  --profile debug --jobs 4 --check
+cargo test -p reverie-test-support --features dbt --test stat -- \
+  --test-threads=1
+```
+
+The default target lists four tests. The optional `dbt` feature adds two
+actual-caller positives and a missing-manifest guard that first authenticates
+the real stat artifact. It does not provide function-guest execution through
+DBT or extend the caller's lifecycle/signal support. The default forwarding
+Tool is behaviorally equivalent to Noop for these assertions, so no wrong-Tool
+sensitivity is claimed. The existing helper installs `reverie=trace` logging;
+these tests have no local timeout.
