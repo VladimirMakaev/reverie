@@ -844,15 +844,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reverie-vdso-dbt-runtime"
-version = "0.5.4"
-dependencies = [
- "reverie-core",
- "reverie-dbt",
- "serde",
-]
-
-[[package]]
 name = "reverie-syscalls"
 version = "0.5.4"
 dependencies = [
@@ -865,6 +856,15 @@ dependencies = [
  "reverie-memory",
  "serde",
  "syscalls",
+]
+
+[[package]]
+name = "reverie-vdso-dbt-runtime"
+version = "0.5.4"
+dependencies = [
+ "reverie-core",
+ "reverie-dbt",
+ "serde",
 ]
 
 [[package]]

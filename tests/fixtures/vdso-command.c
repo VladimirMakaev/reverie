@@ -44,8 +44,8 @@ int main(int argc, char **argv) {
     int (*gettimeofday_entry)(struct timeval *, struct timezone *) =
         (int (*)(struct timeval *, struct timezone *))
             entry(handle, base, "__vdso_gettimeofday");
-    int (*getcpu_entry)(unsigned *, unsigned *, void *) =
-        (int (*)(unsigned *, unsigned *, void *))
+    long (*getcpu_entry)(unsigned *, unsigned *, void *) =
+        (long (*)(unsigned *, unsigned *, void *))
             entry(handle, base, "__vdso_getcpu");
     int (*clock_getres_entry)(clockid_t, struct timespec *) =
         (int (*)(clockid_t, struct timespec *))
@@ -58,7 +58,7 @@ int main(int argc, char **argv) {
     struct timespec resolution = {.tv_sec = 1, .tv_nsec = 0};
     int time_result = clock_gettime_entry(CLOCK_MONOTONIC, &now);
     int tod_result = gettimeofday_entry(&tod, &tz);
-    int cpu_result = getcpu_entry(&cpu, NULL, NULL);
+    long cpu_result = getcpu_entry(&cpu, NULL, NULL);
     int resolution_result = clock_getres_entry(CLOCK_MONOTONIC, &resolution);
 
     if (native) {
