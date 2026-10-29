@@ -216,10 +216,11 @@ rust_library(
                 "publish": False,
             },
             # DBT caller artifacts use the explicit OSS producer. Buck's
-            # generic-basics target retains its existing ptrace selection.
+            # generic conformance targets retain their ptrace selections.
             "features": {"default": [], "dbt": ["dep:reverie-dbt"]},
             "test": [
                 {"name": "basics", "path": "../tests/basics.rs"},
+                {"name": "exit", "path": "../tests/exit.rs"},
                 {"name": "dbt_command", "path": "tests/dbt_command.rs", "required-features": ["dbt"]},
             ],
             "dependencies_override": {
@@ -248,6 +249,7 @@ rust_library(
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:nix",
         "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:tempfile",
         ":reverie-ptrace",
     ],
     deps = [
@@ -266,6 +268,25 @@ rust_unittest(
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:nix",
         "fbsource//third-party/rust:serde",
+        ":reverie",
+        ":reverie-ptrace",
+        ":reverie-test-support",
+    ],
+)
+
+rust_unittest(
+    name = "generic-exit",
+    srcs = [
+        "tests/exit.rs",
+        "tests/fixtures/exit-command.S",
+        "tests/support/exit_command.rs",
+        "tests/tool_fixtures/exit.rs",
+    ],
+    crate_root = "tests/exit.rs",
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:tempfile",
         ":reverie",
         ":reverie-ptrace",
         ":reverie-test-support",

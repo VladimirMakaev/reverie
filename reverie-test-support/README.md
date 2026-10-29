@@ -60,3 +60,40 @@ setup refusal as evidence. The caller protocol's initial-process domain still
 applies; signal termination is a launch error, not supported signal-status
 fidelity. These command cases do not establish raw-environment transparency,
 function-guest execution, or arbitrary-program support.
+
+## Injected-exit commands
+
+The `exit` target keeps the original ptrace function guest and adds a command
+that issues `getpid` followed by `exit_group(0)`. The actual shared
+`InjectExitTool` replaces `getpid` with `exit_group(42)`. Both ptrace and the
+optional authenticated DBT caller must return exit42 and exactly one exit42
+process-hook RPC in the real returned GlobalState. Under DBT the RPC carries
+the admitted terminal request; the child wait status separately checks the
+actual exit. The original function guest is still ptrace-only.
+
+The command fixture embeds its assembly and writes it into a test-owned
+TempDir, so it needs no Cargo-specific runtime paths. Running these command
+cases requires an x86-64 Linux C toolchain selected by `CC` or `cc`, supporting
+`-nostdlib -static -no-pie -Wl,-e,_start -Wl,--build-id=none`. Missing compiler
+capability fails the test. Every compiled image first runs natively and must
+exit0 with empty streams; the TempDir lives through the native and traced run.
+
+```sh
+reverie-dbt/scripts/build-client.sh \
+  --caller-manifest tests/fixtures/basics-noop-dbt-runtime/Cargo.toml \
+  --profile debug --jobs 4 --check
+reverie-dbt/scripts/build-client.sh \
+  --caller-manifest tests/fixtures/exit-dbt-runtime/Cargo.toml \
+  --profile debug --jobs 4 --check
+cargo test -p reverie-test-support --features dbt --test exit -- \
+  --test-threads=1
+```
+
+The default target has two tests; `dbt` adds the actual caller positive, a real
+Noop negative and a missing-manifest guard. The Noop guest must first succeed
+with exit0, empty streams and no application RPCs, then fail the same exit42
+oracle. That control tests the first assertion's sensitivity; it does not
+independently test each later RPC assertion. The missing-manifest guard first
+authenticates the valid exit pair and does not run a guest. Caller initial-process
+and signal-error restrictions remain. The helper installs `reverie=trace`
+logging independently of `RUST_LOG`; these tests have no local timeout.

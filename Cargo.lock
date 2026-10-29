@@ -1875,6 +1875,7 @@ dependencies = [
  "reverie-dbt",
  "reverie-ptrace",
  "serde",
+ "tempfile",
 ]
 
 [[package]]
