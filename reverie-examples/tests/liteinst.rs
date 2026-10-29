@@ -70,6 +70,88 @@ fn run(tool: &str, extra: &[&str], guest: &[&str]) -> Output {
 }
 
 fn output_with_timeout(command: &mut Command) -> Output {
+    output_with_timeout_duration(command, Duration::from_secs(10))
+}
+
+fn output_with_timeout_duration(command: &mut Command, timeout: Duration) -> Output {
+    output_with_timeout_observed(command, timeout, |_| Ok(()))
+}
+
+fn output_with_timeout_observed<G>(
+    command: &mut Command,
+    timeout: Duration,
+    observe_spawn: impl FnOnce(libc::pid_t) -> std::io::Result<G>,
+) -> Output {
+    use std::io::Read as _;
+
+    fn nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
+        let flags = loop {
+            let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+            if flags != -1 {
+                break flags;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        };
+        loop {
+            if unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                != -1
+            {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    fn read_pipe(
+        pipe: &mut impl std::io::Read,
+        bytes: &mut Vec<u8>,
+        eof: &mut bool,
+    ) -> std::io::Result<bool> {
+        if *eof {
+            return Ok(false);
+        }
+        // One bounded read per stream per turn keeps both streams and the
+        // deadline moving, even when one writer produces data continuously.
+        let mut buffer = [0; 8192];
+        match pipe.read(&mut buffer) {
+            Ok(0) => {
+                *eof = true;
+                Ok(false)
+            }
+            Ok(count) => {
+                bytes.extend_from_slice(&buffer[..count]);
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            // Retry next turn, without sleeping or mistaking interruption for EOF.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn drain_after_kill(
+        pipe: &mut (impl std::io::Read + AsRawFd),
+        bytes: &mut Vec<u8>,
+    ) -> std::io::Result<()> {
+        // No pipe can hold more than its capacity. Bound cleanup even if a
+        // writer escaped the owned group; the parent endpoint is nonblocking.
+        let capacity = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETPIPE_SZ) };
+        if capacity == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        match pipe.take(capacity as u64).read_to_end(bytes) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == -1 {
@@ -83,21 +165,546 @@ fn output_with_timeout(command: &mut Command) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
+    let deadline = Instant::now() + timeout;
+    let process_group = child.id() as libc::pid_t;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut stdout_nonblocking = false;
+    let mut stderr_nonblocking = false;
+    let mut leader_owned = true;
+    let mut observer = None;
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> std::io::Result<()> {
+            observer = Some(observe_spawn(process_group)?);
+            let stdout = stdout
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("missing captured stdout"))?;
+            let stderr = stderr
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("missing captured stderr"))?;
+            nonblocking(stdout)?;
+            stdout_nonblocking = true;
+            nonblocking(stderr)?;
+            stderr_nonblocking = true;
+            let mut exited = false;
+            let mut stdout_eof = false;
+            let mut stderr_eof = false;
+            loop {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "example output deadline expired",
+                    ));
+                }
+                if !exited {
+                    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    let waited = unsafe {
+                        libc::waitid(
+                            libc::P_PID,
+                            child.id(),
+                            &mut info,
+                            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                        )
+                    };
+                    if waited == -1 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        if error.raw_os_error() == Some(libc::ECHILD) {
+                            // A foreign reaper invalidates our PID/PGID ownership.
+                            // Refuse capture without signalling a reusable identity.
+                            leader_owned = false;
+                        }
+                        return Err(error);
+                    }
+                    exited = unsafe { info.si_pid() } != 0;
+                }
+                let stdout_progress = read_pipe(stdout, &mut stdout_bytes, &mut stdout_eof)?;
+                let stderr_progress = read_pipe(stderr, &mut stderr_bytes, &mut stderr_eof)?;
+                if exited && stdout_eof && stderr_eof {
+                    return Ok(());
+                }
+                if !stdout_progress && !stderr_progress {
+                    std::thread::sleep(
+                        Duration::from_millis(10)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+            }
+        }));
+    let failed = !matches!(&result, Ok(Ok(())));
+    let mut cleanup_errors = Vec::new();
+    if failed && leader_owned {
+        // WNOWAIT retains the leader's identity until this point, including
+        // when an exited leader has a descendant holding either writer open.
+        if unsafe { libc::kill(-process_group, libc::SIGKILL) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                cleanup_errors.push(error);
+            }
         }
-        if Instant::now() >= deadline {
-            let process_group = i32::try_from(child.id()).unwrap();
-            // SAFETY: the child created its own process group before exec.
-            let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
-            let _ = child.kill();
-            let output = child.wait_with_output().unwrap();
-            panic!("LiteInst example timed out: {output:?}");
+        if let Err(error) = child.kill()
+            && error.raw_os_error() != Some(libc::ESRCH)
+        {
+            cleanup_errors.push(error);
         }
-        std::thread::sleep(Duration::from_millis(10));
     }
+    // The private observer's nonpanicking guard stops and joins its watcher
+    // while the leader is still unreaped. It must never signal after this
+    // handoff. Neither observer joins nor the collector wait for pipe EOF here.
+    drop(observer);
+    let status = child.wait();
+    if failed {
+        if let Some(stdout) = stdout.as_mut().filter(|_| stdout_nonblocking)
+            && let Err(error) = drain_after_kill(stdout, &mut stdout_bytes)
+        {
+            cleanup_errors.push(error);
+        }
+        if let Some(stderr) = stderr.as_mut().filter(|_| stderr_nonblocking)
+            && let Err(error) = drain_after_kill(stderr, &mut stderr_bytes)
+        {
+            cleanup_errors.push(error);
+        }
+    }
+    let result = result.unwrap_or_else(|panic| {
+        let _ = writeln!(
+            std::io::stderr(),
+            "LiteInst example capture unwound: wait={status:?}; cleanup={cleanup_errors:?}; stdout={stdout_bytes:?}; stderr={stderr_bytes:?}"
+        );
+        std::panic::resume_unwind(panic)
+    });
+    let status = status.unwrap_or_else(|error| {
+        panic!(
+            "LiteInst example wait failed: {error}; capture={result:?}; cleanup={cleanup_errors:?}; stdout={stdout_bytes:?}; stderr={stderr_bytes:?}"
+        )
+    });
+    let output = Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    };
+    if let Err(error) = result {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            panic!("LiteInst example timed out: {output:?}; cleanup={cleanup_errors:?}");
+        }
+        panic!("LiteInst example capture failed: {error}; {output:?}; cleanup={cleanup_errors:?}");
+    }
+    output
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct CaptureProcess {
+    pid: i32,
+    group: i32,
+    start_time: u64,
+}
+
+fn capture_process(pid: i32) -> std::io::Result<(CaptureProcess, char)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let fields: Vec<_> = stat
+        .rsplit_once(')')
+        .ok_or_else(|| std::io::Error::other("malformed process stat"))?
+        .1
+        .split_ascii_whitespace()
+        .collect();
+    let invalid = || std::io::Error::other("invalid process identity");
+    Ok((
+        CaptureProcess {
+            pid,
+            group: fields
+                .get(2)
+                .ok_or_else(invalid)?
+                .parse()
+                .map_err(|_| invalid())?,
+            start_time: fields
+                .get(19)
+                .ok_or_else(invalid)?
+                .parse()
+                .map_err(|_| invalid())?,
+        },
+        fields
+            .first()
+            .and_then(|state| state.chars().next())
+            .ok_or_else(invalid)?,
+    ))
+}
+
+fn kill_capture_process(process: &CaptureProcess) -> std::io::Result<()> {
+    use std::os::fd::FromRawFd as _;
+
+    // A pidfd plus the recorded start time prevents emergency test cleanup
+    // from signalling a different process after the helper has reaped a PID.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) };
+    if fd == -1 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+    match capture_process(process.pid) {
+        Ok((actual, _)) if actual == *process => {}
+        Ok(_) => return Err(std::io::Error::other("capture process identity changed")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn capture_worker_prefix(test: &str) -> Vec<u8> {
+    format!("\nrunning 1 test\ntest {test} ... ").into_bytes()
+}
+
+#[test]
+fn output_with_timeout_drains_both_pipes() {
+    const TEST: &str = "output_with_timeout_drains_both_pipes";
+    const READY: &str = "REVERIE_TEST_CAPTURE_WRITER_READY";
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct Ready {
+        process: CaptureProcess,
+        stdout_capacity: usize,
+        stderr_capacity: usize,
+    }
+
+    if let Some(path) = std::env::var_os(READY) {
+        let stdout_capacity = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_GETPIPE_SZ) };
+        let stderr_capacity = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_GETPIPE_SZ) };
+        assert!(stdout_capacity > 0 && stderr_capacity > 0);
+        let ready = Ready {
+            process: capture_process(std::process::id() as i32).unwrap().0,
+            stdout_capacity: stdout_capacity as usize,
+            stderr_capacity: stderr_capacity as usize,
+        };
+        // This file is independent of the two pipes being tested.
+        std::fs::write(path, serde_json::to_vec(&ready).unwrap()).unwrap();
+        std::io::stdout()
+            .write_all(&vec![b'O'; ready.stdout_capacity + 4096])
+            .unwrap();
+        std::io::stdout().flush().unwrap();
+        std::io::stderr()
+            .write_all(&vec![b'E'; ready.stderr_capacity + 4096])
+            .unwrap();
+        std::io::stderr().flush().unwrap();
+        // Omit libtest's variable-duration result line from the exact bytes.
+        std::process::exit(0);
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let ready_path = directory.path().join("writer-ready.json");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+        .env(READY, &ready_path);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        output_with_timeout_duration(&mut command, Duration::from_secs(1))
+    }));
+    let raw = std::fs::read_to_string(&ready_path).unwrap();
+    eprintln!("native writer readiness: {raw}");
+    let ready: Ready = serde_json::from_str(&raw).unwrap();
+    assert_eq!(ready.process.group, ready.process.pid);
+    let waited = unsafe { libc::waitpid(ready.process.pid, std::ptr::null_mut(), libc::WNOHANG) };
+    let wait_error = std::io::Error::last_os_error().raw_os_error();
+    assert_eq!(waited, -1);
+    assert_eq!(wait_error, Some(libc::ECHILD));
+    let output = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    assert!(output.status.success(), "{output:?}");
+    let mut stdout = capture_worker_prefix(TEST);
+    stdout.extend(std::iter::repeat_n(b'O', ready.stdout_capacity + 4096));
+    assert_eq!(output.stdout, stdout);
+    assert_eq!(output.stderr, vec![b'E'; ready.stderr_capacity + 4096]);
+}
+
+#[test]
+fn output_with_timeout_cleans_up_live_pipe_holder() {
+    const TEST: &str = "output_with_timeout_cleans_up_live_pipe_holder";
+    const ROLE: &str = "REVERIE_TEST_CAPTURE_HOLDER_ROLE";
+    const READY: &str = "REVERIE_TEST_CAPTURE_HOLDER_READY";
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct Ready {
+        leader: CaptureProcess,
+        holder: CaptureProcess,
+    }
+
+    let role = std::env::var(ROLE).ok();
+    if role.is_none() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(ROLE, "owner");
+        // This separate owner bound is below the external ten-second bound.
+        let output = output_with_timeout_duration(&mut command, Duration::from_secs(5));
+        eprintln!("native holder owner: {output:?}");
+        assert!(output.status.success(), "{output:?}");
+        return;
+    }
+    if role.as_deref() == Some("leader") {
+        let path = std::env::var_os(READY).unwrap();
+        std::io::stdout().write_all(b"holder-out\n").unwrap();
+        std::io::stdout().flush().unwrap();
+        std::io::stderr().write_all(b"holder-err\n").unwrap();
+        let leader = capture_process(std::process::id() as i32).unwrap().0;
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            // Only async-signal-safe operations after fork; retain the same
+            // group and the captured writers until the helper kills us.
+            loop {
+                unsafe {
+                    libc::pause();
+                }
+            }
+        }
+        let published = (|| -> std::io::Result<()> {
+            let holder = capture_process(child)?.0;
+            if holder.group != leader.group {
+                return Err(std::io::Error::other("holder escaped group"));
+            }
+            std::fs::write(
+                path,
+                serde_json::to_vec(&Ready { leader, holder }).map_err(std::io::Error::other)?,
+            )
+        })();
+        if let Err(error) = published {
+            // The parent still owns this unreaped child on every setup error.
+            unsafe {
+                libc::kill(child, libc::SIGKILL);
+                libc::waitpid(child, std::ptr::null_mut(), 0);
+            }
+            panic!("holder readiness failed: {error}");
+        }
+        std::process::exit(7);
+    }
+    assert_eq!(role.as_deref(), Some("owner"));
+    // Subreaper state is confined to this isolated process, never the parallel
+    // libtest parent. It lets the owner prove that the holder was reaped.
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+        0
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let owner_deadline = Instant::now() + Duration::from_secs(4);
+    let ready_path = directory.path().join("holder-ready.json");
+    type WatchOutcome = (bool, Option<Ready>, bool, std::io::Result<()>);
+    struct Watcher<'a> {
+        group: libc::pid_t,
+        stop: std::sync::mpsc::Sender<()>,
+        thread: Option<std::thread::JoinHandle<WatchOutcome>>,
+        outcome: &'a mut Option<WatchOutcome>,
+    }
+    fn kill_owned_group(group: libc::pid_t) -> std::io::Result<()> {
+        // Called only before the collector reaps its group leader.
+        if unsafe { libc::kill(-group, libc::SIGKILL) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+    impl Drop for Watcher<'_> {
+        fn drop(&mut self) {
+            let _ = self.stop.send(());
+            *self.outcome = Some(match self.thread.take().map(|thread| thread.join()) {
+                Some(Ok(outcome)) => outcome,
+                _ => {
+                    // Even a watcher panic cannot bypass owned-group cleanup.
+                    let cleanup = kill_owned_group(self.group);
+                    (
+                        true,
+                        None,
+                        false,
+                        Err(std::io::Error::other(format!(
+                            "capture watchdog failed; group cleanup={cleanup:?}"
+                        ))),
+                    )
+                }
+            });
+        }
+    }
+    let mut watch_outcome = None;
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+        .env(ROLE, "leader")
+        .env(READY, &ready_path);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        output_with_timeout_observed(&mut command, Duration::from_secs(1), |group| {
+            let (finished, stop) = std::sync::mpsc::channel();
+            let watcher = std::thread::Builder::new().spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut ready = Err(std::io::Error::other("missing holder readiness"));
+                let mut live = false;
+                let forced = loop {
+                    if ready.is_err() {
+                        ready = (|| -> std::io::Result<Ready> {
+                            let bytes = std::fs::read(&ready_path)?;
+                            let value: Ready =
+                                serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+                            let leader = capture_process(group)?.0;
+                            let (holder, state) = capture_process(value.holder.pid)?;
+                            if value.leader != leader
+                                || leader.group != group
+                                || holder != value.holder
+                                || holder.group != group
+                            {
+                                return Err(std::io::Error::other(
+                                    "holder readiness differs from the spawned group",
+                                ));
+                            }
+                            live = state != 'Z' && state != 'X';
+                            Ok(value)
+                        })();
+                    }
+                    if Instant::now() >= deadline {
+                        break true;
+                    }
+                    match stop.recv_timeout(Duration::from_millis(1)) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            break false;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                };
+                let (ready, mut observation) = match ready {
+                    Ok(value) => (Some(value), Ok(())),
+                    Err(error) => (None, Err(error)),
+                };
+                if forced || observation.is_err() {
+                    // Authority comes from spawn, never the readiness file.
+                    // Missing readiness remains an error even if cleanup works.
+                    if let Err(error) = kill_owned_group(group) {
+                        observation = Err(std::io::Error::other(format!(
+                            "holder observation={observation:?}; group cleanup={error}"
+                        )));
+                    }
+                }
+                (forced, ready, live, observation)
+            })?;
+            Ok(Watcher {
+                group,
+                stop: finished,
+                thread: Some(watcher),
+                outcome: &mut watch_outcome,
+            })
+        })
+    }));
+    let (forced, ready, live, watchdog_cleanup) = watch_outcome.unwrap_or_else(|| {
+        (
+            false,
+            None,
+            false,
+            Err(std::io::Error::other("capture watchdog was not installed")),
+        )
+    });
+    let observed = (|| -> std::io::Result<_> {
+        let ready = ready
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("missing holder readiness"))?;
+        let leader_wait =
+            unsafe { libc::waitpid(ready.leader.pid, std::ptr::null_mut(), libc::WNOHANG) };
+        let leader_error = std::io::Error::last_os_error().raw_os_error();
+        let mut status = 0;
+        let holder_wait = loop {
+            let waited = unsafe { libc::waitpid(ready.holder.pid, &mut status, libc::WNOHANG) };
+            if waited != 0 {
+                break waited;
+            }
+            if Instant::now() >= owner_deadline {
+                return Err(std::io::Error::other("helper left its holder alive"));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        Ok((leader_wait, leader_error, holder_wait, status))
+    })();
+    // Cleanup precedes all assertions, including readiness/observation errors.
+    let cleanup = if let Some(value) = &ready {
+        let holder = kill_capture_process(&value.holder);
+        let leader = kill_capture_process(&value.leader);
+        holder.and(leader)
+    } else {
+        Ok(())
+    };
+    let mut reaped = Vec::new();
+    let reaping = loop {
+        let mut status = 0;
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if pid > 0 {
+            reaped.push((pid, status));
+            continue;
+        }
+        if pid == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                break Ok(());
+            }
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break Err(error);
+        }
+        if Instant::now() >= owner_deadline {
+            break Err(std::io::Error::other("capture children were not reaped"));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    eprintln!(
+        "native holder observation: forced={forced}, live={live}, ready={ready:?}, waited={observed:?}, reaped={reaped:?}"
+    );
+    watchdog_cleanup.unwrap();
+    cleanup.unwrap();
+    reaping.unwrap();
+    assert!(
+        !forced,
+        "owner watchdog intervened instead of helper cleanup"
+    );
+    assert!(live, "no live holder observed before the helper deadline");
+    let ready = ready.unwrap();
+    let (leader_wait, leader_error, holder_wait, status) = observed.unwrap();
+    assert_eq!(leader_wait, -1);
+    assert_eq!(leader_error, Some(libc::ECHILD));
+    assert_eq!(holder_wait, ready.holder.pid, "helper left a live holder");
+    assert!(libc::WIFSIGNALED(status));
+    assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+    assert!(match capture_process(ready.holder.pid) {
+        Ok((actual, state)) => actual != ready.holder || state == 'Z' || state == 'X',
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    });
+    let panic = result.expect_err("helper returned normally despite a live pipe holder");
+    let panic = panic
+        .downcast_ref::<String>()
+        .expect("timeout panic must retain its output");
+    assert!(panic.starts_with("LiteInst example timed out: "), "{panic}");
+    assert!(panic.contains("unix_wait_status(1792)"), "{panic}");
+    let mut stdout = capture_worker_prefix(TEST);
+    stdout.extend_from_slice(b"holder-out\n");
+    assert!(
+        panic.contains(&format!(
+            "stdout: {:?}",
+            std::str::from_utf8(&stdout).unwrap()
+        )),
+        "{panic}"
+    );
+    assert!(panic.contains("stderr: \"holder-err\\n\""), "{panic}");
 }
 
 #[test]
