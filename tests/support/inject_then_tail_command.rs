@@ -48,6 +48,10 @@ impl GuestBinary {
         let output = command
             .output()
             .expect("compile inject-then-tail C fixture with CC or cc");
+        eprintln!(
+            "inject-then-tail compiler output: status={:?} stdout={:02x?} stderr={:02x?}",
+            output.status, output.stdout, output.stderr,
+        );
         assert!(output.status.success(), "guest compiler failed: {output:?}");
         Self {
             _directory: directory,
