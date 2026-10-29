@@ -33,13 +33,58 @@ mod tests {
 
     #[test]
     fn run_guest_vdso_getcpu_test() {
-        check_fn::<LocalState, _>(|| {
-            // this calls getcpu via vdso.
-            let cpu = unsafe { libc::sched_getcpu() };
+        struct VdsoHandle(*mut libc::c_void);
+
+        impl Drop for VdsoHandle {
+            fn drop(&mut self) {
+                unsafe { libc::dlclose(self.0) };
+            }
+        }
+
+        type Getcpu = unsafe extern "C" fn(
+            *mut libc::c_uint,
+            *mut libc::c_uint,
+            *mut libc::c_void,
+        ) -> libc::c_long;
+
+        // Resolve in the parent: loader operations are unsafe after a threaded
+        // fork, and sched_getcpu may read rseq TLS without entering the vDSO.
+        let vdso_base = unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) } as usize;
+        assert_ne!(vdso_base, 0);
+        let handle = unsafe {
+            libc::dlerror();
+            libc::dlopen(
+                c"linux-vdso.so.1".as_ptr(),
+                libc::RTLD_NOW | libc::RTLD_LOCAL,
+            )
+        };
+        assert!(!handle.is_null());
+        let handle = VdsoHandle(handle);
+        assert!(unsafe { libc::dlerror() }.is_null());
+        let symbol =
+            unsafe { libc::dlvsym(handle.0, c"__vdso_getcpu".as_ptr(), c"LINUX_2.6".as_ptr()) };
+        assert!(unsafe { libc::dlerror() }.is_null());
+        assert!(!symbol.is_null());
+        let mut info = MaybeUninit::uninit();
+        assert_ne!(unsafe { libc::dladdr(symbol, info.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { info.assume_init() }.dli_fbase as usize, vdso_base);
+        let getcpu = unsafe { std::mem::transmute::<*mut libc::c_void, Getcpu>(symbol) };
+
+        check_fn::<LocalState, _>(move || {
+            // This function guest inherits the parent's mapping; ptrace patches
+            // the entry in place before the closure runs.
+            assert_eq!(
+                unsafe { libc::getauxval(libc::AT_SYSINFO_EHDR) } as usize,
+                vdso_base
+            );
+            let mut cpu = libc::c_uint::MAX;
+            let ret = unsafe { getcpu(&mut cpu, std::ptr::null_mut(), std::ptr::null_mut()) };
+            assert_eq!(ret, 0);
             // NB: getcpu in vdso area always set cpu to 0.
             // see symbol __vdso_getcpu.
             assert_eq!(cpu, 0);
         });
+        drop(handle);
     }
 
     #[test]
