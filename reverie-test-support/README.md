@@ -173,3 +173,40 @@ pair before checking refusal. Unit global state alone does not authenticate
 the selected Tool. No wrong-Tool sensitivity, DBT function-guest execution,
 or expanded lifecycle/signal support is claimed. The helper installs
 `reverie=trace` independently of `RUST_LOG`; these tests have no local timeout.
+
+## Returning injections followed by identical tail forwarding
+
+The `inject_then_tail` target reuses the standalone example's actual `TestTool`
+with config 3. It performs three returning injections of selected identity and
+getrandom calls, then forwards the original call with `tail_inject`. The original
+standalone guest, host and main bodies remain unchanged; these are new command
+tests, not execution of that old standalone program.
+
+Each backend test compiles a checked C fixture using `CC` (or `cc`) in an owned
+executable temporary directory, runs that same image natively first, and then
+uses the actual Tool through ptrace or an explicit authenticated DBT caller.
+The guest checks six identity results and an exact eight-byte getrandom result.
+All runs require exit 0, stdout `inject-then-tail=ok\n`, and empty stderr. Numeric
+IDs and random bytes are not compared across processes. Image bytes are retained
+before each launch; independently compiled images need not have the same hash.
+A C compiler and executable temporary storage are required; there is no local
+timeout in these helpers.
+
+The default target contains one ptrace test. The `dbt` feature adds the actual
+caller test and a separate missing-manifest guard, for three tests total. The
+real returned global state is `TestTool`. Its empty state does not authenticate
+the exported Tool or independently count injections: caller source/artifact
+identity and config bind the path, while the guest checks its results. Neither
+Noop equivalence nor measured kernel-call multiplicity is claimed.
+
+```sh
+reverie-dbt/scripts/build-client.sh \
+  --caller-manifest tests/fixtures/inject-then-tail-dbt-runtime/Cargo.toml \
+  --profile debug --jobs 4 --check
+cargo test -p reverie-test-support --features dbt --test inject_then_tail -- \
+  --test-threads=1
+```
+
+DBT keeps the existing initial-process restrictions and signal-error contract.
+Buck registers the ptrace target; the optional DBT producer is explicit in the
+Cargo validation and CI paths.

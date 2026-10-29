@@ -53,4 +53,5 @@ exclude = [
     "tests/fixtures/exit-dbt-runtime",
     "tests/fixtures/stat-dbt-runtime",
     "tests/fixtures/vdso-dbt-runtime",
+    "tests/fixtures/inject-then-tail-dbt-runtime",
 ]

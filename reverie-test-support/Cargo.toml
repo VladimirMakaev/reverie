@@ -28,6 +28,7 @@ nix = { version = "0.30.1", features = ["fs", "process", "signal"] }
 reverie-ptrace = { version = "0.5.4", path = "../reverie-ptrace", features = ["nightly"] }
 serde = { version = "1.0.219", features = ["derive"] }
 tempfile = "3.27.0"
+tracing = "0.1.41"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sanitized)"] }
@@ -52,3 +53,7 @@ path = "../tests/stat.rs"
 [[test]]
 name = "vdso"
 path = "../tests/vdso.rs"
+
+[[test]]
+name = "inject_then_tail"
+path = "../tests/inject_then_tail.rs"
