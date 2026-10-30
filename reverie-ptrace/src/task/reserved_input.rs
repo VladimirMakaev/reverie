@@ -1068,7 +1068,7 @@ impl FatalSession {
                 Err(Errno::EPROTO.into())
             };
         }
-        generations.push((terminal, task));
+        generations.push((Arc::new(terminal), task));
         Ok(())
     }
 

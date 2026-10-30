@@ -503,6 +503,17 @@ pub(crate) struct PtracerWaitOwner {
 }
 
 impl PtracerWaitOwner {
+    /// Retain the original bound generation without looking up its numeric TID.
+    pub(crate) fn generation(&self) -> Option<TraceeGeneration> {
+        self.generation.lock().unwrap().clone()
+    }
+
+    /// Obtain the shared terminal facade from that same retained generation.
+    pub(crate) fn terminal_cleanup(&self) -> Option<safeptrace::TerminalCleanup> {
+        self.generation()
+            .map(|generation| generation.terminal_cleanup())
+    }
+
     pub(crate) fn bind_running(&self, running: &Running) {
         self.bind(running.generation(), || {
             running.terminal_cleanup_on_ptracer_thread().into_driver()

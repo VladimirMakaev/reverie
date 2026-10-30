@@ -2492,7 +2492,7 @@ pub(crate) struct FatalSession {
     native_operations: StdMutex<Vec<native_syscall::NativeOperationOwner>>,
     input_generations: StdMutex<
         Vec<(
-            safeptrace::TerminalCleanup,
+            Arc<safeptrace::TerminalCleanup>,
             reverie::reserved_input::InputTaskId,
         )>,
     >,
