@@ -238,19 +238,24 @@ impl Tool for NativeTool {
             Mode::Exec | Mode::ExecPrivate | Mode::ExecPreparing
         ) {
             let evidence = evidence();
-            let mut seen = evidence.lock().unwrap();
+            let (completion, unrelated) = {
+                let seen = evidence.lock().unwrap();
+                (seen.completion.clone(), seen.unrelated.clone())
+            };
+            // Assert without poisoning the evidence needed by CloseOperation
+            // during failure cleanup. Both handles retain the same live state.
             assert!(
-                seen.completion
+                completion
                     .as_ref()
                     .expect("old operation retained")
                     .effects_complete(),
                 "old owner's close/effects proof precedes new-image Tool callback"
             );
             assert!(
-                !seen.unrelated.as_ref().unwrap().effects_complete(),
+                !unrelated.as_ref().unwrap().effects_complete(),
                 "an unassociated owner is not closed by another task's exec"
             );
-            seen.post_exec_complete = true;
+            evidence.lock().unwrap().post_exec_complete = true;
         }
         Ok(())
     }
