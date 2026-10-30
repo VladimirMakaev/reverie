@@ -9,12 +9,16 @@
 
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::future::Future;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
+use std::task::Context;
+use std::task::Waker;
 use std::thread::ThreadId;
 use std::time::Duration;
 use std::time::Instant;
@@ -23,7 +27,9 @@ use reverie::ExitStatus;
 use reverie::Guest;
 use reverie::InjectionPurpose;
 use reverie::Subscription;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::Errno;
+use reverie::syscalls::MemoryAccess;
 use reverie_rpc_transport::ConnectionMonitor;
 use reverie_rpc_transport::RpcIssueMonitor;
 use reverie_rpc_transport::RpcServer;
@@ -38,6 +44,17 @@ const TEST_NAME: &str = "caller_runtime::tests::caller_runtime_protocol";
 const WITNESS: &str = "CALLER_RUNTIME_UNIT_COMPLETED";
 const SEED: u64 = 73;
 const FINAL_ARGS: [u64; 6] = [0x12f, 2, 3, 4, 5, 6];
+const ASYNC_ARGS: [u64; 6] = [0x117, 17, 34, 51, 68, 85];
+const ASYNC_CASES: [&str; 8] = [
+    "inject-exit-ready-ok",
+    "inject-exit-group-ready-err",
+    "application-exit-ready-err",
+    "application-exit-group-ready-ok",
+    "inject-exit-ready-ok-mismatch",
+    "inject-exit-group-ready-err-mismatch",
+    "application-exit-ready-err-mismatch",
+    "application-exit-group-ready-ok-mismatch",
+];
 static EVENTS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 static DIAGNOSTICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static SELECTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -54,11 +71,50 @@ fn pid() -> Pid {
     Pid::from_raw(std::process::id() as i32)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum AsyncInjection {
+    InjectExitOk,
+    InjectExitGroupErr,
+    ApplicationExitErr,
+    ApplicationExitGroupOk,
+}
+
+impl AsyncInjection {
+    fn for_case(case: &str) -> Option<Self> {
+        match case.strip_suffix("-mismatch").unwrap_or(case) {
+            "inject-exit-ready-ok" => Some(Self::InjectExitOk),
+            "inject-exit-group-ready-err" => Some(Self::InjectExitGroupErr),
+            "application-exit-ready-err" => Some(Self::ApplicationExitErr),
+            "application-exit-group-ready-ok" => Some(Self::ApplicationExitGroupOk),
+            _ => None,
+        }
+    }
+
+    fn syscall(self) -> Sysno {
+        match self {
+            Self::InjectExitOk | Self::ApplicationExitErr => Sysno::exit,
+            Self::InjectExitGroupErr | Self::ApplicationExitGroupOk => Sysno::exit_group,
+        }
+    }
+
+    fn application_purpose(self) -> bool {
+        matches!(
+            self,
+            Self::ApplicationExitErr | Self::ApplicationExitGroupOk
+        )
+    }
+
+    fn returns_error(self) -> bool {
+        matches!(self, Self::InjectExitGroupErr | Self::ApplicationExitErr)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Config {
     seed: u64,
     label: String,
     instructions: u8,
+    async_injection: Option<AsyncInjection>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -139,6 +195,97 @@ impl Default for Probe {
 impl Drop for Probe {
     fn drop(&mut self) {
         event("tool-drop");
+    }
+}
+
+struct InjectionDrop<'a>(&'a AtomicUsize);
+impl Drop for InjectionDrop<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        event("injection-future-drop");
+    }
+}
+
+struct CallbackDrop;
+impl Drop for CallbackDrop {
+    fn drop(&mut self) {
+        event("callback-drop");
+    }
+}
+
+fn pending<F: Future>(future: F) {
+    let mut future = Box::pin(future);
+    assert!(
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+}
+
+fn poll_then_drop_injection<F: Future>(future: F) {
+    let drops = AtomicUsize::new(0);
+    let mut owned = Box::pin(async {
+        let _drop = InjectionDrop(&drops);
+        future.await
+    });
+    for _ in 0..2 {
+        assert!(
+            owned
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+    // Drop the owned async frame, not merely a temporary Pin<&mut _>.
+    drop(owned);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+fn exercise_async_injection<G: Guest<Probe>>(
+    guest: &mut G,
+    mode: AsyncInjection,
+) -> Result<i64, Error> {
+    assert_eq!(guest.injected_syscalls(), Some(0));
+    let mut memory = guest.memory();
+    let mut source = [3_u8, 5, 7, 11];
+    let address = AddrMut::from_raw(source.as_mut_ptr() as usize).unwrap();
+    let mut output = [0_u8; 4];
+    assert_eq!(memory.read(address, &mut output), Ok(4));
+    assert_eq!(output, source);
+    let call = Syscall::from_raw(mode.syscall(), SyscallArgs::new(0x117, 17, 34, 51, 68, 85));
+    if mode.application_purpose() {
+        poll_then_drop_injection(guest.inject_with_purpose(call, InjectionPurpose::Application));
+    } else {
+        poll_then_drop_injection(guest.inject(call));
+    }
+    assert_eq!(guest.injected_syscalls(), Some(1));
+    // This handle predates admission. Neither it nor later Guest operations
+    // may escape the established ending, even after its future was abandoned.
+    output.fill(99);
+    assert_eq!(memory.read(address, &mut output), Err(Errno::ESRCH));
+    assert_eq!(memory.read_exact(address, &mut []), Err(Errno::ESRCH));
+    assert_eq!(memory.write(address, &[17; 4]), Err(Errno::ESRCH));
+    assert_eq!(source, [3, 5, 7, 11]);
+    assert_eq!(output, [99; 4]);
+    assert!(matches!(
+        guest.try_send_rpc_sync(Request::AfterFinished),
+        Err(Request::AfterFinished)
+    ));
+    pending(guest.send_rpc(Request::AfterFinished));
+    pending(guest.inject(Syscall::from_raw(
+        Sysno::getpid,
+        SyscallArgs::new(0, 0, 0, 0, 0, 0),
+    )));
+    pending(guest.inject_with_purpose(call, InjectionPurpose::Application));
+    pending(guest.regs());
+    pending(guest.set_regs(unsafe { std::mem::zeroed() }));
+    assert_eq!(guest.injected_syscalls(), Some(1));
+    if mode.returns_error() {
+        Err(Errno::EACCES.into())
+    } else {
+        Ok(19)
     }
 }
 
@@ -234,6 +381,10 @@ impl Tool for Probe {
         assert_eq!(guest.thread_state().stamp, SEED + 3);
         event("syscall");
         guest.thread_state_mut().stamp += 4;
+        if let Some(mode) = guest.config().async_injection {
+            let _drop = CallbackDrop;
+            return exercise_async_injection(guest, mode);
+        }
         guest
             .tail_inject(Syscall::from_raw(
                 Sysno::exit_group,
@@ -252,7 +403,11 @@ impl Tool for Probe {
         assert_eq!(tid, self.process);
         assert_eq!(state.tid, tid.as_raw());
         assert!(state.stamp == SEED + 3 || state.stamp == SEED + 7);
-        assert_eq!(status, reverie::exit_status_from_raw(FINAL_ARGS[0]));
+        if rpc.config().async_injection.is_some() {
+            assert_eq!(status, reverie::exit_status_from_raw(ASYNC_ARGS[0]));
+        } else {
+            assert_eq!(status, reverie::exit_status_from_raw(FINAL_ARGS[0]));
+        }
         check_config(rpc.config());
         event("thread-exit");
         assert_eq!(
@@ -270,7 +425,11 @@ impl Tool for Probe {
         status: ExitStatus,
     ) -> Result<(), Error> {
         assert_eq!(process, self.process);
-        assert_eq!(status, reverie::exit_status_from_raw(FINAL_ARGS[0]));
+        if rpc.config().async_injection.is_some() {
+            assert_eq!(status, reverie::exit_status_from_raw(ASYNC_ARGS[0]));
+        } else {
+            assert_eq!(status, reverie::exit_status_from_raw(FINAL_ARGS[0]));
+        }
         check_config(rpc.config());
         event("process-exit");
         assert_eq!(
@@ -320,6 +479,9 @@ struct NativeFixture {
     primary: Cell<Option<i32>>,
     calls: Cell<usize>,
     reservation: Cell<Option<TerminalFact>>,
+    async_injection: Cell<Option<AsyncInjection>>,
+    admissions: Cell<usize>,
+    register_reads: Cell<usize>,
     sent: RefCell<Frames>,
     received: RefCell<Frames>,
 }
@@ -412,6 +574,40 @@ unsafe extern "C" fn admit(
     1
 }
 
+unsafe extern "C" fn admit_async(
+    context: usize,
+    number: i64,
+    args: *const u64,
+    out: *mut TerminalFact,
+) -> i32 {
+    let fixture = unsafe { &*(context as *const NativeFixture) };
+    let mode = fixture.async_injection.get().unwrap();
+    assert_eq!(number, mode.syscall().id() as i64);
+    assert_eq!(fixture.admissions.get(), 0);
+    assert!(fixture.reservation.get().is_none());
+    fixture.admissions.set(fixture.admissions.get() + 1);
+    let fact = TerminalFact {
+        size: std::mem::size_of::<TerminalFact>() as u32,
+        kind: 1,
+        image: 1,
+        context: context as u64,
+        pid: pid().as_raw(),
+        tid: pid().as_raw(),
+        sysno: number,
+        args: unsafe { args.cast::<[u64; 6]>().read() },
+        cookie: 91,
+        origin: 2,
+        reserved: 0,
+    };
+    assert_eq!(fact.args, ASYNC_ARGS);
+    fixture.reservation.set(Some(fact));
+    event("unit-reservation");
+    unsafe {
+        out.write(fact);
+    }
+    1
+}
+
 unsafe extern "C" fn emit(bytes: *const u8, length: usize) {
     let bytes = unsafe { std::slice::from_raw_parts(bytes, length) };
     DIAGNOSTICS
@@ -422,7 +618,9 @@ unsafe extern "C" fn emit(bytes: *const u8, length: usize) {
 unsafe extern "C" fn idle() {
     std::thread::yield_now();
 }
-unsafe extern "C" fn read_registers(_: usize, output: *mut libc::user_regs_struct) -> i32 {
+unsafe extern "C" fn read_registers(context: usize, output: *mut libc::user_regs_struct) -> i32 {
+    let fixture = unsafe { &*(context as *const NativeFixture) };
+    fixture.register_reads.set(fixture.register_reads.get() + 1);
     unsafe {
         output.write(std::mem::zeroed());
     }
@@ -672,7 +870,9 @@ fn exercise(case: &str) {
             "rdtsc" => 2,
             _ => 0,
         },
+        async_injection: AsyncInjection::for_case(case),
     };
+    fixture.async_injection.set(config.async_injection);
     let run = ActivationRun::new();
     run.bind_root(pid().as_raw()).unwrap();
     let mut server = Server::start(config.clone(), run.clone());
@@ -681,6 +881,9 @@ fn exercise(case: &str) {
     // Pending/defer1 retained no context or application state above.
     let fixture = Box::new(fixture);
     let mut callbacks = callbacks();
+    if config.async_injection.is_some() {
+        callbacks.admit_terminal = admit_async;
+    }
     assert_eq!(
         unsafe {
             runtime.background_init(
@@ -817,6 +1020,9 @@ fn exercise(case: &str) {
     } else {
         libc::SYS_getpid
     };
+    let before_callback = events();
+    let before_calls = fixture.calls.get();
+    let before_registers = fixture.register_reads.get();
     let action = unsafe {
         runtime.pre_syscall(
             fixture.context(),
@@ -856,8 +1062,26 @@ fn exercise(case: &str) {
         }
     } else {
         assert_eq!(action, 2);
-        assert_eq!(deferred_number, libc::SYS_exit_group);
-        assert_eq!(deferred_args, FINAL_ARGS);
+        if let Some(mode) = config.async_injection {
+            assert_eq!(deferred_number, mode.syscall().id() as i64);
+            assert_eq!(deferred_args, ASYNC_ARGS);
+            assert_eq!(fixture.admissions.get(), 1);
+            assert_eq!(fixture.calls.get(), before_calls);
+            assert_eq!(fixture.register_reads.get(), before_registers);
+            assert_eq!(server.global.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                &events()[before_callback.len()..],
+                [
+                    "syscall",
+                    "unit-reservation",
+                    "injection-future-drop",
+                    "callback-drop",
+                ]
+            );
+        } else {
+            assert_eq!(deferred_number, libc::SYS_exit_group);
+            assert_eq!(deferred_args, FINAL_ARGS);
+        }
         fixture.reservation.get().unwrap()
     };
     assert_eq!(result, -1234);
@@ -884,7 +1108,14 @@ fn exercise(case: &str) {
         }
     );
 
-    if case == "mismatch" {
+    if config.async_injection.is_some() {
+        assert_eq!(attachment.effects.ending(), Some(fact));
+        assert_eq!(attachment.effects.refusal(), None);
+    }
+    let mismatch = case == "mismatch" || case.ends_with("-mismatch");
+    if mismatch {
+        let before = events();
+        let calls = fixture.calls.get();
         for field in 0..4 {
             let mut changed = fact;
             match field {
@@ -916,6 +1147,8 @@ fn exercise(case: &str) {
                     )
                     .unwrap()
             };
+            assert_eq!(events(), before);
+            assert_eq!(fixture.calls.get(), calls);
             assert!(attachment.phase == Phase::Running);
             assert!(attachment.state.is_some());
             assert!(attachment.process.as_ref().is_some());
@@ -1030,10 +1263,15 @@ fn exercise(case: &str) {
     assert!(counters.runtime_state.is_null());
     fixture.shutdown();
     server.finish();
-    if case != "mismatch" {
+    if !mismatch {
         let receipt = run.completed().unwrap();
-        assert_eq!(receipt.exit_code(), 47);
-        assert_eq!(receipt.syscall(), libc::SYS_exit_group);
+        if let Some(mode) = config.async_injection {
+            assert_eq!(receipt.exit_code(), 23);
+            assert_eq!(receipt.syscall(), mode.syscall().id() as i64);
+        } else {
+            assert_eq!(receipt.exit_code(), 47);
+            assert_eq!(receipt.syscall(), libc::SYS_exit_group);
+        }
         assert_eq!(
             receipt.origin(),
             if case == "original" {
@@ -1061,17 +1299,19 @@ impl Drop for ChildGuard {
 fn caller_runtime_protocol() {
     if let Some(case) = std::env::var_os(CHILD_CASE) {
         let case = case.to_str().unwrap();
-        assert!(matches!(
-            case,
-            "deferred"
-                | "original"
-                | "mismatch"
-                | "cpuid"
-                | "rdtsc"
-                | "failed"
-                | "missing-fatal"
-                | "missing-finished"
-        ));
+        assert!(
+            matches!(
+                case,
+                "deferred"
+                    | "original"
+                    | "mismatch"
+                    | "cpuid"
+                    | "rdtsc"
+                    | "failed"
+                    | "missing-fatal"
+                    | "missing-finished"
+            ) || ASYNC_CASES.contains(&case)
+        );
         exercise(case);
         println!("{WITNESS}:{case}");
         return;
@@ -1088,15 +1328,23 @@ fn caller_runtime_protocol() {
         "failed",
         "missing-fatal",
         "missing-finished",
-    ] {
+    ]
+    .into_iter()
+    .chain(ASYNC_CASES)
+    {
         let directory = tempfile::tempdir().unwrap();
+        let dirfd = std::fs::File::open(directory.path()).unwrap();
+        // Keep the real socket under TMPDIR while its held parent dirfd gives
+        // both processes a short pathname, independent of harness nesting.
+        let socket = format!(
+            "/proc/{}/fd/{}/caller.sock",
+            std::process::id(),
+            dirfd.as_raw_fd()
+        );
         let child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST_NAME, "--test-threads=1", "--nocapture"])
             .env(CHILD_CASE, case)
-            .env(
-                crate::sync_rpc::RPC_SOCKET_ENV,
-                directory.path().join("caller.sock"),
-            )
+            .env(crate::sync_rpc::RPC_SOCKET_ENV, socket)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

@@ -24,6 +24,10 @@ use super::protocol::Terminal;
 pub const LATER_EXIT_CODE: i32 = 31;
 
 impl Mode {
+    pub fn uses_async_terminal_injection(self) -> bool {
+        matches!(self, Self::AsyncInject | Self::AsyncApplicationInject)
+    }
+
     pub fn guest_argument(self) -> &'static str {
         match self {
             Self::Invalid => panic!("invalid fixture mode"),
@@ -31,7 +35,7 @@ impl Mode {
             Self::OriginalExit | Self::NoApplicationRpc => "2",
             Self::SuppressOnce => "3",
             Self::RewriteAway => "4",
-            Self::RewriteToTerminal => "5",
+            Self::RewriteToTerminal | Self::AsyncInject | Self::AsyncApplicationInject => "5",
             Self::RpcDisconnect => "6",
         }
     }
@@ -39,7 +43,12 @@ impl Mode {
     pub fn has_terminal_attempt(self) -> bool {
         matches!(
             self,
-            Self::SelectedTail | Self::SuppressOnce | Self::RewriteAway | Self::RewriteToTerminal
+            Self::SelectedTail
+                | Self::SuppressOnce
+                | Self::RewriteAway
+                | Self::RewriteToTerminal
+                | Self::AsyncInject
+                | Self::AsyncApplicationInject
         )
     }
 }
@@ -76,7 +85,7 @@ impl Config {
 
     pub fn trigger_call(&self) -> Syscall {
         call(
-            if self.mode == Mode::RewriteToTerminal {
+            if self.mode == Mode::RewriteToTerminal || self.mode.uses_async_terminal_injection() {
                 Sysno::getpid
             } else {
                 self.terminal.number()
@@ -87,7 +96,10 @@ impl Config {
 
     pub fn replacement(&self) -> Option<Syscall> {
         match self.mode {
-            Mode::SelectedTail | Mode::RewriteToTerminal => Some(self.terminal_call()),
+            Mode::SelectedTail
+            | Mode::RewriteToTerminal
+            | Mode::AsyncInject
+            | Mode::AsyncApplicationInject => Some(self.terminal_call()),
             Mode::RewriteAway => Some(call(Sysno::getpid, [0; 6])),
             Mode::SuppressOnce => None,
             Mode::OriginalExit | Mode::NoApplicationRpc | Mode::RpcDisconnect | Mode::Invalid => {

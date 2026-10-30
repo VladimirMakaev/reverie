@@ -133,6 +133,13 @@ fn run_native(config: Config, guest: &Path) {
             String::from_utf8_lossy(&native_diagnostics),
         );
     });
+    let (received_config, rows) = global.snapshot();
+    if config.mode.uses_async_terminal_injection() {
+        eprintln!(
+            "caller_async_terminal_native: config={config:?}; status={:?}; stdout={:?}; stderr={:?}; native_diagnostics={native_diagnostics:?}; received_config={received_config:?}; rows={rows:?}",
+            output.status, output.stdout, output.stderr,
+        );
+    }
     assert_eq!(output.status.code(), Some(config.exit_code()), "{output:?}");
     let expected_stdout: &[u8] = if config.mode.continues() {
         b"before\ncontinued\n"
@@ -147,7 +154,6 @@ fn run_native(config: Config, guest: &Path) {
         String::from_utf8_lossy(&native_diagnostics)
     );
 
-    let (received_config, rows) = global.snapshot();
     assert_eq!(received_config, config);
     if config.mode == Mode::NoApplicationRpc {
         assert_eq!(LifecycleGlobal::no_application_rpc_requests(), 0);
@@ -293,7 +299,7 @@ fn run_cases_using(selector: &str, cases: &[Config], run: fn(Config, &Path)) {
     assert!(std::env::var_os(CHILD_SELECTOR).is_none());
     assert!(std::env::var_os(CHILD_GUEST).is_none());
     let guest = guest_binary();
-    for index in 0..cases.len() {
+    for (index, config) in cases.iter().enumerate() {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", selector, "--nocapture", "--test-threads=1"])
@@ -301,6 +307,12 @@ fn run_cases_using(selector: &str, cases: &[Config], run: fn(Config, &Path)) {
             .env(CHILD_SELECTOR, selector)
             .env(CHILD_GUEST, &guest);
         let output = output_with_timeout(&mut command);
+        if config.mode.uses_async_terminal_injection() {
+            eprintln!(
+                "caller_async_terminal_helper: selector={selector}; case={index}; status={:?}; stdout={:?}; stderr={:?}",
+                output.status, output.stdout, output.stderr,
+            );
+        }
         assert!(output.status.success(), "{selector}[{index}]: {output:?}");
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert_eq!(
@@ -362,6 +374,46 @@ fn caller_rewrite_to_terminal_preserves_actual_status() {
     run_cases(
         "caller_rewrite_to_terminal_preserves_actual_status",
         &[23, 0x117].map(|code| Config::new(Mode::RewriteToTerminal, Terminal::ExitGroup, code)),
+    );
+}
+
+#[test]
+fn caller_async_inject_exit_never_returns() {
+    run_cases(
+        "caller_async_inject_exit_never_returns",
+        &[Config::new(Mode::AsyncInject, Terminal::Exit, 0x117)],
+    );
+}
+
+#[test]
+fn caller_async_inject_exit_group_never_returns() {
+    run_cases(
+        "caller_async_inject_exit_group_never_returns",
+        &[Config::new(Mode::AsyncInject, Terminal::ExitGroup, 0x117)],
+    );
+}
+
+#[test]
+fn caller_async_application_inject_exit_never_returns() {
+    run_cases(
+        "caller_async_application_inject_exit_never_returns",
+        &[Config::new(
+            Mode::AsyncApplicationInject,
+            Terminal::Exit,
+            0x117,
+        )],
+    );
+}
+
+#[test]
+fn caller_async_application_inject_exit_group_never_returns() {
+    run_cases(
+        "caller_async_application_inject_exit_group_never_returns",
+        &[Config::new(
+            Mode::AsyncApplicationInject,
+            Terminal::ExitGroup,
+            0x117,
+        )],
     );
 }
 

@@ -38,6 +38,8 @@ pub enum Mode {
     RewriteToTerminal,
     RpcDisconnect,
     NoApplicationRpc,
+    AsyncInject,
+    AsyncApplicationInject,
 }
 
 impl Mode {

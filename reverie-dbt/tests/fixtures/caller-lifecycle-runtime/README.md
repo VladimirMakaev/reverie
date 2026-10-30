@@ -26,6 +26,10 @@ selected marker syscall, write `continued`, and exit through unselected
 | `caller_suppressed_exit_resumes_before_later_consumption` | Selected `exit(23)` returns zero; guest continuation precedes one later consuming hook sequence and actual wait 31. |
 | `caller_rewrite_away_from_exit_resumes_before_later_consumption` | Selected `exit(23)` tails to `getpid`; guest compares the result with its actual `gettid`, continues, and later waits 31. |
 | `caller_rewrite_to_terminal_preserves_actual_status` | Selected `getpid` tails to `exit_group(23)` or `exit_group(0x117)`; no continuation and actual wait 23. |
+| `caller_async_inject_exit_never_returns` | Selected `getpid` injects `exit(0x117)` through `Guest::inject`; the injection never returns, cleanup completes, and actual wait is 23. |
+| `caller_async_inject_exit_group_never_returns` | The same returning API requests `exit_group(0x117)`. |
+| `caller_async_application_inject_exit_never_returns` | Selected `getpid` injects `exit(0x117)` through `inject_with_purpose(Application)` with the same nonreturn and cleanup checks. |
+| `caller_async_application_inject_exit_group_never_returns` | The same application-purpose API requests `exit_group(0x117)`. |
 
 Every case asserts the complete RPC event sequence and the same configuration.
 An attempt-local destructor must run before a continuation or consuming hook.
@@ -35,6 +39,26 @@ test selector with exactly one successful harness summary and one completion
 witness. The unchanged ten-second execution limit kills and reaps the helper's
 process group on timeout. The assembly is compiled once, before that limit,
 with `CC` (or `cc`) under Cargo's existing target temporary directory.
+
+The four asynchronous terminal cases reuse guest argument 5 and the existing
+assembly. The original request is `getpid`; both injected terminal syscalls keep
+all six operands `[0x117, 17, 34, 51, 68, 85]`. The acknowledged `Attempt` RPC
+records the original and requested replacement before injection. An unconditional
+panic after the awaited API catches either an erroneous success or an errno
+return; the guest also fails if its original request resumes. The same actual
+returned Global records the complete hook sequence, and the existing attempt
+guard must drop before the consuming hook. These cases print actual child bytes,
+native diagnostics, configuration and RPC rows before checking them, then retain
+that record through the supervising helper's capture.
+
+This covers syscall-phase application-purpose asynchronous terminal injection.
+Startup, synchronous returning injection, validation-purpose terminal injection
+and other unsupported lifecycle operations retain their refusal rules. The
+low-level tests separately force admission refusal, invalid returned facts,
+future abandonment and duplicate final notifications through synthetic native
+callbacks; those are not claims of duplicate physical native exits. This fixture
+does not exercise the original backtrace Tool or establish general lifecycle
+support or deterministic execution.
 
 ## Build and run
 

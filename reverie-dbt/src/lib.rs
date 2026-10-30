@@ -853,6 +853,38 @@ where
         }
     }
 
+    async fn inject_async_for_purpose<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        purpose: InjectionPurpose,
+    ) -> Result<i64, Errno> {
+        self.wait_if_caller_stopped().await;
+        let (number, args) = syscall.into_parts();
+        if self.caller_syscall_phase
+            && purpose == InjectionPurpose::Application
+            && matches!(number.id() as i64, libc::SYS_exit | libc::SYS_exit_group)
+            && let Some(effects) = &self.caller_effects
+        {
+            self.injected_syscalls += 1;
+            // The Guest contract makes terminal injection nonreturning. Reserve
+            // the existing terminal effect, then let the caller driver drop this
+            // future and its borrows before native consumes the exact request.
+            effects.admit_exit(
+                number.id() as i64,
+                [
+                    args.arg0 as u64,
+                    args.arg1 as u64,
+                    args.arg2 as u64,
+                    args.arg3 as u64,
+                    args.arg4 as u64,
+                    args.arg5 as u64,
+                ],
+            );
+            return std::future::pending().await;
+        }
+        self.inject_for_purpose(Syscall::from_raw(number, args), purpose)
+    }
+
     fn inject_for_purpose<S: SyscallInfo>(
         &mut self,
         syscall: S,
@@ -1236,8 +1268,8 @@ where
     async fn daemonize(&mut self) {}
 
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
-        self.wait_if_caller_stopped().await;
-        self.inject_for_purpose(syscall, InjectionPurpose::Application)
+        self.inject_async_for_purpose(syscall, InjectionPurpose::Application)
+            .await
     }
 
     async fn inject_with_purpose<S: SyscallInfo>(
@@ -1245,8 +1277,8 @@ where
         syscall: S,
         purpose: InjectionPurpose,
     ) -> Result<i64, Error> {
-        self.wait_if_caller_stopped().await;
-        self.inject_for_purpose(syscall, purpose)
+        self.inject_async_for_purpose(syscall, purpose)
+            .await
             .map_err(Error::from)
     }
 
@@ -3984,7 +4016,136 @@ mod tests {
     #[derive(Default)]
     struct RecordedCallback {
         calls: Vec<(i64, [u64; 6], u32)>,
+        admissions: Vec<caller_abi::TerminalFact>,
+        admission_requests: Vec<(i64, [u64; 6])>,
+        admission_fault: AdmissionFault,
         result: i64,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    enum AdmissionFault {
+        #[default]
+        None,
+        CallbackFailure,
+        Context,
+        Pid,
+        Tid,
+        Image,
+        ZeroCookie,
+        Origin,
+        Syscall,
+        Operands,
+        Size,
+        Kind,
+        Reserved,
+    }
+
+    const ASYNC_EXIT_ARGS: [u64; 6] = [0x117, 17, 34, 51, 68, 85];
+
+    fn async_exit_call(number: Sysno) -> Syscall {
+        Syscall::from_raw(number, SyscallArgs::new(0x117, 17, 34, 51, 68, 85))
+    }
+
+    fn async_exit_fact(context: usize, number: i64, args: [u64; 6]) -> caller_abi::TerminalFact {
+        caller_abi::TerminalFact {
+            size: std::mem::size_of::<caller_abi::TerminalFact>() as u32,
+            kind: 1,
+            image: 7,
+            context: context as u64,
+            pid: 10,
+            tid: 10,
+            sysno: number,
+            args,
+            cookie: 1,
+            origin: 2,
+            reserved: 0,
+        }
+    }
+
+    unsafe extern "C" fn record_async_admit(
+        context: usize,
+        number: i64,
+        args: *const u64,
+        output: *mut caller_abi::TerminalFact,
+    ) -> i32 {
+        let record = unsafe { &mut *(context as *mut RecordedCallback) };
+        let args = unsafe { args.cast::<[u64; 6]>().read() };
+        record.admission_requests.push((number, args));
+        let mut fact = async_exit_fact(context, number, args);
+        match record.admission_fault {
+            AdmissionFault::None | AdmissionFault::CallbackFailure => {}
+            AdmissionFault::Context => fact.context += 1,
+            AdmissionFault::Pid => fact.pid += 1,
+            AdmissionFault::Tid => fact.tid += 1,
+            AdmissionFault::Image => fact.image += 1,
+            AdmissionFault::ZeroCookie => fact.cookie = 0,
+            AdmissionFault::Origin => fact.origin = 1,
+            AdmissionFault::Syscall => fact.sysno = libc::SYS_getpid,
+            AdmissionFault::Operands => fact.args[5] += 1,
+            AdmissionFault::Size => fact.size -= 1,
+            AdmissionFault::Kind => fact.kind = 0,
+            AdmissionFault::Reserved => fact.reserved = 1,
+        }
+        record.admissions.push(fact);
+        unsafe { output.write(fact) };
+        i32::from(record.admission_fault != AdmissionFault::CallbackFailure)
+    }
+
+    fn caller_injection_guest<'a>(
+        native: &mut RecordedCallback,
+        counters: &'a mut PrototypeCounters,
+        syscall_phase: bool,
+    ) -> (
+        DbtGuest<'a, PrototypeTool>,
+        Arc<caller_effects::CallerEffects>,
+    ) {
+        // Each test keeps this local recorder at a stable address until every
+        // Guest future and the Guest itself have been dropped.
+        let context = native as *mut _ as usize;
+        let effects = Arc::new(caller_effects::CallerEffects::new(
+            context,
+            10,
+            10,
+            7,
+            record_async_admit,
+        ));
+        let guest = DbtGuest::new(
+            context,
+            Pid::from_raw(10),
+            Pid::from_raw(10),
+            None,
+            0,
+            counters,
+            &GLOBAL_STATE,
+            &CONFIG,
+            record_callback,
+            read_regs,
+            write_regs_noop,
+        )
+        .with_caller_effects(Arc::clone(&effects), syscall_phase);
+        (guest, effects)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum InjectionApi {
+        Ordinary,
+        Purpose(InjectionPurpose),
+        Synchronous(InjectionPurpose),
+    }
+
+    async fn invoke_test_injection(
+        guest: &mut DbtGuest<'_, PrototypeTool>,
+        syscall: Syscall,
+        api: InjectionApi,
+    ) -> Result<i64, Errno> {
+        match api {
+            InjectionApi::Ordinary => guest.inject(syscall).await,
+            InjectionApi::Purpose(purpose) => guest
+                .inject_with_purpose(syscall, purpose)
+                .await
+                .map_err(|error| error.into_errno().expect("exact errno conversion")),
+            InjectionApi::Synchronous(purpose) => guest.inject_for_purpose(syscall, purpose),
+        }
     }
 
     unsafe extern "C" fn record_callback(
@@ -4610,6 +4771,413 @@ mod tests {
             assert_eq!((slot.as_raw() as *const u32).read(), 0xdead_beef);
         }
         drop(guard);
+    }
+
+    #[test]
+    fn caller_async_exit_injection_admits_before_suspending() {
+        const IMAGE: u64 = 7;
+
+        unsafe extern "C" fn record_admit(
+            context: usize,
+            number: i64,
+            args: *const u64,
+            output: *mut caller_abi::TerminalFact,
+        ) -> i32 {
+            let record = unsafe { &mut *(context as *mut RecordedCallback) };
+            let fact = caller_abi::TerminalFact {
+                size: std::mem::size_of::<caller_abi::TerminalFact>() as u32,
+                kind: 1,
+                image: IMAGE,
+                context: context as u64,
+                pid: 10,
+                tid: 10,
+                sysno: number,
+                args: unsafe { args.cast::<[u64; 6]>().read() },
+                cookie: 1,
+                origin: 2,
+                reserved: 0,
+            };
+            record.admissions.push(fact);
+            unsafe { output.write(fact) };
+            1
+        }
+
+        host_linux::take_observed();
+        let mut native = RecordedCallback::default();
+        let context = &mut native as *mut _ as usize;
+        let effects = Arc::new(caller_effects::CallerEffects::new(
+            context,
+            10,
+            10,
+            IMAGE,
+            record_admit,
+        ));
+        let mut counters = PrototypeCounters::default();
+        let mut guest = DbtGuest::<PrototypeTool>::new(
+            context,
+            Pid::from_raw(10),
+            Pid::from_raw(10),
+            None,
+            0,
+            &mut counters,
+            &GLOBAL_STATE,
+            &CONFIG,
+            record_callback,
+            read_regs,
+            write_regs_noop,
+        )
+        .with_caller_effects(Arc::clone(&effects), true);
+        let args = [0x117, 17, 34, 51, 68, 85];
+        let syscall = Syscall::from_raw(
+            Sysno::exit_group,
+            SyscallArgs::new(0x117, 17, 34, 51, 68, 85),
+        );
+        let expected = caller_abi::TerminalFact {
+            size: std::mem::size_of::<caller_abi::TerminalFact>() as u32,
+            kind: 1,
+            image: IMAGE,
+            context: context as u64,
+            pid: 10,
+            tid: 10,
+            sysno: libc::SYS_exit_group,
+            args,
+            cookie: 1,
+            origin: 2,
+            reserved: 0,
+        };
+
+        // Poll the actual Guest API once. Dropping the owned future releases
+        // its mutable Guest borrow without polling a completed future again.
+        let mut future = Box::pin(guest.inject(syscall));
+        let polled = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        drop(future);
+        let injected_syscalls = guest.injected_syscalls();
+        let refusal = effects.refusal();
+        let ending = effects.ending();
+        let provider_calls = host_linux::take_observed();
+        let poll_errno = match &polled {
+            Poll::Ready(Err(errno)) => Some(errno.into_raw()),
+            _ => None,
+        };
+        eprintln!(
+            "caller_async_terminal_observation: poll={polled:?}; errno={poll_errno:?}; injected_syscalls={injected_syscalls:?}; refusal={refusal:?}; ending={ending:?}; admissions={:?}; invoker_calls={:?}; provider_calls={provider_calls:?}",
+            native.admissions, native.calls,
+        );
+
+        assert!(
+            polled.is_pending(),
+            "caller-backed asynchronous exit injection must admit then suspend"
+        );
+        assert_eq!(injected_syscalls, Some(1));
+        assert_eq!(refusal, None);
+        assert_eq!(ending, Some(expected));
+        assert_eq!(native.admissions, [expected]);
+        assert!(native.calls.is_empty());
+        assert!(provider_calls.is_empty());
+    }
+
+    #[test]
+    fn caller_async_terminal_injection_reserves_once_after_first_poll() {
+        for api in [
+            InjectionApi::Ordinary,
+            InjectionApi::Purpose(InjectionPurpose::Application),
+        ] {
+            for number in [Sysno::exit, Sysno::exit_group] {
+                host_linux::take_observed();
+                let mut native = RecordedCallback::default();
+                let mut counters = PrototypeCounters::default();
+                let (mut guest, effects) = caller_injection_guest(&mut native, &mut counters, true);
+                let call = async_exit_call(number);
+                match api {
+                    InjectionApi::Ordinary => drop(Box::pin(guest.inject(call))),
+                    InjectionApi::Purpose(purpose) => {
+                        drop(Box::pin(guest.inject_with_purpose(call, purpose)));
+                    }
+                    InjectionApi::Synchronous(_) => unreachable!("async-only cases"),
+                }
+                assert_eq!(guest.injected_syscalls(), Some(0));
+                assert_eq!(effects.ending(), None);
+                assert_eq!(effects.refusal(), None);
+                assert!(native.admissions.is_empty());
+                assert!(native.admission_requests.is_empty());
+                assert!(native.calls.is_empty());
+                assert!(host_linux::take_observed().is_empty());
+
+                let mut future = Box::pin(invoke_test_injection(&mut guest, call, api));
+                let first = future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()));
+                assert_eq!(first, Poll::Pending, "{api:?}/{number:?}");
+                assert_eq!(
+                    native.admission_requests,
+                    [(number.id() as i64, ASYNC_EXIT_ARGS)]
+                );
+                let second = future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()));
+                drop(future);
+                let expected = async_exit_fact(guest.context, number.id() as i64, ASYNC_EXIT_ARGS);
+                eprintln!(
+                    "caller_async_terminal_once: api={api:?}; syscall={number:?}; first={first:?}; second={second:?}; count={:?}; ending={:?}; refusal={:?}; requests={:?}; admissions={:?}; invocations={:?}",
+                    guest.injected_syscalls(),
+                    effects.ending(),
+                    effects.refusal(),
+                    native.admission_requests,
+                    native.admissions,
+                    native.calls,
+                );
+                assert_eq!(second, Poll::Pending);
+                assert_eq!(guest.injected_syscalls(), Some(1));
+                assert_eq!(effects.ending(), Some(expected));
+                assert_eq!(effects.refusal(), None);
+                assert_eq!(
+                    native.admission_requests,
+                    [(number.id() as i64, ASYNC_EXIT_ARGS)]
+                );
+                assert_eq!(native.admissions, [expected]);
+                assert!(native.calls.is_empty());
+                assert!(host_linux::take_observed().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn caller_async_terminal_admission_rejects_invalid_facts() {
+        for api in [
+            InjectionApi::Ordinary,
+            InjectionApi::Purpose(InjectionPurpose::Application),
+        ] {
+            for number in [Sysno::exit, Sysno::exit_group] {
+                for fault in [
+                    AdmissionFault::CallbackFailure,
+                    AdmissionFault::Context,
+                    AdmissionFault::Pid,
+                    AdmissionFault::Tid,
+                    AdmissionFault::Image,
+                    AdmissionFault::ZeroCookie,
+                    AdmissionFault::Origin,
+                    AdmissionFault::Syscall,
+                    AdmissionFault::Operands,
+                    AdmissionFault::Size,
+                    AdmissionFault::Kind,
+                    AdmissionFault::Reserved,
+                ] {
+                    host_linux::take_observed();
+                    let mut native = RecordedCallback {
+                        admission_fault: fault,
+                        ..Default::default()
+                    };
+                    let mut counters = PrototypeCounters::default();
+                    let (mut guest, effects) =
+                        caller_injection_guest(&mut native, &mut counters, true);
+                    let mut future = Box::pin(invoke_test_injection(
+                        &mut guest,
+                        async_exit_call(number),
+                        api,
+                    ));
+                    let first = future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()));
+                    // A refused eligible terminal attempt must also stay suspended.
+                    assert_eq!(first, Poll::Pending, "{api:?}/{number:?}/{fault:?}");
+                    let second = future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()));
+                    drop(future);
+                    eprintln!(
+                        "caller_async_terminal_refused_admission: api={api:?}; syscall={number:?}; fault={fault:?}; first={first:?}; second={second:?}; count={:?}; ending={:?}; refusal={:?}; requests={:?}; admissions={:?}; invocations={:?}",
+                        guest.injected_syscalls(),
+                        effects.ending(),
+                        effects.refusal(),
+                        native.admission_requests,
+                        native.admissions,
+                        native.calls,
+                    );
+                    assert_eq!(second, Poll::Pending);
+                    assert_eq!(guest.injected_syscalls(), Some(1));
+                    assert_eq!(effects.ending(), None);
+                    assert_eq!(effects.refusal(), Some("caller-terminal-admission-refused"));
+                    assert_eq!(
+                        native.admission_requests,
+                        [(number.id() as i64, ASYNC_EXIT_ARGS)]
+                    );
+                    assert_eq!(native.admissions.len(), 1);
+                    assert!(native.calls.is_empty());
+                    assert!(host_linux::take_observed().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn caller_returning_injection_refusals_remain_exact() {
+        let application = InjectionPurpose::Application;
+        let validation = InjectionPurpose::Pselect6WrapperValidation;
+        for number in [
+            Sysno::exit,
+            Sysno::exit_group,
+            Sysno::clone,
+            Sysno::execve,
+            Sysno::tgkill,
+        ] {
+            for syscall_phase in [false, true] {
+                for api in [
+                    InjectionApi::Ordinary,
+                    InjectionApi::Purpose(application),
+                    InjectionApi::Purpose(validation),
+                    InjectionApi::Synchronous(application),
+                    InjectionApi::Synchronous(validation),
+                ] {
+                    // The eligible async terminal cells have their own success
+                    // and admission-refusal tables; every remaining cell stays
+                    // an immediate returning-lifecycle refusal.
+                    if syscall_phase
+                        && matches!(number, Sysno::exit | Sysno::exit_group)
+                        && matches!(
+                            api,
+                            InjectionApi::Ordinary
+                                | InjectionApi::Purpose(InjectionPurpose::Application)
+                        )
+                    {
+                        continue;
+                    }
+                    host_linux::take_observed();
+                    let mut native = RecordedCallback::default();
+                    let mut counters = PrototypeCounters::default();
+                    let (mut guest, effects) =
+                        caller_injection_guest(&mut native, &mut counters, syscall_phase);
+                    let mut future = Box::pin(invoke_test_injection(
+                        &mut guest,
+                        async_exit_call(number),
+                        api,
+                    ));
+                    let result = future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()));
+                    drop(future);
+                    eprintln!(
+                        "caller_returning_refusal: api={api:?}; syscall={number:?}; syscall_phase={syscall_phase}; result={result:?}; count={:?}; ending={:?}; refusal={:?}; requests={:?}; invocations={:?}",
+                        guest.injected_syscalls(),
+                        effects.ending(),
+                        effects.refusal(),
+                        native.admission_requests,
+                        native.calls,
+                    );
+                    assert_eq!(result, Poll::Ready(Err(Errno::EOPNOTSUPP)));
+                    assert_eq!(guest.injected_syscalls(), Some(1));
+                    assert_eq!(effects.ending(), None);
+                    assert_eq!(
+                        effects.refusal(),
+                        Some("caller-returning-lifecycle-unsupported")
+                    );
+                    assert!(native.admission_requests.is_empty());
+                    assert!(native.admissions.is_empty());
+                    assert!(native.calls.is_empty());
+                    assert!(host_linux::take_observed().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn caller_async_stopped_injection_preserves_latched_state() {
+        for established in [false, true] {
+            for api in [
+                InjectionApi::Ordinary,
+                InjectionApi::Purpose(InjectionPurpose::Application),
+                InjectionApi::Purpose(InjectionPurpose::Pselect6WrapperValidation),
+            ] {
+                for number in [Sysno::exit, Sysno::exit_group, Sysno::getpid] {
+                    host_linux::take_observed();
+                    let mut native = RecordedCallback::default();
+                    let mut counters = PrototypeCounters::default();
+                    let (mut guest, effects) =
+                        caller_injection_guest(&mut native, &mut counters, true);
+                    if established {
+                        let mut fact =
+                            async_exit_fact(guest.context, libc::SYS_exit_group, ASYNC_EXIT_ARGS);
+                        fact.origin = 1;
+                        assert!(effects.establish_final(fact));
+                    } else {
+                        effects.refuse("retained-test-refusal");
+                    }
+                    let before = (effects.ending(), effects.refusal());
+                    let mut future = Box::pin(invoke_test_injection(
+                        &mut guest,
+                        async_exit_call(number),
+                        api,
+                    ));
+                    let result = future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()));
+                    drop(future);
+                    assert_eq!(result, Poll::Pending, "{established}/{api:?}/{number:?}");
+                    assert_eq!(guest.injected_syscalls(), Some(0));
+                    assert_eq!((effects.ending(), effects.refusal()), before);
+                    assert!(native.admission_requests.is_empty());
+                    assert!(native.admissions.is_empty());
+                    assert!(native.calls.is_empty());
+                    assert!(host_linux::take_observed().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn caller_async_nonterminal_and_legacy_routing_is_unchanged() {
+        for caller in [false, true] {
+            for number in [Sysno::getpid, Sysno::exit, Sysno::exit_group] {
+                if caller && number != Sysno::getpid {
+                    continue;
+                }
+                for api in [
+                    InjectionApi::Ordinary,
+                    InjectionApi::Purpose(InjectionPurpose::Application),
+                ] {
+                    for raw in [73, -i64::from(libc::EINTR)] {
+                        host_linux::take_observed();
+                        let mut native = RecordedCallback {
+                            result: raw,
+                            ..Default::default()
+                        };
+                        let mut counters = PrototypeCounters::default();
+                        let (mut guest, effects) =
+                            caller_injection_guest(&mut native, &mut counters, true);
+                        if !caller {
+                            guest.caller_effects = None;
+                        }
+                        let call = async_exit_call(number);
+                        let provider =
+                            expected_provider_call(&guest, call, InjectionPurpose::Application);
+                        let mut future = Box::pin(invoke_test_injection(&mut guest, call, api));
+                        let result = future
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop()));
+                        drop(future);
+                        assert_eq!(
+                            result,
+                            Poll::Ready(if raw == 73 { Ok(73) } else { Err(Errno::EINTR) })
+                        );
+                        assert_eq!(guest.injected_syscalls(), Some(1));
+                        assert_eq!(effects.ending(), None);
+                        assert_eq!(effects.refusal(), None);
+                        assert!(native.admission_requests.is_empty());
+                        assert!(native.admissions.is_empty());
+                        assert_eq!(
+                            native.calls,
+                            [(
+                                number.id() as i64,
+                                ASYNC_EXIT_ARGS,
+                                InjectionPurpose::Application as u32
+                            )]
+                        );
+                        assert_eq!(host_linux::take_observed(), [provider]);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

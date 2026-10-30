@@ -14,6 +14,7 @@ use reverie::Error;
 use reverie::ExitStatus;
 use reverie::GlobalRPC;
 use reverie::Guest;
+use reverie::InjectionPurpose;
 use reverie::Pid;
 use reverie::Subscription;
 use reverie::Tool;
@@ -135,7 +136,10 @@ impl Tool for LifecycleTool {
         subscriptions.syscall(Sysno::getppid);
         match config.mode {
             Mode::OriginalExit => {}
-            Mode::RewriteToTerminal | Mode::RpcDisconnect => {
+            Mode::RewriteToTerminal
+            | Mode::RpcDisconnect
+            | Mode::AsyncInject
+            | Mode::AsyncApplicationInject => {
                 subscriptions.syscall(Sysno::getpid);
             }
             _ => {
@@ -273,6 +277,16 @@ impl Tool for LifecycleTool {
             },
         )
         .await;
+        if self.config.mode == Mode::AsyncInject {
+            let result = guest.inject(replacement.unwrap()).await;
+            panic!("asynchronous terminal inject returned: {result:?}");
+        }
+        if self.config.mode == Mode::AsyncApplicationInject {
+            let result = guest
+                .inject_with_purpose(replacement.unwrap(), InjectionPurpose::Application)
+                .await;
+            panic!("application-purpose terminal inject returned: {result:?}");
+        }
         match replacement {
             Some(replacement) => guest.tail_inject(replacement).await,
             None => Ok(0),
