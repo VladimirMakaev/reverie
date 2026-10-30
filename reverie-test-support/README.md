@@ -311,8 +311,8 @@ Cargo validation and CI paths.
 
 The `at_random` target reuses the standalone example's actual `TestTool` and
 16-byte `PRNG_SEED`. Its post-exec hook writes that seed through the guest's
-auxiliary vector. The original standalone guest, host and main bodies remain
-unchanged; these are new command tests, not execution of that standalone.
+auxiliary vector. The original standalone guest body is shared with an ordinary
+Rust command; the standalone host and main remain unchanged.
 
 Each positive compiles the embedded C fixture with `CC` (or `cc`) in an owned,
 executable temporary directory. The same image and empty argument list run
@@ -322,6 +322,16 @@ unconstrained; the Tool runs compare every byte with the shared seed. The C
 fixture contains no copy of the seed. Compiler output and image bytes are
 retained before launch; independent compilations need not produce equal hashes.
 These helpers have no local timeout.
+
+The DBT positive also runs the same Cargo-built `at-random-rust-command-guest`
+image through ptrace and the authenticated DBT caller with unit configuration.
+It retains the original `getauxval(AT_RANDOM)`, 16-byte slice, both printed
+records, and exact seed assertion. Each command requires exit 0, the complete
+original two stdout lines, and empty stderr; raw results are printed before
+assertions. The seed has one constants owner inside the caller's authenticated
+input root. This Rust body is not a native-success control: unmodified native
+entropy is not expected to equal the Tool's seed. The standalone Tokio host
+path is preserved but is not a separate command test.
 
 The default target has one ptrace test. Feature `dbt` adds the actual caller
 positive and an independent missing-manifest guard, for three tests total.

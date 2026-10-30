@@ -253,6 +253,12 @@ rust_library(
                 "test": False,
                 "bench": False,
                 "required-features": ["dbt"],
+            }, {
+                "name": "at-random-rust-command-guest",
+                "path": "../tests/fixtures/at-random-rust-command.rs",
+                "test": False,
+                "bench": False,
+                "required-features": ["dbt"],
             }],
             "dependencies_override": {
                 "dependencies": {

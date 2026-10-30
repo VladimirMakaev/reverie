@@ -14,9 +14,10 @@ use reverie::syscalls::MemoryAccess;
 #[derive(Debug, Default, Clone)]
 pub struct TestTool {}
 
-pub const PRNG_SEED: [u8; 16] = [
-    0x12, 0x34, 0x56, 0x78, 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xca, 0xfe, 0x87, 0x65, 0x43, 0x21,
-];
+#[path = "at_random_constants.rs"]
+mod at_random_constants;
+
+pub use at_random_constants::PRNG_SEED;
 
 #[reverie::tool]
 impl Tool for TestTool {

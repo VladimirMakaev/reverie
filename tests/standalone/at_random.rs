@@ -14,19 +14,12 @@ use reverie::ExitStatus;
 #[path = "../tool_fixtures/at_random.rs"]
 mod at_random_tool;
 
-use at_random_tool::PRNG_SEED;
 use at_random_tool::TestTool;
 
-fn guest_mode() {
-    println!("Running in guest mode (actual test).");
+#[path = "../support/at_random_rust_guest.rs"]
+mod at_random_rust_guest;
 
-    let at_random = unsafe { libc::getauxval(libc::AT_RANDOM) as *const u8 };
-    let slice = unsafe { std::slice::from_raw_parts(at_random, 16) };
-
-    println!("Entropy (intercepted) at at_random {:02x?}", slice);
-
-    assert_eq!(slice, PRNG_SEED);
-}
+use at_random_rust_guest::guest_mode;
 
 async fn host_mode() -> Result<ExitStatus, Error> {
     println!("Running in HOST mode (ReverieTool)");

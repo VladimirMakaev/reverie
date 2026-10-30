@@ -51,6 +51,33 @@ fn caller_manifest() -> std::path::PathBuf {
 }
 
 #[cfg(feature = "dbt")]
+fn assert_rust_command_output(label: &str, output: &reverie::process::Output) {
+    eprintln!(
+        "at-random Rust command {label}: status={:?} stdout={:02x?} stderr={:02x?}",
+        output.status, output.stdout, output.stderr,
+    );
+    assert_eq!(output.status, reverie::ExitStatus::Exited(0));
+    assert_eq!(
+        output.stdout,
+        b"Running in guest mode (actual test).\nEntropy (intercepted) at at_random [12, 34, 56, 78, de, ad, be, ef, ca, fe, ca, fe, 87, 65, 43, 21]\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(feature = "dbt")]
+fn rust_command_test(manifest: &std::path::Path) {
+    let program = env!("CARGO_BIN_EXE_at-random-rust-command-guest");
+    eprintln!("at-random Rust guest: image={program}");
+    let (output, ()): (_, ()) =
+        reverie_test_support::test_cmd_with_config::<TestTool>(program, &[], ()).unwrap();
+    assert_rust_command_output("ptrace", &output);
+    let (output, ()): (_, ()) =
+        reverie_test_support::test_dbt_cmd_with_config::<TestTool>(program, &[], (), manifest)
+            .unwrap();
+    assert_rust_command_output("dbt", &output);
+}
+
+#[cfg(feature = "dbt")]
 #[test]
 fn dbt_at_random_command() {
     let manifest = caller_manifest();
@@ -66,6 +93,7 @@ fn dbt_at_random_command() {
     )
     .unwrap();
     assert_command_output("dbt", &output);
+    rust_command_test(&manifest);
 }
 
 #[cfg(feature = "dbt")]
