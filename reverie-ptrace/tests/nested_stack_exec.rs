@@ -194,7 +194,7 @@ fn exec_cell(success: bool) {
         let result = unsafe {
             libc::execl(
                 path.as_ptr(),
-                c"scratch-exec".as_ptr(),
+                c"true".as_ptr(),
                 std::ptr::null::<libc::c_char>(),
             )
         };
