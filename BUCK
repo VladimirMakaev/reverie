@@ -259,6 +259,12 @@ rust_library(
                 "test": False,
                 "bench": False,
                 "required-features": ["dbt"],
+            }, {
+                "name": "thread-start-rust-command-guest",
+                "path": "../tests/fixtures/thread-start-rust-command.rs",
+                "test": False,
+                "bench": False,
+                "required-features": ["dbt"],
             }],
             "dependencies_override": {
                 "dependencies": {

@@ -103,3 +103,10 @@ path = "../tests/fixtures/at-random-rust-command.rs"
 test = false
 bench = false
 required-features = ["dbt"]
+
+[[bin]]
+name = "thread-start-rust-command-guest"
+path = "../tests/fixtures/thread-start-rust-command.rs"
+test = false
+bench = false
+required-features = ["dbt"]

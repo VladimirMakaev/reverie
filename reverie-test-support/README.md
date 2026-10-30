@@ -351,3 +351,33 @@ cargo test -p reverie-test-support --features dbt --test at_random -- \
 Buck registers the ptrace target; Cargo validation and both CI jobs explicitly
 produce the DBT caller before its consumers. The maintained testing helper
 installs `reverie=trace` independently of `RUST_LOG`.
+
+## Returning thread-start injection
+
+The `thread_start` target retains both original ptrace function tests. The
+returning `thread_start_inject` Tool still injects `Getpid` during startup and
+asserts that its returned PID equals `guest.pid()`. It now sends an awaited unit
+RPC immediately after that assertion. A shared global Tool records a boolean,
+and the test checks the actual returned global state. This is an additive test
+observation, not a hook-count or Noop-sensitivity assertion.
+
+With `dbt`, the same test also runs the ordinary `thread-start-rust-command-guest`
+image natively, through ptrace, and through DBT. The command and original
+function test share the empty guest body and returning Tool. Native exit zero
+and empty streams only establish the command launch control; each traced run
+also requires the real post-assertion RPC flag. The raw status, streams and flag
+are recorded before assertions. The separate missing-manifest test requires a
+real `NotFound` error. Produce the authenticated caller before selecting these
+tests:
+
+```bash
+reverie-dbt/scripts/build-client.sh --caller-manifest tests/fixtures/thread-start-dbt-runtime/Cargo.toml --profile validate --jobs 4 --check
+```
+
+The alias exports the shared test Tool with its mandatory producer-supplied
+input identity. Its existing `tool_fixtures` input root covers the observing
+Tool; the producer authenticates the complete current dependency closure.
+`thread_start_tail_inject` remains byte-preserved and ptrace-only, including
+when the test target enables `dbt`. DBT startup tail completion is unsupported;
+this returning-injection case does not claim otherwise. These generic tests do
+not establish syscall-stream parity, exact hook counts, or deterministic time.
