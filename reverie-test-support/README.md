@@ -105,6 +105,16 @@ command forms using the same `LocalState` Tool. It subscribes to all syscalls
 and uses the default identical tail forwarding; these tests do not establish
 stat-to-fstatat conversion or a separate reinjection mechanism.
 
+The two original Rust bodies and raw statx helper live in
+`tests/support/stat_rust_guest.rs`. Their original test identities still call
+ptrace's `check_fn`. With `dbt` enabled, each identity also runs the same shared
+body through the plain Rust `stat-rust-command-guest` binary: native first,
+then ptrace and the authenticated DBT caller, using the same command image.
+The binary accepts exactly `stat` or `statx`; it is not a libtest self-exec.
+All three command runs retain their raw outputs before requiring exit0 and
+empty streams. The original inode assertions and the separate C command tests
+remain intact. The returned unit global state is not application-RPC evidence.
+
 The first C guest checks that `open("/proc/self/exe", O_RDONLY)` returns a
 positive descriptor, that `stat`, `lstat` and `fstat` succeed, and that the
 followed inode equals the descriptor inode but differs from the symlink inode.

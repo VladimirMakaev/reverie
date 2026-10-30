@@ -218,6 +218,9 @@ rust_library(
             # DBT caller artifacts use the explicit OSS producer. Buck's
             # generic conformance targets retain their ptrace selections.
             "features": {"default": [], "dbt": ["dep:reverie-dbt"]},
+            "bin": [
+                {"name": "stat-rust-command-guest", "path": "../tests/fixtures/stat-rust-command.rs", "test": False, "bench": False, "required-features": ["dbt"]},
+            ],
             "test": [
                 {"name": "basics", "path": "../tests/basics.rs"},
                 {"name": "exit", "path": "../tests/exit.rs"},
@@ -250,7 +253,6 @@ rust_library(
     },
     test_deps = [
         "fbsource//third-party/rust:close-err",
-        "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:nix",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:tempfile",
@@ -258,6 +260,7 @@ rust_library(
         ":reverie-ptrace",
     ],
     deps = [
+        "fbsource//third-party/rust:libc",
         ":reverie",
         ":reverie-ptrace",
     ],
@@ -305,6 +308,7 @@ rust_unittest(
         "tests/fixtures/stat-command.c",
         "tests/fixtures/statx-command.c",
         "tests/support/stat_command.rs",
+        "tests/support/stat_rust_guest.rs",
         "tests/tool_fixtures/stat.rs",
     ],
     crate_root = "tests/stat.rs",
