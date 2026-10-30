@@ -68,6 +68,7 @@ struct Evidence {
     completion: Option<NativeOperationCompletion>,
     unrelated: Option<NativeOperation>,
     post_exec_complete: bool,
+    tail_boundary_observed: bool,
 }
 thread_local! {
     static EVIDENCE: RefCell<Arc<StdMutex<Evidence>>> = RefCell::new(Arc::default());
@@ -368,6 +369,38 @@ impl Tool for NativeTool {
             assert!(operation.effects_complete());
             return Ok(45);
         }
+        if matches!(self.mode, Mode::Tail) && call.into_parts().0 == Sysno::getppid {
+            let log = evidence();
+            let mut log = log.lock().unwrap();
+            assert!(
+                !log.tail_boundary_observed,
+                "one existing follow-up boundary"
+            );
+            let tail = log
+                .events
+                .iter()
+                .filter(|event| event.call.number == Sysno::getpid as u64)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                tail.len(),
+                3,
+                "existing next syscall entry must settle tail effects before its Tool callback"
+            );
+            assert_eq!(tail[0].event, NativeSyscallEvent::ResumeIssued);
+            assert_eq!(tail[1].event, NativeSyscallEvent::ResultUnobserved);
+            assert_eq!(tail[2].event, NativeSyscallEvent::EffectsComplete);
+            for event in &tail {
+                assert_eq!(event.call.id, tail[0].call.id);
+                assert_eq!(event.call.abi, tail[0].call.abi);
+                assert_eq!(event.call.number, tail[0].call.number);
+                assert_eq!(event.call.args, tail[0].call.args);
+                assert_eq!(event.call.purpose, tail[0].call.purpose);
+                assert_eq!(event.call.operation_bound, tail[0].call.operation_bound);
+                assert_eq!(event.call.input_receipt, tail[0].call.input_receipt);
+                assert_eq!(event.call.staged_image, tail[0].call.staged_image);
+            }
+            log.tail_boundary_observed = true;
+        }
         if call.into_parts().0 != Sysno::getpid {
             return Ok(guest.inject(call).await?);
         }
@@ -549,6 +582,10 @@ fn native_observation_distinguishes_exact_private_tail_emulation_and_errno() {
         assert_eq!(events[0].call.id, events[1].call.id);
         match mode {
             Mode::Tail => {
+                assert!(
+                    evidence().lock().unwrap().tail_boundary_observed,
+                    "the existing follow-up callback must assert completion before retirement"
+                );
                 assert_eq!(events[1].event, NativeSyscallEvent::ResultUnobserved);
                 assert_eq!(events[2].event, NativeSyscallEvent::EffectsComplete);
                 assert_eq!(events[0].call.id, events[2].call.id);
