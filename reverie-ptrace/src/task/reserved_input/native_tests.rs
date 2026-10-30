@@ -688,7 +688,7 @@ pub(super) fn debugger_requests(
     }
     let layout = control.layout(identity).unwrap();
     let before = read_image(task, layout).unwrap();
-    let stack_address = task.getregs().unwrap().stack_ptr() as u64;
+    let stack_address = task.getregs().unwrap().stack_ptr();
     let stack = AddrMut::<u64>::from_raw(stack_address as usize).unwrap();
     let saved: u64 = task.read_value(stack).unwrap();
     let breakpoints = Mutex::new(HashMap::new());
@@ -698,88 +698,89 @@ pub(super) fn debugger_requests(
         parked_registers: None,
         reserved_input: Some((control.clone(), identity)),
     };
-    let mut request = |make: &dyn Fn(oneshot::Sender<Result<(), TraceError>>) -> GdbRequest| {
-        let (tx, mut rx) = oneshot::channel();
-        view.answer(make(tx));
-        evidence().lock().unwrap().debugger_requests += 1;
-        rx.try_recv().expect("synchronous actual debugger reply")
-    };
-    let tagged = match layout.abi {
-        InputAbi::X86_64 => layout.base | (1 << 57),
-        InputAbi::Aarch64 => layout.base | (0xab << 56),
-    };
-    for address in [layout.base, tagged] {
+    {
+        let mut request = |make: &dyn Fn(oneshot::Sender<Result<(), TraceError>>) -> GdbRequest| {
+            let (tx, mut rx) = oneshot::channel();
+            view.answer(make(tx));
+            evidence().lock().unwrap().debugger_requests += 1;
+            rx.try_recv().expect("synchronous actual debugger reply")
+        };
+        let tagged = match layout.abi {
+            InputAbi::X86_64 => layout.base | (1 << 57),
+            InputAbi::Aarch64 => layout.base | (0xab << 56),
+        };
+        for address in [layout.base, tagged] {
+            assert!(matches!(
+                request(&|tx| GdbRequest::WriteInferiorMemory(address, 8, vec![0x33; 8], tx)),
+                Err(TraceError::Errno(Errno::EPERM))
+            ));
+        }
+        // An int3 is one byte, but the existing transport writes an entire word.
+        // Even an unmapped preceding address must be refused before its read.
+        for address in [layout.base - 7, layout.base, tagged] {
+            assert!(matches!(
+                request(&|tx| GdbRequest::SetBreakpoint(
+                    Breakpoint {
+                        ty: BreakpointType::Software,
+                        addr: address,
+                        bytecode: None
+                    },
+                    tx
+                )),
+                Err(TraceError::Errno(Errno::EPERM))
+            ));
+        }
+        breakpoints.lock().unwrap().insert(layout.base, 0x55);
         assert!(matches!(
-            request(&|tx| GdbRequest::WriteInferiorMemory(address, 8, vec![0x33; 8], tx)),
-            Err(TraceError::Errno(Errno::EPERM))
-        ));
-    }
-    // An int3 is one byte, but the existing transport writes an entire word.
-    // Even an unmapped preceding address must be refused before its read.
-    for address in [layout.base - 7, layout.base, tagged] {
-        assert!(matches!(
-            request(&|tx| GdbRequest::SetBreakpoint(
+            request(&|tx| GdbRequest::RemoveBreakpoint(
                 Breakpoint {
                     ty: BreakpointType::Software,
-                    addr: address,
+                    addr: layout.base,
                     bytecode: None
                 },
                 tx
             )),
             Err(TraceError::Errno(Errno::EPERM))
         ));
+        assert_eq!(breakpoints.lock().unwrap().get(&layout.base), Some(&0x55));
+        breakpoints.lock().unwrap().clear();
+        // Real ordinary-memory write and breakpoint add/remove remain supported.
+        request(&|tx| {
+            GdbRequest::WriteInferiorMemory(
+                stack_address,
+                8,
+                saved.wrapping_add(1).to_ne_bytes().to_vec(),
+                tx,
+            )
+        })
+        .unwrap();
+        request(&|tx| {
+            GdbRequest::WriteInferiorMemory(stack_address, 8, saved.to_ne_bytes().to_vec(), tx)
+        })
+        .unwrap();
+        request(&|tx| {
+            GdbRequest::SetBreakpoint(
+                Breakpoint {
+                    ty: BreakpointType::Software,
+                    addr: stack_address,
+                    bytecode: None,
+                },
+                tx,
+            )
+        })
+        .unwrap();
+        request(&|tx| {
+            GdbRequest::RemoveBreakpoint(
+                Breakpoint {
+                    ty: BreakpointType::Software,
+                    addr: stack_address,
+                    bytecode: None,
+                },
+                tx,
+            )
+        })
+        .unwrap();
     }
-    breakpoints.lock().unwrap().insert(layout.base, 0x55);
-    assert!(matches!(
-        request(&|tx| GdbRequest::RemoveBreakpoint(
-            Breakpoint {
-                ty: BreakpointType::Software,
-                addr: layout.base,
-                bytecode: None
-            },
-            tx
-        )),
-        Err(TraceError::Errno(Errno::EPERM))
-    ));
-    assert_eq!(breakpoints.lock().unwrap().get(&layout.base), Some(&0x55));
-    breakpoints.lock().unwrap().clear();
-    // Real ordinary-memory write and breakpoint add/remove remain supported.
-    request(&|tx| {
-        GdbRequest::WriteInferiorMemory(
-            stack_address,
-            8,
-            saved.wrapping_add(1).to_ne_bytes().to_vec(),
-            tx,
-        )
-    })
-    .unwrap();
-    request(&|tx| {
-        GdbRequest::WriteInferiorMemory(stack_address, 8, saved.to_ne_bytes().to_vec(), tx)
-    })
-    .unwrap();
-    request(&|tx| {
-        GdbRequest::SetBreakpoint(
-            Breakpoint {
-                ty: BreakpointType::Software,
-                addr: stack_address,
-                bytecode: None,
-            },
-            tx,
-        )
-    })
-    .unwrap();
-    request(&|tx| {
-        GdbRequest::RemoveBreakpoint(
-            Breakpoint {
-                ty: BreakpointType::Software,
-                addr: stack_address,
-                bytecode: None,
-            },
-            tx,
-        )
-    })
-    .unwrap();
-    drop(request);
     assert_eq!(view.task.read_value::<_, u64>(stack).unwrap(), saved);
     assert_eq!(
         read_image(view.task, layout).unwrap(),

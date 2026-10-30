@@ -3897,12 +3897,11 @@ fn input_facility<T: Tool>(
     if !T::enforces_serialized_execution(config) {
         return Err(reverie::Error::Tool(anyhow::Error::new(
             reverie::reserved_input::InputUnavailable::new("input-serialized-execution-required"),
-        ))
-        .into());
+        )));
     }
     reverie::reserved_input::ReservedInputControl::new_backend()
         .map(Some)
-        .map_err(|error| reverie::Error::Tool(anyhow::Error::new(error)).into())
+        .map_err(|error| reverie::Error::Tool(anyhow::Error::new(error)))
 }
 
 /// Helper function for everything after the child is spawned.

@@ -675,10 +675,8 @@ impl<L: Tool + 'static> TracedTask<L> {
                 let a = regs.args();
                 NativeSyscallRequest {
                     abi,
-                    number: regs.syscall() as u64,
-                    args: [
-                        a.0 as u64, a.1 as u64, a.2 as u64, a.3 as u64, a.4 as u64, a.5 as u64,
-                    ],
+                    number: regs.syscall(),
+                    args: [a.0, a.1, a.2, a.3, a.4, a.5],
                 }
             }
         };
@@ -709,22 +707,20 @@ impl<L: Tool + 'static> TracedTask<L> {
         };
         let facts = PtraceNativeFacts::new(self, stop);
         let mut observers = Vec::new();
-        if L::observes_native_syscalls(&self.global_state.cfg) {
-            if let Some(observer) = self
+        if L::observes_native_syscalls(&self.global_state.cfg)
+            && let Some(observer) = self
                 .process_state
                 .observe_native_syscall(&self.thread_state, &facts, &call)
                 .map_err(|error| self.input_failure(error))?
-            {
-                observers.push(observer);
-            }
+        {
+            observers.push(observer);
         }
-        if let Some(operation) = &context.operation {
-            if let Some(observer) = operation
+        if let Some(operation) = &context.operation
+            && let Some(observer) = operation
                 .observe(&facts, &call)
                 .map_err(|error| self.input_failure(error))?
-            {
-                observers.push(observer);
-            }
+        {
+            observers.push(observer);
         }
         drop(facts); // All pins close before input initialization or native resume.
         if observers.is_empty() && context.operation.is_none() {

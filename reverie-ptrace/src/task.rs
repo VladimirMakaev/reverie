@@ -1332,6 +1332,12 @@ struct StepChoice {
     shielded: bool,
 }
 
+/// Masks retained while preparing a private-page syscall entry.
+struct InjectionSignalMasks {
+    original: u64,
+    current: u64,
+}
+
 /// What an injection's single-step can change of SIGTRAP's state, read
 /// before the injection (`TracedTask::read_sigtrap_before_injection`).
 struct SigtrapBeforeInjection {
@@ -11352,7 +11358,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         let native = NativeCallContext::internal();
         self.observe_native_at_stop(
             &task,
-            nr as u64,
+            nr,
             [
                 args.arg0 as u64,
                 args.arg1 as u64,
@@ -13244,8 +13250,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         let original_mask = stopped.getsigmask()?;
         self.requeue_signals_until_syscall_entry(
             wait,
-            original_mask,
-            original_mask,
+            InjectionSignalMasks {
+                original: original_mask,
+                current: original_mask,
+            },
             nr,
             false,
             true,
@@ -13322,8 +13330,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         self.arm_liteinst_wait(&wait);
         self.requeue_signals_until_syscall_entry(
             wait,
-            original_mask,
-            mask,
+            InjectionSignalMasks {
+                original: original_mask,
+                current: mask,
+            },
             nr,
             true,
             requeue,
@@ -13346,13 +13356,16 @@ impl<L: Tool + 'static> TracedTask<L> {
     async fn requeue_signals_until_syscall_entry(
         &mut self,
         wait: Wait,
-        original_mask: u64,
-        mut mask: u64,
+        masks: InjectionSignalMasks,
         nr: Sysno,
         plain_injection: bool,
         requeue: bool,
         input: Option<&NativeCallContext>,
     ) -> Result<(Wait, bool), TraceError> {
+        let InjectionSignalMasks {
+            original: original_mask,
+            current: mut mask,
+        } = masks;
         fn requeueable(sig: AnySignal) -> bool {
             !matches!(
                 sig.as_nix(),

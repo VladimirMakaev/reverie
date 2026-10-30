@@ -383,15 +383,15 @@ impl<L: Tool + 'static> TracedTask<L> {
             .input_control()
             .ok_or_else(|| InputUnavailable::new("input-backend-unavailable"))?;
         control.backend_bind_injection(&receipt, task, nr as u64, *request.args())?;
-        if let Some((scope, image)) = &scope_image {
-            if let Err(error) = control.backend_begin_preparation(&receipt, scope, image.clone()) {
-                control
-                    .backend_settled_not_run(receipt.id())
-                    .map_err(|fatal| {
-                        InputInjectionError::Fatal(self.input_failure(fatal).to_string())
-                    })?;
-                return Err(error.into());
-            }
+        if let Some((scope, image)) = &scope_image
+            && let Err(error) = control.backend_begin_preparation(&receipt, scope, image.clone())
+        {
+            control
+                .backend_settled_not_run(receipt.id())
+                .map_err(|fatal| {
+                    InputInjectionError::Fatal(self.input_failure(fatal).to_string())
+                })?;
+            return Err(error.into());
         }
         let input = NativeInputCall {
             receipt,
@@ -1015,7 +1015,7 @@ fn force_words(
     mut boundary: impl FnMut(usize, bool) -> Result<(), Errno>,
 ) -> Result<(), Errno> {
     let layout = image.layout();
-    for (index, word) in image.bytes().chunks_exact(8).enumerate() {
+    for (index, word) in image.bytes().as_chunks::<8>().0.iter().enumerate() {
         let address = layout
             .base
             .checked_add((index * 8) as u64)
@@ -1027,7 +1027,7 @@ fn force_words(
         boundary(index, false)?;
         // An exact aligned word selects safeptrace's POKEDATA path, whose
         // stopped-generation/ptracer-thread checks wrap each native request.
-        task.write_value(address, &u64::from_ne_bytes(word.try_into().unwrap()))?;
+        task.write_value(address, &u64::from_ne_bytes(*word))?;
         boundary(index, true)?;
     }
     Ok(())
