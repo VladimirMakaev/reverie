@@ -14,6 +14,8 @@
 mod command;
 #[path = "tool_fixtures/exit.rs"]
 mod exit_tool;
+#[path = "support/exit_rust_guest.rs"]
+mod rust_guest;
 
 use exit_tool::GlobalState;
 use exit_tool::InjectExitTool;
@@ -139,13 +141,64 @@ fn dbt_exit_missing_artifact_refuses() {
 fn smoke() {
     use reverie_ptrace::testing::test_fn;
 
-    let (output, state) = test_fn::<InjectExitTool, _>(|| unsafe {
-        let _ = libc::getpid();
-        libc::syscall(libc::SYS_exit_group, 0);
-    })
-    .unwrap();
+    let (output, state) = test_fn::<InjectExitTool, _>(rust_guest::smoke).unwrap();
     assert_eq!(output.status, ExitStatus::Exited(42));
     let mut mg = state.exited.lock().unwrap();
     assert_eq!(mg.pop().map(|x| x.1), Some(ExitStatus::Exited(42)));
     assert!(mg.is_empty());
+    drop(mg);
+
+    #[cfg(feature = "dbt")]
+    check_rust_command();
+}
+
+#[cfg(feature = "dbt")]
+fn check_rust_command() {
+    let manifest = caller_manifest("inject-exit");
+    let noop_manifest = caller_manifest("basics-noop");
+    reverie_dbt::CallerArtifact::load(&manifest).unwrap();
+    reverie_dbt::CallerArtifact::load(&noop_manifest).unwrap();
+    let program = env!("CARGO_BIN_EXE_exit-rust-command-guest");
+    eprintln!("injected exit Rust command: image={program}");
+
+    let output = std::process::Command::new(program).output().unwrap();
+    eprintln!(
+        "injected exit rust/native: status={:?} stdout={:02x?} stderr={:02x?}",
+        output.status, output.stdout, output.stderr,
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, rust_guest::PRE_BODY_MARKER);
+    assert!(output.stderr.is_empty());
+
+    let (output, state) = reverie_test_support::test_cmd::<InjectExitTool>(program, &[]).unwrap();
+    record_command("rust/ptrace", &output, &state);
+    assert_eq!(output.stdout, rust_guest::PRE_BODY_MARKER);
+    assert!(output.stderr.is_empty());
+    assert_exit_oracle(&output, &state);
+
+    let (output, state) = reverie_test_support::test_dbt_cmd_with_config::<InjectExitTool>(
+        program,
+        &[],
+        (),
+        &manifest,
+    )
+    .unwrap();
+    record_command("rust/dbt", &output, &state);
+    assert_eq!(output.stdout, rust_guest::PRE_BODY_MARKER);
+    assert!(output.stderr.is_empty());
+    assert_exit_oracle(&output, &state);
+
+    let (output, state) = reverie_test_support::test_dbt_cmd_with_config::<InjectExitTool>(
+        program,
+        &[],
+        (),
+        &noop_manifest,
+    )
+    .unwrap();
+    record_command("rust/noop", &output, &state);
+    assert_eq!(output.stdout, rust_guest::PRE_BODY_MARKER);
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.status, ExitStatus::Exited(0));
+    assert!(state.exited.lock().unwrap().is_empty());
+    assert!(std::panic::catch_unwind(|| assert_exit_oracle(&output, &state)).is_err());
 }

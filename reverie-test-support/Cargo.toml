@@ -68,3 +68,10 @@ path = "../tests/fixtures/stat-rust-command.rs"
 test = false
 bench = false
 required-features = ["dbt"]
+
+[[bin]]
+name = "exit-rust-command-guest"
+path = "../tests/fixtures/exit-rust-command.rs"
+test = false
+bench = false
+required-features = ["dbt"]

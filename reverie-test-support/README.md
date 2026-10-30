@@ -69,7 +69,30 @@ that issues `getpid` followed by `exit_group(0)`. The actual shared
 optional authenticated DBT caller must return exit42 and exactly one exit42
 process-hook RPC in the real returned GlobalState. Under DBT the RPC carries
 the admitted terminal request; the child wait status separately checks the
-actual exit. The original function guest is still ptrace-only.
+actual exit. The original function-guest invocation remains ptrace-only.
+
+With `dbt`, the existing `smoke` identity also runs the same two-statement Rust
+body in an ordinary Cargo-built command image: native, ptrace, authenticated
+InjectExit, and authenticated Noop. The shared body is not reimplemented in
+assembly. All runs require the exact `inject-exit-rust-body\n` stdout marker
+and empty stderr. Native and Noop must exit0; ptrace and InjectExit must exit42
+and satisfy the unchanged real-state oracle (one exit42 RPC, no remainder).
+The Noop's real state must be empty before the same injected-exit oracle is
+required to reject it. The original three smoke assertions and all existing
+assembly and missing-artifact tests remain unchanged; the five/two feature and
+default identities do not change.
+
+The Rust wrapper makes one raw write immediately before calling the shared
+body, with no formatting, argument parsing or other library work between.
+A failed or short marker write exits97; an unexpectedly returning body exits98.
+If either refusal syscall unexpectedly returns, a nonreturning x86-64 trap
+fails without making another getpid call.
+Missing/partial markers fail, so an early startup getpid causing exit42 cannot
+masquerade as reaching the intended body. Rust/libc/loader startup is part of
+this command, not inherited-function execution. This marker establishes reaching the direct-call boundary, not a separate
+instruction-PC trace; lazy libc resolution inside the body is not excluded. Cargo supplies the dbt-only binary
+path; default/Buck ptrace tests do not need that Cargo environment variable.
+The normal libc dependency and bin metadata are mirrored in BUCK.
 
 The command fixture embeds its assembly and writes it into a test-owned
 TempDir, so it needs no Cargo-specific runtime paths. Running these command

@@ -230,6 +230,13 @@ rust_library(
                 {"name": "at_random", "path": "../tests/at_random.rs"},
                 {"name": "dbt_command", "path": "tests/dbt_command.rs", "required-features": ["dbt"]},
             ],
+            "bin": [{
+                "name": "exit-rust-command-guest",
+                "path": "../tests/fixtures/exit-rust-command.rs",
+                "test": False,
+                "bench": False,
+                "required-features": ["dbt"],
+            }],
             "dependencies_override": {
                 "dependencies": {
                     "reverie-dbt": {"version": "0.5.4", "path": "../reverie-dbt", "default-features": False, "optional": True},
@@ -288,6 +295,7 @@ rust_unittest(
         "tests/exit.rs",
         "tests/fixtures/exit-command.S",
         "tests/support/exit_command.rs",
+        "tests/support/exit_rust_guest.rs",
         "tests/tool_fixtures/exit.rs",
     ],
     crate_root = "tests/exit.rs",
