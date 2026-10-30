@@ -729,3 +729,8 @@ fn exec_settles_a_pre_release_bound_owner_before_any_physical_attempt_exists() {
         "actual exec, not callback Drop, settles the never-issued owner"
     );
 }
+
+#[cfg(target_arch = "x86_64")]
+mod register_edits;
+
+mod held_signal;

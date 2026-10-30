@@ -532,12 +532,18 @@ impl ReservedInputControl {
     /// facts for a generation already retained by the backend.
     pub fn observe_exit_effects(&self, task: InputTaskId) -> Result<bool, InputUnavailable> {
         {
-            let state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap();
             let owner = state
                 .tasks
                 .get(&task)
                 .ok_or_else(|| InputUnavailable::new("input-task-not-owned"))?;
-            if owner.native_effects_complete || owner.native_terminal {
+            if owner.native_effects_complete {
+                return Ok(true);
+            }
+            if owner.native_terminal {
+                // Physical death does not authenticate an unsettled image.
+                // Retain the same failure that blocked terminal settlement.
+                Self::effects_complete_locked(&mut state, task)?;
                 return Ok(true);
             }
         }
@@ -1264,10 +1270,10 @@ impl ReservedInputControl {
             .freezes
             .get(&cohort.id)
             .ok_or_else(|| InputUnavailable::new("input-freeze-missing"))?;
-        if tasks
-            .iter()
-            .any(|task| state.tasks[task].native_effects_complete)
-        {
+        if tasks.iter().any(|task| {
+            let owner = &state.tasks[task];
+            owner.native_effects_complete || owner.native_terminal
+        }) {
             return Err(InputUnavailable::new("input-retirement-has-native-effect"));
         }
         let tasks = state.freezes.remove(&cohort.id).unwrap();
@@ -2083,7 +2089,9 @@ impl ReservedInputControl {
                         | InputTransactionPhase::Launched
                 )
             ) {
-                state.fatal = Some("input-terminal-before-settlement".to_owned());
+                state
+                    .fatal
+                    .get_or_insert_with(|| "input-terminal-before-settlement".to_owned());
                 return Err(InputUnavailable::new("input-terminal-before-settlement"));
             }
             if call.state == PhysicalInjectionState::Issued {
@@ -2131,7 +2139,9 @@ impl ReservedInputControl {
                         | InputTransactionPhase::Launched
                 )
             ) {
-                state.fatal = Some("input-terminal-before-settlement".to_owned());
+                state
+                    .fatal
+                    .get_or_insert_with(|| "input-terminal-before-settlement".to_owned());
                 return Err(InputUnavailable::new("input-terminal-before-settlement"));
             }
             if call.state == PhysicalInjectionState::Issued {
@@ -2168,16 +2178,21 @@ impl ReservedInputControl {
         Ok(())
     }
 
-    /// Backend-only: before terminal publication or cancellation releases ownership.
+    /// Backend-only: record an authenticated physical death before publication.
+    /// A failed image gate still retains its transaction, accesses and cohorts;
+    /// physical death cannot turn that failure into successful settlement.
     pub fn backend_terminal(&self, task: InputTaskId) -> Result<(), InputUnavailable> {
         let mut state = self.state.lock().unwrap();
-        Self::effects_complete_locked(&mut state, task)?;
-        let owner = state.tasks.get_mut(&task).unwrap();
+        let owner = state
+            .tasks
+            .get_mut(&task)
+            .ok_or_else(|| InputUnavailable::new("input-task-not-owned"))?;
         owner.native_terminal = true;
         owner.grant = None;
         if state.by_tid.get(&task.tid) == Some(&task) {
             state.by_tid.remove(&task.tid);
         }
+        Self::effects_complete_locked(&mut state, task)?;
         // Physical task death settles its native accesses but does not retire
         // frozen/logically outstanding accesses or their external scopes.
         for access in state
@@ -2463,6 +2478,107 @@ mod tests {
             control.failure().as_deref(),
             Some("input-terminal-before-settlement")
         );
+    }
+
+    #[test]
+    fn physical_death_retains_a_failed_image_and_its_logical_quarantine() {
+        let (control, parent) = root();
+        let shared = control
+            .backend_register_child(parent.task, 11, 11, Some(true), Some(false))
+            .unwrap();
+        let copied = control
+            .backend_register_child(parent.task, 12, 12, Some(false), Some(false))
+            .unwrap();
+        // This outstanding access is outside the image being initialized.
+        // Its logical owner must survive even when that owner's task dies.
+        let access = control
+            .acquire_access(
+                parent.task,
+                InputAccess {
+                    target: InputTarget::Region(copied.region),
+                    span: InputSpan::Unknown,
+                    direction: InputAccessDirection::Read,
+                    lifetime: InputAccessLifetime::Transient,
+                    cause: "retained-reader".into(),
+                },
+            )
+            .unwrap();
+        let (scope, receipt, image) = call(&control, parent.task);
+        control
+            .backend_begin_preparation(&receipt, &scope, image)
+            .unwrap();
+        control.backend_prepared_stopped(receipt.id()).unwrap();
+        control.backend_initializing(receipt.id()).unwrap();
+        control.backend_normalizing(receipt.id()).unwrap();
+        let cohort = control.freeze_tasks(&[parent.task, shared.task]).unwrap();
+        control.backend_fail("input-normalization:transport-failure");
+        assert_eq!(
+            control.backend_terminal(parent.task).unwrap_err().reason(),
+            "input-terminal-before-settlement"
+        );
+        assert_eq!(control.native_terminal(parent.task), Some(true));
+        assert_eq!(control.native_terminal(shared.task), Some(false));
+        assert_eq!(control.task_identity(parent.native_tid), None);
+        assert_eq!(control.task_identity(shared.native_tid), Some(shared.task));
+        assert_eq!(control.current_grant(parent.task), None);
+        assert_eq!(
+            control
+                .observe_exit_effects(parent.task)
+                .unwrap_err()
+                .reason(),
+            "input-terminal-before-settlement"
+        );
+        assert_eq!(
+            control
+                .backend_cancel_injections(parent.task)
+                .unwrap_err()
+                .reason(),
+            "input-terminal-before-settlement"
+        );
+        assert_eq!(
+            control.failure().as_deref(),
+            Some("input-normalization:transport-failure")
+        );
+        for task in [parent.task, shared.task, copied.task] {
+            assert!(
+                control
+                    .backend_continuation(task, Some(receipt.id()))
+                    .is_err()
+            );
+            assert!(control.grant(task, InputGrantKind::Ordinary).is_err());
+        }
+        assert_eq!(
+            control
+                .settle_fenced_tasks(&[parent.task])
+                .unwrap_err()
+                .reason(),
+            "input-cohort-native-unsettled"
+        );
+        assert_eq!(
+            control
+                .cancel_freeze_before_effect(cohort)
+                .unwrap_err()
+                .reason(),
+            "input-retirement-has-native-effect"
+        );
+        let state = control.state.lock().unwrap();
+        assert!(!state.tasks[&parent.task].native_effects_complete);
+        assert_eq!(
+            state.regions[&parent.region].transaction,
+            Some(receipt.id())
+        );
+        assert_eq!(
+            state.injections[&receipt.id()].phase,
+            Some(InputTransactionPhase::Normalizing)
+        );
+        assert_eq!(
+            state.injections[&receipt.id()].state,
+            PhysicalInjectionState::Prepared
+        );
+        assert!(!state.accesses[&access.id].native_complete);
+        assert_eq!(state.freezes.len(), 1);
+        assert_eq!(state.tasks[&parent.task].frozen.len(), 1);
+        assert_eq!(state.tasks[&shared.task].frozen.len(), 1);
     }
 
     #[test]

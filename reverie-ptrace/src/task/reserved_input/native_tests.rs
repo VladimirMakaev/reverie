@@ -283,6 +283,11 @@ impl Tool for PageTool {
             evidence().lock().unwrap().after_clone += 1;
             return Ok(0);
         }
+        if self.fault == Fault::FutureView && number == Sysno::write && args.arg0 as i32 == -900 {
+            // This control observes the initial zero page A. Other controls
+            // deliberately prefill it to distinguish normalization from A.
+            return Ok(0);
+        }
         if number != Sysno::clone3 && !(number == Sysno::write && args.arg0 as i32 == -900) {
             return Ok(guest.inject(call).await?);
         }
@@ -365,7 +370,16 @@ impl Tool for PageTool {
                 }
                 result
             }
-            Err(InputInjectionError::Unavailable(_)) if creating && self.fault != Fault::None => {
+            Err(InputInjectionError::Unavailable(_))
+                if creating
+                    && matches!(
+                        self.fault,
+                        Fault::BeforeFirstWord
+                            | Fault::AfterFirstWord
+                            | Fault::AfterLaterWord
+                            | Fault::ReadbackTail
+                    ) =>
+            {
                 assert_eq!(observation.state, PhysicalInjectionState::ProvedNoChild);
                 assert_eq!(observation.verified_image.as_ref(), Some(&image));
                 let mut actual = vec![0; layout.page_bytes];
@@ -1131,7 +1145,7 @@ fn native_exec_and_nonleader_exec_keep_old_fences_separate_from_new_page_owner()
 
 #[test]
 fn native_final_observation_sees_immutable_future_b_while_the_real_page_is_still_a() {
-    let (output, _) = run_page_control(Fault::FutureView, libc::SIGCHLD as u64).unwrap();
+    let (output, _) = run_page_control(Fault::FutureView, 0).unwrap();
     assert!(output.status.success());
     let state = evidence();
     let state = state.lock().unwrap();
