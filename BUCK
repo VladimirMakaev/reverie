@@ -247,6 +247,12 @@ rust_library(
                 "test": False,
                 "bench": False,
                 "required-features": ["dbt"],
+            }, {
+                "name": "inject-then-tail-rust-command-guest",
+                "path": "../tests/fixtures/inject-then-tail-rust-command.rs",
+                "test": False,
+                "bench": False,
+                "required-features": ["dbt"],
             }],
             "dependencies_override": {
                 "dependencies": {

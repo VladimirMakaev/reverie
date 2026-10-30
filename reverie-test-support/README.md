@@ -262,18 +262,31 @@ or expanded lifecycle/signal support is claimed. The helper installs
 The `inject_then_tail` target reuses the standalone example's actual `TestTool`
 with config 3. It performs three returning injections of selected identity and
 getrandom calls, then forwards the original call with `tail_inject`. The original
-standalone guest, host and main bodies remain unchanged; these are new command
-tests, not execution of that old standalone program.
+standalone guest body is shared unchanged with an ordinary Rust command; its
+host and main bodies remain unchanged. The command runs that guest body without
+using the standalone program's Tokio host entry point.
 
 Each backend test compiles a checked C fixture using `CC` (or `cc`) in an owned
 executable temporary directory, runs that same image natively first, and then
 uses the actual Tool through ptrace or an explicit authenticated DBT caller.
 The guest checks six identity results and an exact eight-byte getrandom result.
-All runs require exit 0, stdout `inject-then-tail=ok\n`, and empty stderr. Numeric
+These C runs require exit 0, stdout `inject-then-tail=ok\n`, and empty stderr. Numeric
 IDs and random bytes are not compared across processes. Image bytes are retained
 before each launch; independently compiled images need not have the same hash.
 A C compiler and executable temporary storage are required; there is no local
 timeout in these helpers.
+
+The existing DBT positive test also runs one Cargo-built Rust command image
+natively, through ptrace, and through the authenticated DBT caller, using config
+3 for both traced runs. It shares the original six ID calls, aligned allocation,
+eight-byte getrandom, error and short-read checks, deallocation, and three printed
+records. The original `RAND_SIZE` expression has one shared constants file inside
+the caller's existing source-input root. Complete child status, stdout and stderr
+are printed before checks. The Rust runs require exit 0 and the original ordered
+record formats, retaining the actual IDs and random value without comparing or
+normalizing them across processes. Their stderr is retained without an empty
+stream requirement. No C marker or synthetic injection count replaces the Rust
+body's checks.
 
 The default target contains one ptrace test. The `dbt` feature adds the actual
 caller test and a separate missing-manifest guard, for three tests total. The

@@ -89,3 +89,10 @@ path = "../tests/fixtures/vdso-rust-command.rs"
 test = false
 bench = false
 required-features = ["dbt"]
+
+[[bin]]
+name = "inject-then-tail-rust-command-guest"
+path = "../tests/fixtures/inject-then-tail-rust-command.rs"
+test = false
+bench = false
+required-features = ["dbt"]
