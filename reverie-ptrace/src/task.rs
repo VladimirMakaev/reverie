@@ -13782,7 +13782,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
-    async fn inject_backend_private_with_retry<S: SyscallInfo>(
+    pub(crate) async fn inject_backend_private_with_retry<S: SyscallInfo>(
         &mut self,
         syscall: S,
     ) -> Result<i64, Errno> {

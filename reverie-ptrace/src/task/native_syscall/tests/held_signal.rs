@@ -199,15 +199,25 @@ fn a_bound_private_request_survives_real_held_signal_preparation() {
         .iter()
         .filter(|event| event.operation)
         .collect::<Vec<_>>();
-    assert_eq!(owned.len(), 2, "{events:?}");
+    // ppoll's step stop precedes delivery of the pending realtime signal.
+    // It stops the first close before the instruction; inject_with_retry
+    // then issues a second physical attempt after the signal is held.
+    assert_eq!(owned.len(), 4, "{events:?}");
     assert_eq!(owned[0].event, NativeSyscallEvent::ResumeIssued);
+    assert_eq!(owned[1].event, NativeSyscallEvent::ProvedNotRun);
+    assert_eq!(owned[2].event, NativeSyscallEvent::ResumeIssued);
     assert_eq!(
-        owned[1].event,
+        owned[3].event,
         NativeSyscallEvent::NativeResult(Err(Errno::EBADF))
     );
     assert_eq!(owned[0].call.id, owned[1].call.id);
+    assert_eq!(owned[2].call.id, owned[3].call.id);
+    assert_ne!(owned[0].call.id, owned[2].call.id);
     assert_ne!(owned[0].call.id, helper[0].call.id);
+    assert_ne!(owned[2].call.id, helper[0].call.id);
     for event in owned {
+        assert!(event.call.operation_bound);
+        assert_eq!(event.call.purpose, NativeSyscallPurpose::Application);
         assert_eq!(event.call.number, Sysno::close as u64);
         assert_eq!(event.call.args, CLOSE_ARGS);
         assert_eq!(

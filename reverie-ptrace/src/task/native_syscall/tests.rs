@@ -61,6 +61,8 @@ struct Seen {
 #[derive(Debug, Default)]
 struct Evidence {
     events: Vec<Seen>,
+    setup_events: Vec<setup_origin::SetupSeen>,
+    setup_target: bool,
     operation_returned: bool,
     operation_readmitted: bool,
     completion: Option<NativeOperationCompletion>,
@@ -172,18 +174,27 @@ impl GlobalTool for NativeGlobal {
 #[derive(Default)]
 struct NativeTool {
     mode: Mode,
+    pid: Option<Pid>,
 }
 #[reverie::tool]
 impl Tool for NativeTool {
     type GlobalState = NativeGlobal;
     type ThreadState = ();
-    fn new(_: Pid, mode: &Mode) -> Self {
-        Self { mode: *mode }
+    fn new(pid: Pid, mode: &Mode) -> Self {
+        Self {
+            mode: *mode,
+            pid: Some(pid),
+        }
     }
     fn subscriptions(mode: &Mode) -> Subscription {
         let mut calls = vec![Sysno::getpid, Sysno::getppid];
         if matches!(mode, Mode::Exec | Mode::ExecPrivate | Mode::ExecPreparing) {
             calls.push(Sysno::execve);
+        }
+        if matches!(mode, Mode::Exec) {
+            // The setup-origin control requires an actual clock replacement;
+            // it does not accept an absent host-vDSO patch as coverage.
+            calls.push(Sysno::clock_gettime);
         }
         calls.into_iter().collect()
     }
@@ -207,6 +218,11 @@ impl Tool for NativeTool {
             !matches!(self.mode, Mode::UnobservedDefault),
             "default path must not invoke observer"
         );
+        if matches!(self.mode, Mode::Exec)
+            && let Some(observer) = setup_origin::observe(self.pid.unwrap(), call)
+        {
+            return Ok(Some(observer));
+        }
         if call.purpose != NativeSyscallPurpose::Application {
             return Ok(None);
         }
@@ -243,11 +259,17 @@ impl Tool for NativeTool {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
+        if matches!(self.mode, Mode::Exec) && call.into_parts().0 == Sysno::clock_gettime {
+            return guest.inject(call).await.map_err(Into::into);
+        }
         if matches!(
             self.mode,
             Mode::Exec | Mode::ExecPrivate | Mode::ExecPreparing
         ) && call.into_parts().0 == Sysno::execve
         {
+            if matches!(self.mode, Mode::Exec) {
+                evidence().lock().unwrap().setup_target = true;
+            }
             if !matches!(self.mode, Mode::ExecPreparing) {
                 assert!(
                     guest.reserved_input_control().is_none(),
@@ -686,6 +708,7 @@ fn the_same_operation_cannot_issue_a_different_bound_request() {
 #[test]
 fn exec_completes_generic_native_effects_without_the_input_facility() {
     let events = run(Mode::Exec);
+    setup_origin::assert_complete_setup();
     let exec = events
         .iter()
         .filter(|event| event.operation && event.call.number == Sysno::execve as u64)
@@ -734,3 +757,5 @@ fn exec_settles_a_pre_release_bound_owner_before_any_physical_attempt_exists() {
 mod register_edits;
 
 mod held_signal;
+
+mod setup_origin;
