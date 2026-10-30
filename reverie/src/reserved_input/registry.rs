@@ -19,6 +19,35 @@ use super::ReservedInputLayout;
 
 static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 
+/// Opaque run identity for local extension state; not a guest identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InputRunId(u64);
+
+/// Authenticated descriptor-table creation edge. This is not a census or an
+/// acquisition receipt; consumers snapshot their own history at this edge.
+#[derive(Debug, Clone, Copy)]
+pub struct InputFilesEvent {
+    /// Exact source table owner at the native birth/exec cut.
+    pub source: InputTaskRegistration,
+    /// New child or replacement-image owner.
+    pub destination: InputTaskRegistration,
+    /// Native sharing proof. None conservatively unifies the lifetimes.
+    pub shared: Option<bool>,
+    /// True for an authenticated exec replacement (close-on-exec may remove FDs).
+    pub exec: bool,
+}
+
+/// Synchronous local history observer. It runs outside registry locks, before
+/// child/image publication. It cannot acquire a new native execution grant.
+pub trait InputFilesObserver: std::fmt::Debug + Send + Sync {
+    /// Snapshot/link Tool-owned history for this actual native edge.
+    fn observe(
+        &self,
+        control: &ReservedInputControl,
+        event: InputFilesEvent,
+    ) -> Result<(), InputUnavailable>;
+}
+
 /// Native task incarnation. Numeric TID reuse cannot reproduce this identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InputTaskId {
@@ -358,6 +387,7 @@ struct Access {
     task: InputTaskId,
     declaration: InputAccess,
     physical: Option<PhysicalInjectionId>,
+    operation: Option<crate::native_syscall::NativeOperationCompletion>,
     native_complete: bool,
 }
 
@@ -453,6 +483,7 @@ pub struct ReservedInputControl {
     run: u64,
     state: Arc<Mutex<State>>,
     native_exit_observer: Arc<OnceLock<Arc<dyn InputNativeExitObserver>>>,
+    files_observer: Arc<OnceLock<Arc<dyn InputFilesObserver>>>,
 }
 
 impl ReservedInputControl {
@@ -466,7 +497,23 @@ impl ReservedInputControl {
             run,
             state: Arc::new(Mutex::new(State::default())),
             native_exit_observer: Arc::new(OnceLock::new()),
+            files_observer: Arc::new(OnceLock::new()),
         })
+    }
+
+    /// Stable identity for local nonserialized extension state.
+    pub fn run_identity(&self) -> InputRunId {
+        InputRunId(self.run)
+    }
+
+    /// Install one local table-history observer before target registration.
+    pub fn install_files_observer(
+        &self,
+        observer: Arc<dyn InputFilesObserver>,
+    ) -> Result<(), InputUnavailable> {
+        self.files_observer
+            .set(observer)
+            .map_err(|_| InputUnavailable::new("input-files-observer-already-installed"))
     }
 
     /// Backend-only: install the run's exact-generation native observer once.
@@ -520,6 +567,21 @@ impl ReservedInputControl {
             .get(&task)
             .and_then(|task| state.files_possibly_shared.get(&task.registration.files))
             == Some(&false)
+    }
+
+    /// Observe registration, grant and file-table proof in one leaf-lock read.
+    pub fn native_syscall_authority(
+        &self,
+        task: InputTaskId,
+    ) -> Result<crate::native_syscall::NativeSyscallAuthority, InputUnavailable> {
+        let state = self.state.lock().unwrap();
+        let task = state.live(task)?;
+        Ok(crate::native_syscall::NativeSyscallAuthority {
+            registration: task.registration,
+            grant: task.grant.map(|(generation, kind, _)| (generation, kind)),
+            files_proven_unshared: state.files_possibly_shared.get(&task.registration.files)
+                == Some(&false),
+        })
     }
 
     /// Return the current identity binding, without granting execution.
@@ -581,6 +643,22 @@ impl ReservedInputControl {
             .and_then(|task| task.grant.map(|grant| grant.0))
     }
 
+    /// Authenticate the current grant for a backend's pre-release immutable
+    /// request ticket. A missing, retired or frozen owner cannot bind a request;
+    /// this neither consumes nor renews authority and is never used at issue to
+    /// invent a new background grant.
+    pub fn native_request_grant(&self, task: InputTaskId) -> Result<u64, InputUnavailable> {
+        let state = self.state.lock().unwrap();
+        let owner = state.live(task)?;
+        if !owner.frozen.is_empty() {
+            return Err(InputUnavailable::new("input-task-frozen"));
+        }
+        owner
+            .grant
+            .map(|grant| grant.0)
+            .ok_or_else(|| InputUnavailable::new("input-no-execution-grant"))
+    }
+
     /// Consume the current actual grant into one operation; never mints a grant.
     pub fn begin_operation(
         &self,
@@ -628,6 +706,7 @@ impl ReservedInputControl {
                 task,
                 declaration,
                 physical: None,
+                operation: None,
                 native_complete: false,
             },
         );
@@ -653,7 +732,7 @@ impl ReservedInputControl {
             .accesses
             .get_mut(&lease.id)
             .ok_or_else(|| InputUnavailable::new("input-access-missing"))?;
-        if access.task != task || access.physical.is_some() {
+        if access.task != task || access.physical.is_some() || access.operation.is_some() {
             return Err(InputUnavailable::new("input-access-binding"));
         }
         access.physical = Some(receipt.id);
@@ -662,8 +741,9 @@ impl ReservedInputControl {
 
     /// Trusted Tool completion of an ordinary background operation after its
     /// native return and all copyout, before logical readmission. Never call on
-    /// cancellation or Tool error. Attached physical calls instead use native
-    /// backend completion, so this cannot override an unsettled call receipt.
+    /// cancellation or Tool error. Physical-call and operation-bound leases
+    /// instead require their exact native completion proof, so this cannot
+    /// override an unsettled call or a closed-operation obligation.
     pub fn complete_access_after_return(
         &self,
         lease: &InputAccessLease,
@@ -677,8 +757,98 @@ impl ReservedInputControl {
             .accesses
             .get_mut(&lease.id)
             .ok_or_else(|| InputUnavailable::new("input-access-missing"))?;
+        if access.task != task || access.physical.is_some() || access.operation.is_some() {
+            return Err(InputUnavailable::new("input-access-binding"));
+        }
+        access.native_complete = true;
+        Ok(())
+    }
+
+    /// Bind this lease to one explicit operation before its native calls can
+    /// escape the caller. The retained proof has no observer/control cycle.
+    pub fn bind_access_operation(
+        &self,
+        lease: &InputAccessLease,
+        task: InputTaskId,
+        operation: &crate::native_syscall::NativeOperation,
+    ) -> Result<(), InputUnavailable> {
+        self.bind_access_completion(lease, task, &operation.completion())
+    }
+
+    /// Bind an observer-free completion handle for the same exact operation.
+    /// This is useful for retained table-copy obligations without a strong cycle.
+    pub fn bind_access_completion(
+        &self,
+        lease: &InputAccessLease,
+        task: InputTaskId,
+        completion: &crate::native_syscall::NativeOperationCompletion,
+    ) -> Result<(), InputUnavailable> {
+        if lease.run != self.run {
+            return Err(InputUnavailable::new("input-run-mismatch"));
+        }
+        let proof = completion.clone();
+        let mut state = self.state.lock().unwrap();
+        let access = state
+            .accesses
+            .get_mut(&lease.id)
+            .ok_or_else(|| InputUnavailable::new("input-access-missing"))?;
         if access.task != task || access.physical.is_some() {
             return Err(InputUnavailable::new("input-access-binding"));
+        }
+        if access
+            .operation
+            .as_ref()
+            .is_some_and(|bound| !bound.same_operation(&proof))
+        {
+            return Err(InputUnavailable::new("input-operation-binding"));
+        }
+        access.operation = Some(proof);
+        Ok(())
+    }
+
+    /// Mark native effects complete from this exact closed operation. This also
+    /// supports cancelled callbacks when all attempts have affirmative native
+    /// completion/no-issue proof. It does not retire the lease: matching logical
+    /// readmission or the existing authenticated terminal fence still owns that.
+    pub fn complete_access_after_operation(
+        &self,
+        lease: &InputAccessLease,
+        task: InputTaskId,
+        operation: &crate::native_syscall::NativeOperation,
+    ) -> Result<(), InputUnavailable> {
+        self.complete_access_after_completion(lease, task, &operation.completion())
+    }
+
+    /// Observer-free form of [`Self::complete_access_after_operation`], requiring
+    /// the exact prebound completion handle and the same native-completion proof.
+    pub fn complete_access_after_completion(
+        &self,
+        lease: &InputAccessLease,
+        task: InputTaskId,
+        completion: &crate::native_syscall::NativeOperationCompletion,
+    ) -> Result<(), InputUnavailable> {
+        if lease.run != self.run {
+            return Err(InputUnavailable::new("input-run-mismatch"));
+        }
+        let proof = completion.clone();
+        // Closed-and-complete is monotone. Do not nest the operation mutex under
+        // the registry's leaf lock or invoke a Tool callback from it.
+        if !proof.effects_complete() {
+            return Err(InputUnavailable::new("input-native-operation-unsettled"));
+        }
+        let mut state = self.state.lock().unwrap();
+        let access = state
+            .accesses
+            .get_mut(&lease.id)
+            .ok_or_else(|| InputUnavailable::new("input-access-missing"))?;
+        if access.task != task
+            || access.physical.is_some()
+            || !access
+                .operation
+                .as_ref()
+                .is_some_and(|bound| bound.same_operation(&proof))
+        {
+            return Err(InputUnavailable::new("input-operation-binding"));
         }
         access.native_complete = true;
         Ok(())
@@ -833,6 +1003,7 @@ impl ReservedInputControl {
                     task,
                     declaration: declaration.clone(),
                     physical: Some(physical),
+                    operation: None,
                     native_complete: false,
                 },
             );
@@ -1324,6 +1495,18 @@ impl ReservedInputControl {
                 native_effects_complete: false,
             },
         );
+        drop(state);
+        if let Some(observer) = self.files_observer.get() {
+            observer.observe(
+                self,
+                InputFilesEvent {
+                    source: parent_registration,
+                    destination: registration,
+                    shared: files_shared,
+                    exec: false,
+                },
+            )?;
+        }
         Ok(registration)
     }
 
@@ -1443,6 +1626,18 @@ impl ReservedInputControl {
                 native_effects_complete: false,
             },
         );
+        drop(state);
+        if let Some(observer) = self.files_observer.get() {
+            observer.observe(
+                self,
+                InputFilesEvent {
+                    source: old_former,
+                    destination: registration,
+                    shared: Some(false),
+                    exec: true,
+                },
+            )?;
+        }
         Ok(registration)
     }
 
@@ -2030,6 +2225,97 @@ mod tests {
             )
             .unwrap();
         (control, task)
+    }
+
+    #[derive(Debug)]
+    struct EmptyNativeOperation;
+    impl crate::native_syscall::NativeOperationObserver for EmptyNativeOperation {
+        fn observe(
+            &self,
+            _: &dyn crate::native_syscall::NativeSyscallFacts,
+            _: &crate::native_syscall::NativeSyscallCall,
+        ) -> Result<Option<Arc<dyn crate::native_syscall::NativeSyscallObserver>>, crate::Error>
+        {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn access_completion_requires_its_exact_closed_and_native_settled_operation() {
+        use crate::native_syscall::NativeOperation;
+        let (control, task) = root();
+        let grant = control.grant(task.task, InputGrantKind::Ordinary).unwrap();
+        let operation = NativeOperation::new(Arc::new(EmptyNativeOperation));
+        let helper = NativeOperation::new(Arc::new(EmptyNativeOperation));
+        helper.close();
+        let lease = control
+            .acquire_access(
+                task.task,
+                InputAccess {
+                    target: InputTarget::Region(task.region),
+                    span: InputSpan::Unknown,
+                    direction: InputAccessDirection::Read,
+                    lifetime: InputAccessLifetime::Transient,
+                    cause: Arc::from("test-operation"),
+                },
+            )
+            .unwrap();
+        control
+            .bind_access_completion(&lease, task.task, &operation.completion())
+            .unwrap();
+        assert_eq!(
+            control
+                .complete_access_after_return(&lease, task.task)
+                .unwrap_err()
+                .reason(),
+            "input-access-binding",
+            "legacy completion cannot override an operation proof"
+        );
+        assert_eq!(
+            control
+                .complete_access_after_operation(&lease, task.task, &helper)
+                .unwrap_err()
+                .reason(),
+            "input-operation-binding"
+        );
+        assert!(
+            control
+                .complete_access_after_operation(&lease, task.task, &operation)
+                .is_err()
+        );
+        let never_issued = operation.begin_native_attempt().unwrap();
+        let issued = operation.begin_native_attempt().unwrap();
+        issued.transition_started();
+        operation.close();
+        never_issued.cancelled_before_transition();
+        issued.cancelled_before_transition();
+        assert!(
+            control
+                .complete_access_after_operation(&lease, task.task, &operation)
+                .is_err()
+        );
+        assert!(!control.state.lock().unwrap().accesses[&lease.id].native_complete);
+        issued.effects_ended();
+        control
+            .complete_access_after_operation(&lease, task.task, &operation)
+            .unwrap();
+        assert!(
+            control
+                .state
+                .lock()
+                .unwrap()
+                .accesses
+                .contains_key(&lease.id),
+            "native completion must not retire logical readmission"
+        );
+        control.readmit_access(lease, task.task, grant).unwrap();
+        assert!(control.state.lock().unwrap().accesses.is_empty());
+
+        let never = NativeOperation::new(Arc::new(EmptyNativeOperation));
+        let activity = never.begin_native_attempt().unwrap();
+        activity.cancelled_before_transition();
+        never.close();
+        assert!(never.effects_complete());
     }
 
     fn call(

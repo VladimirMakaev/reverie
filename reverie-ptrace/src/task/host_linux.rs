@@ -44,11 +44,11 @@ use reverie::syscalls::Sysno;
 use safeptrace::Error as TraceError;
 
 use super::TracedTask;
-use super::reserved_input::NativeInputCall;
+use super::native_syscall::NativeCallContext;
 
 /// The host kernel, reached by running the call in the stopped tracee.
 pub(super) struct HostLinux<'a, L> {
-    input: Option<&'a NativeInputCall>,
+    input: Option<&'a NativeCallContext>,
     tool: PhantomData<fn() -> L>,
 }
 
@@ -60,7 +60,7 @@ impl<'a, L> HostLinux<'a, L> {
         }
     }
 
-    pub(super) fn with_input(input: &'a NativeInputCall) -> Self {
+    pub(super) fn with_input(input: &'a NativeCallContext) -> Self {
         Self {
             input: Some(input),
             tool: PhantomData,

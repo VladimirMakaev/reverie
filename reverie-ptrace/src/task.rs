@@ -167,6 +167,9 @@ mod gdb_stop;
 mod host_linux;
 mod reserved_input;
 use reserved_input::NativeInputCall;
+mod native_syscall;
+use native_syscall::DeferredNativeCall;
+use native_syscall::NativeCallContext;
 
 #[cfg(test)]
 mod thread_state_ready_tests;
@@ -612,7 +615,7 @@ fn temporary_signal_mask(task: &Stopped, nr: Sysno, args: &SyscallArgs) -> Optio
 
 fn preparation_word(
     task: &Stopped,
-    input: Option<&NativeInputCall>,
+    input: Option<&NativeCallContext>,
     address: usize,
 ) -> Option<u64> {
     match input {
@@ -625,7 +628,7 @@ fn temporary_signal_mask_prepared(
     task: &Stopped,
     nr: Sysno,
     args: &SyscallArgs,
-    input: Option<&NativeInputCall>,
+    input: Option<&NativeCallContext>,
 ) -> Option<u64> {
     let read = |address| preparation_word(task, input, address);
     let (mask, size) = match nr {
@@ -1680,7 +1683,7 @@ fn next_instruction_raises_sigtrap(task: &Stopped) -> Result<bool, TraceError> {
 fn read_sigaction_prepared(
     task: &Stopped,
     address: usize,
-    input: Option<&NativeInputCall>,
+    input: Option<&NativeCallContext>,
 ) -> Option<KernelSigaction> {
     if input.is_none() {
         return read_sigaction_forced(task, address);
@@ -2484,6 +2487,9 @@ fn kernel_task_flags(tid: Pid) -> std::io::Result<u64> {
 #[derive(Default)]
 pub(crate) struct FatalSession {
     reserved_input: Option<reverie::reserved_input::ReservedInputControl>,
+    native_sequence: AtomicU64,
+    native_attempts: StdMutex<Vec<Arc<native_syscall::NativeAttempt>>>,
+    native_operations: StdMutex<Vec<native_syscall::NativeOperationOwner>>,
     input_generations: StdMutex<
         Vec<(
             safeptrace::TerminalCleanup,
@@ -4015,6 +4021,9 @@ pub struct TracedTask<L: Tool> {
     /// Taking this record consumes that authority, including fast tail injection
     /// which transfers the original call to the callback's final resume.
     pending_syscall: Option<(Sysno, SyscallArgs)>,
+    native_callback: Option<u64>,
+    native_entry_pending: Option<Arc<AtomicBool>>,
+    deferred_native_call: Option<DeferredNativeCall>,
 
     /// Address of the writable e9tool register frame for the active event.
     injected_syscall_frame: Option<usize>,
@@ -4491,6 +4500,9 @@ impl<L: Tool> TracedTask<L> {
             watch_run: StdMutex::new(SignalRun::Unknown),
             initial_stack_pointer: None,
             pending_syscall: None,
+            native_callback: None,
+            native_entry_pending: None,
+            deferred_native_call: None,
             injected_syscall_frame: None,
             injected_tail_result: None,
             next_state,
@@ -4614,6 +4626,9 @@ impl<L: Tool> TracedTask<L> {
             watch_run: StdMutex::new(SignalRun::Unknown),
             initial_stack_pointer: self.initial_stack_pointer,
             pending_syscall: None,
+            native_callback: None,
+            native_entry_pending: None,
+            deferred_native_call: None,
             injected_syscall_frame: None,
             injected_tail_result: None,
             next_state,
@@ -4749,6 +4764,9 @@ impl<L: Tool> TracedTask<L> {
             watch_run: StdMutex::new(SignalRun::Unknown),
             initial_stack_pointer: self.initial_stack_pointer,
             pending_syscall: None,
+            native_callback: None,
+            native_entry_pending: None,
+            deferred_native_call: None,
             injected_syscall_frame: None,
             injected_tail_result: None,
             next_state,
@@ -5206,8 +5224,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         use reverie::syscalls::ArchPrctl;
         use reverie::syscalls::ArchPrctlCmd;
 
-        self.inject_with_retry(ArchPrctl::new().with_cmd(ArchPrctlCmd::ARCH_GET_CPUID(None)))
-            .await
+        self.inject_backend_private_with_retry(
+            ArchPrctl::new().with_cmd(ArchPrctlCmd::ARCH_GET_CPUID(None)),
+        )
+        .await
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -5215,8 +5235,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         use reverie::syscalls::ArchPrctl;
         use reverie::syscalls::ArchPrctlCmd;
 
-        self.inject_with_retry(ArchPrctl::new().with_cmd(ArchPrctlCmd::ARCH_SET_CPUID(0)))
-            .await
+        self.inject_backend_private_with_retry(
+            ArchPrctl::new().with_cmd(ArchPrctlCmd::ARCH_SET_CPUID(0)),
+        )
+        .await
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -5367,7 +5389,17 @@ impl<L: Tool + 'static> TracedTask<L> {
                 shield_sigtrap && owner.shield_sigtrap_for_step(&task, "pre-init mmap")?;
             // Execute the injected mmap call.
             owner.input_continuation(None)?;
+            let native = NativeCallContext::internal();
+            let (a, b, c, d, e, f) = regs.args();
+            owner.observe_native_at_stop(
+                &task,
+                Sysno::mmap as u64,
+                [a, b, c, d, e, f],
+                Some(&native),
+            )?;
+            owner.native_transition_started(Some(&native));
             let mut running = RootStopLease::new(task, held_root_stop.clone()).step(None)?;
+            owner.native_resume_issued(Some(&native))?;
             #[cfg(test)]
             at_preinit_point(
                 preinit_point,
@@ -5435,6 +5467,8 @@ impl<L: Tool + 'static> TracedTask<L> {
                 }
             };
 
+            let result = Errno::from_ret(task.getregs()?.ret() as usize).map(|x| x as i64);
+            owner.native_result_at_stop(&task, Some(&native), result, true, false)?;
             // Make sure we got our desired address.
             assert_eq!(
                 Errno::from_ret(task.getregs()?.ret() as usize)?,
@@ -5654,7 +5688,7 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         // Protect our trampoline page from being written to. We won't need to
         // change this again for the lifetime of the guest process.
-        self.inject_with_retry(
+        self.inject_backend_private_with_retry(
             Mprotect::new()
                 .with_addr(AddrMut::from_raw(cp::TRAMPOLINE_BASE))
                 .with_len(cp::TRAMPOLINE_SIZE)
@@ -6395,9 +6429,17 @@ impl<L: Tool + 'static> TracedTask<L> {
         task.setregs(&regs)?;
         self.segv_resume_syscall
             .store(Sysno::rt_sigreturn as u64 + 1, Ordering::SeqCst);
-        self.resume_stopped(task, None)?
-            .next_state_with_owner(&self.ptracer_waits)
-            .await
+        let native = NativeCallContext::application(None);
+        let (a, b, c, d, e, f) = regs.args();
+        self.observe_native_at_stop(
+            &task,
+            Sysno::rt_sigreturn as u64,
+            [a, b, c, d, e, f],
+            Some(&native),
+        )?;
+        let running = self.resume_stopped_input(task, None, Some(&native))?;
+        self.native_unobserved(Some(&native))?;
+        running.next_state_with_owner(&self.ptracer_waits).await
     }
 
     // TODO-HUMAN-REVIEW(PR-102): Review rewritten-syscall dispatch and result handling.
@@ -7269,6 +7311,15 @@ impl<L: Tool + 'static> TracedTask<L> {
         task: Stopped,
         resume: SignalResume,
     ) -> Result<Wait, TraceError> {
+        self.resume_with_signal_and_native(task, resume, None).await
+    }
+
+    async fn resume_with_signal_and_native(
+        &mut self,
+        task: Stopped,
+        resume: SignalResume,
+        deferred: Option<&DeferredNativeCall>,
+    ) -> Result<Wait, TraceError> {
         let SignalResume {
             signal,
             reported,
@@ -7347,11 +7398,15 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.held_siginfo_written.store(true, Ordering::Relaxed);
             task.setsiginfo_bytes(&bytes)?;
         }
+        let native = self.prepare_deferred_native(&task, deferred)?;
         let running = if step {
-            self.step_stopped_any(task, signal)?
+            self.step_stopped_any_input(task, signal, native)?
         } else {
-            self.resume_stopped_any(task, signal)?
+            self.resume_stopped_any_input(task, signal, native)?
         };
+        // This route deliberately has no syscall exit stop. Do not turn a
+        // later unrelated register value into the tail call's return value.
+        self.native_unobserved(native)?;
         running.next_state_with_owner(&self.ptracer_waits).await
     }
 
@@ -7674,6 +7729,12 @@ impl<L: Tool + 'static> TracedTask<L> {
         // still own guards until the injected exec unwinds; those retain the
         // old Arc, so their Drop cannot release a frame of this new image.
         self.stack_arena = Arc::new(StackArena::default());
+        // Actual successful exec ends the displaced image's native effects
+        // even for an observing Tool with no reserved-input facility. Do this
+        // before new-image initialization or any consuming Tool callback.
+        self.fatal_session()
+            .complete_native_effects(&task.terminal_cleanup())
+            .map_err(|error| self.input_failure(error))?;
         if !std::mem::take(&mut self.reserved_input_exec_transferred) {
             self.reserved_input_exec_transfer(&task, self.reserved_input_task)?;
             self.reserved_input_exec_transferred = false;
@@ -8053,20 +8114,25 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// kernel run the call and resumes the guest at its return.
     async fn handle_unsubscribed_mapping_syscall(&mut self, task: Stopped) -> Result<Wait, Error> {
         let tid = self.tid();
+        let native = NativeCallContext::application(None);
+        self.observe_native_entry(&task, &native)?;
         let wait = self
-            .syscall_stopped(task, None)
+            .syscall_stopped_input(task, None, Some(&native))
             .tracee_context(tid, "resume unsubscribed mapping syscall")?
             .next_state_with_owner(&self.ptracer_waits)
             .await
             .tracee_context(tid, "wait for unsubscribed mapping syscall")?;
         self.arm_liteinst_wait(&wait);
         match wait {
-            Wait::Stopped(stopped, Event::Syscall) => self
-                .resume_stopped(stopped, None)
-                .tracee_context(tid, "resume after unsubscribed mapping syscall")?
-                .next_state_with_owner(&self.ptracer_waits)
-                .await
-                .tracee_context(tid, "wait after unsubscribed mapping syscall"),
+            Wait::Stopped(stopped, Event::Syscall) => {
+                let result = Errno::from_ret(stopped.getregs()?.ret() as usize).map(|x| x as i64);
+                self.native_result_at_stop(&stopped, Some(&native), result, true, false)?;
+                self.resume_stopped(stopped, None)
+                    .tracee_context(tid, "resume after unsubscribed mapping syscall")?
+                    .next_state_with_owner(&self.ptracer_waits)
+                    .await
+                    .tracee_context(tid, "wait after unsubscribed mapping syscall")
+            }
             Wait::Stopped(_, event) => Err(Error::runtime(
                 tid,
                 "run unsubscribed mapping syscall",
@@ -8078,6 +8144,8 @@ impl<L: Tool + 'static> TracedTask<L> {
 
     async fn handle_seccomp(&mut self, mut task: Stopped) -> Result<Wait, Error> {
         let tid = self.tid();
+        self.native_user_continuation(&task)
+            .tracee_context(tid, "account previous native continuation")?;
         let syscall = self
             .get_syscall(&task)
             .tracee_context(tid, "read registers at seccomp stop")?;
@@ -8188,9 +8256,11 @@ impl<L: Tool + 'static> TracedTask<L> {
                 // background call of another thread rewrote before the kernel
                 // read it. The exit stop sends no signal and runs no guest
                 // instruction. Any other stop is the main loop's to handle.
+                let native = NativeCallContext::application(None);
+                self.observe_native_entry(&task, &native)?;
                 if self.keeps_segv_state() || self.records_watch_sigtrap() {
                     let wait = self
-                        .syscall_stopped(task, None)
+                        .syscall_stopped_input(task, None, Some(&native))
                         .tracee_context(tid, "run rt_sigreturn to its exit")?
                         .next_state_with_owner(&self.ptracer_waits)
                         .await
@@ -8198,6 +8268,15 @@ impl<L: Tool + 'static> TracedTask<L> {
                     self.arm_liteinst_wait(&wait);
                     return match wait {
                         Wait::Stopped(stopped, Event::Syscall) => {
+                            let result = Errno::from_ret(stopped.getregs()?.ret() as usize)
+                                .map(|x| x as i64);
+                            self.native_result_at_stop(
+                                &stopped,
+                                Some(&native),
+                                result,
+                                true,
+                                false,
+                            )?;
                             self.note_segv_sigreturn_exit(&stopped)
                                 .tracee_context(tid, "look for rt_sigreturn's SIGSEGV")?;
                             self.resume_stopped(stopped, None)
@@ -8209,14 +8288,26 @@ impl<L: Tool + 'static> TracedTask<L> {
                         wait => Ok(wait),
                     };
                 }
-                return self
-                    .resume_stopped(task, None)
-                    .tracee_context(tid, "resume rt_sigreturn")?
+                let running = self
+                    .resume_stopped_input(task, None, Some(&native))
+                    .tracee_context(tid, "resume rt_sigreturn")?;
+                self.native_unobserved(Some(&native))?;
+                return running
                     .next_state_with_owner(&self.ptracer_waits)
                     .await
                     .tracee_context(tid, "wait after rt_sigreturn");
             }
             self.pending_syscall = Some((nr, args));
+            let native_callback = self
+                .global_state
+                .fatal_session
+                .native_sequence
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    old.checked_add(1)
+                })
+                .map_err(|_| self.input_failure("native-callback-identity-exhausted"))?;
+            self.native_callback = Some(native_callback);
+            self.native_entry_pending = Some(Arc::new(AtomicBool::new(true)));
 
             self.in_syscall_callback = true;
             let mut parked = self.park_for_gdb();
@@ -8232,6 +8323,14 @@ impl<L: Tool + 'static> TracedTask<L> {
             .await;
             self.unpark(parked);
             self.in_syscall_callback = false;
+            self.native_callback = None;
+            let mut deferred_native = self.deferred_native_call.take();
+            if deferred_native
+                .as_ref()
+                .is_some_and(|call| call.callback != native_callback)
+            {
+                return Err(self.input_failure("native-tail-callback-mismatch").into());
+            }
 
             let retval = match retval {
                 Some(Err(error)) if !matches!(error, reverie::Error::Errno(_)) => {
@@ -8318,8 +8417,9 @@ impl<L: Tool + 'static> TracedTask<L> {
                     .iter()
                     .any(|&nr| self.segv_resume_syscall.load(Ordering::SeqCst) == nr as u64 + 1)
             {
+                let native = self.prepare_deferred_native(&task, deferred_native.as_ref())?;
                 let wait = self
-                    .syscall_stopped(task, None)
+                    .syscall_stopped_input(task, None, native)
                     .tracee_context(tid, "run a mask-setting syscall to its exit")?
                     .next_state_with_owner(&self.ptracer_waits)
                     .await
@@ -8327,6 +8427,10 @@ impl<L: Tool + 'static> TracedTask<L> {
                 self.arm_liteinst_wait(&wait);
                 task = match wait {
                     Wait::Stopped(stopped, Event::Syscall) => {
+                        let result = Errno::from_ret(stopped.getregs()?.ret() as usize)
+                            .map(|value| value as i64);
+                        self.native_result_at_stop(&stopped, native, result, true, false)?;
+                        deferred_native = None;
                         self.segv_resume_syscall.store(0, Ordering::SeqCst);
                         self.note_segv_sigreturn_exit(&stopped)
                             .tracee_context(tid, "look for a mask-setting syscall's SIGSEGV")?;
@@ -8336,9 +8440,10 @@ impl<L: Tool + 'static> TracedTask<L> {
                 };
             }
             let wait = self
-                .resume_with_signal(task, resume)
+                .resume_with_signal_and_native(task, resume, deferred_native.as_ref())
                 .await
                 .tracee_context(tid, "resume after seccomp stop")?;
+            self.native_entry_pending = None;
             tracing::trace!(
                 target: "reverie_ptrace::syscall",
                 "completed guest syscall interception"
@@ -8460,7 +8565,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         &self,
         task: Stopped,
         signal: T,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<Running, TraceError> {
         self.input_continuation(input)?;
         if self.global_state.fatal_session.is_failed() {
@@ -8469,9 +8574,13 @@ impl<L: Tool + 'static> TracedTask<L> {
         let signal = signal.into();
         self.note_segv_resume(&task, signal.map(|signal| signal as i32));
         let guard = self.exit_stop_guard(&task);
-        self.lease_liteinst_root_stop(task)
+        self.native_transition_started(input);
+        let running = self
+            .lease_liteinst_root_stop(task)
             .guard_exit_stop(guard)
-            .resume(signal)
+            .resume(signal)?;
+        self.native_resume_issued(input)?;
+        Ok(running)
     }
 
     fn step_stopped<T: Into<Option<Signal>>>(
@@ -8486,7 +8595,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         &self,
         task: Stopped,
         signal: T,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<Running, TraceError> {
         self.input_continuation(input)?;
         if self.global_state.fatal_session.is_failed() {
@@ -8497,9 +8606,13 @@ impl<L: Tool + 'static> TracedTask<L> {
         let signal = signal.into();
         self.note_segv_signal_without_cont(signal.map(|signal| signal as i32));
         let guard = self.exit_stop_guard(&task);
-        self.lease_liteinst_root_stop(task)
+        self.native_transition_started(input);
+        let running = self
+            .lease_liteinst_root_stop(task)
             .guard_exit_stop(guard)
-            .step(signal)
+            .step(signal)?;
+        self.native_resume_issued(input)?;
+        Ok(running)
     }
 
     fn syscall_stopped<T: Into<Option<Signal>>>(
@@ -8514,7 +8627,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         &self,
         task: Stopped,
         signal: T,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<Running, TraceError> {
         self.input_continuation(input)?;
         if self.global_state.fatal_session.is_failed() {
@@ -8523,9 +8636,13 @@ impl<L: Tool + 'static> TracedTask<L> {
         let signal = signal.into();
         self.note_segv_signal_without_cont(signal.map(|signal| signal as i32));
         let guard = self.exit_stop_guard(&task);
-        self.lease_liteinst_root_stop(task)
+        self.native_transition_started(input);
+        let running = self
+            .lease_liteinst_root_stop(task)
             .guard_exit_stop(guard)
-            .syscall(signal)
+            .syscall(signal)?;
+        self.native_resume_issued(input)?;
+        Ok(running)
     }
 
     /// `resume_stopped` for a signal that may be one nix cannot name
@@ -8542,7 +8659,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         &self,
         task: Stopped,
         signal: Option<AnySignal>,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<Running, TraceError> {
         self.input_continuation(input)?;
         match signal {
@@ -8551,12 +8668,14 @@ impl<L: Tool + 'static> TracedTask<L> {
                     return Err(Errno::ECANCELED.into());
                 }
                 self.note_segv_resume(&task, Some(signal.raw()));
-                {
-                    let guard = self.exit_stop_guard(&task);
-                    self.lease_liteinst_root_stop(task)
-                        .guard_exit_stop(guard)
-                        .resume_raw(signal.raw())
-                }
+                let guard = self.exit_stop_guard(&task);
+                self.native_transition_started(input);
+                let running = self
+                    .lease_liteinst_root_stop(task)
+                    .guard_exit_stop(guard)
+                    .resume_raw(signal.raw())?;
+                self.native_resume_issued(input)?;
+                Ok(running)
             }
             signal => self.resume_stopped_input(task, signal.and_then(AnySignal::as_nix), input),
         }
@@ -8575,7 +8694,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         &self,
         task: Stopped,
         signal: Option<AnySignal>,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<Running, TraceError> {
         self.input_continuation(input)?;
         match signal {
@@ -8586,12 +8705,14 @@ impl<L: Tool + 'static> TracedTask<L> {
                 #[cfg(test)]
                 record_step_for_test(task.pid());
                 self.note_segv_signal_without_cont(Some(signal.raw()));
-                {
-                    let guard = self.exit_stop_guard(&task);
-                    self.lease_liteinst_root_stop(task)
-                        .guard_exit_stop(guard)
-                        .step_raw(signal.raw())
-                }
+                let guard = self.exit_stop_guard(&task);
+                self.native_transition_started(input);
+                let running = self
+                    .lease_liteinst_root_stop(task)
+                    .guard_exit_stop(guard)
+                    .step_raw(signal.raw())?;
+                self.native_resume_issued(input)?;
+                Ok(running)
             }
             signal => self.step_stopped_input(task, signal.and_then(AnySignal::as_nix), input),
         }
@@ -8610,7 +8731,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         &self,
         task: Stopped,
         signal: Option<AnySignal>,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<Running, TraceError> {
         self.input_continuation(input)?;
         match signal {
@@ -8620,9 +8741,13 @@ impl<L: Tool + 'static> TracedTask<L> {
                 }
                 self.note_segv_signal_without_cont(Some(signal.raw()));
                 let guard = self.exit_stop_guard(&task);
-                self.lease_liteinst_root_stop(task)
+                self.native_transition_started(input);
+                let running = self
+                    .lease_liteinst_root_stop(task)
                     .guard_exit_stop(guard)
-                    .syscall_raw(signal.raw())
+                    .syscall_raw(signal.raw())?;
+                self.native_resume_issued(input)?;
+                Ok(running)
             }
             signal => self.syscall_stopped_input(task, signal.and_then(AnySignal::as_nix), input),
         }
@@ -8635,7 +8760,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         child: Running,
         context: Option<libc::user_regs_struct>,
         child_context: Option<libc::user_regs_struct>,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<Wait, TraceError> {
         self.segv_new_task_seen = true;
         tracing::debug!(
@@ -8700,6 +8825,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         // Read once: a clone3's flags are guest memory, and the table the
         // child is given and the check of it below must see the same value.
         let issued_flags = input.and_then(|input| {
+            let input = input.input.as_ref()?;
             let desc = input.control().backend_description(input.id())?;
             let nr = Sysno::new(desc.number as usize)?;
             let args = SyscallArgs::from(&desc.args.map(|value| value as usize));
@@ -9869,6 +9995,15 @@ impl<L: Tool + 'static> TracedTask<L> {
                     // This actual Exec edge owns the surviving leader stop.
                     // Transfer input ownership before former retirement or any
                     // consuming Tool hook can publish a replacement task.
+                    // The Exec decoder owns both displaced incarnations here.
+                    // Generic observation must complete even with no facility;
+                    // neither ordinary callback Drop nor a new PID binding is
+                    // used as a substitute for this native edge.
+                    for owner in [&stop.terminal, &former_slot.stop.terminal] {
+                        if let Err(error) = session.complete_native_effects(owner) {
+                            let _ = self.input_failure(error);
+                        }
+                    }
                     let _ = self
                         .reserved_input_exec_transfer(&stopped, former_task.reserved_input_task);
                     session.finished(&former_slot.stop);
@@ -10541,7 +10676,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         nr: Sysno,
         args: SyscallArgs,
     ) -> Result<Result<i64, Errno>, TraceError> {
-        self.untraced_syscall_with(task, nr, args, false, None)
+        let native = NativeCallContext::application(None);
+        self.untraced_syscall_with(task, nr, args, false, Some(&native))
             .await
     }
 
@@ -10557,7 +10693,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         nr: Sysno,
         args: SyscallArgs,
         original: bool,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<Result<i64, Errno>, TraceError> {
         self.timer.expire_overflow_records(&task);
         tracing::trace!(
@@ -10647,6 +10783,12 @@ impl<L: Tool + 'static> TracedTask<L> {
         } else {
             0
         };
+        self.observe_native_at_stop(
+            &task,
+            nr as u64,
+            *host_linux::request(nr, args).args(),
+            input,
+        )?;
         if let Err(error) = self.prepare_input_at_stop(&mut task, input) {
             let input = input.expect("only an input call prepares an image");
             return Err(self.recover_input_not_run(&task, oldregs, input, error));
@@ -10740,7 +10882,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         &mut self,
         task: Stopped,
         nr: Sysno,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<(Wait, bool), TraceError> {
         let (mut wait, mut seccomp_trapped) = self.step_private_syscall(task, nr, input).await?;
 
@@ -10913,7 +11055,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         &mut self,
         task: Stopped,
         nr: Sysno,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<(Wait, bool), TraceError> {
         let after_syscall = (cp::PRIVATE_PAGE_OFFSET + cp::SYSCALL_INSTR_SIZE) as u64;
         // Signals returned to the kernel queue during this step, still blocked
@@ -11131,7 +11273,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         &mut self,
         task: Stopped,
         nr: Sysno,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<(Wait, bool), TraceError> {
         // The shield makes requests main does not, which a tracer filter may
         // refuse (`thread_may_be_seccomp_filtered`).
@@ -11219,8 +11361,22 @@ impl<L: Tool + 'static> TracedTask<L> {
         *regs.ip_mut() = cp::PRIVATE_PAGE_OFFSET as Reg;
         task.setregs(&regs)?;
         set_sigmask(&task, original_mask | BLOCKABLE_SIGNAL_BITS)?;
+        let native = NativeCallContext::internal();
+        self.observe_native_at_stop(
+            &task,
+            nr as u64,
+            [
+                args.arg0 as u64,
+                args.arg1 as u64,
+                args.arg2 as u64,
+                args.arg3 as u64,
+                args.arg4 as u64,
+                args.arg5 as u64,
+            ],
+            Some(&native),
+        )?;
         let mut entered = false;
-        let mut running = self.syscall_stopped_any(task, None)?;
+        let mut running = self.syscall_stopped_any_input(task, None, Some(&native))?;
         loop {
             let wait = running.next_state_with_owner(&self.ptracer_waits).await?;
             self.arm_liteinst_wait(&wait);
@@ -11239,10 +11395,17 @@ impl<L: Tool + 'static> TracedTask<L> {
             match wait {
                 Wait::Stopped(stopped, Event::Syscall) if !entered => {
                     entered = true;
-                    running = self.syscall_stopped_any(stopped, None)?;
+                    running = self.syscall_stopped_any_input(stopped, None, Some(&native))?;
                 }
                 Wait::Stopped(stopped, Event::Syscall) => {
                     let ret = stopped.getregs()?.ret();
+                    self.native_result_at_stop(
+                        &stopped,
+                        Some(&native),
+                        Errno::from_ret(ret as usize).map(|x| x as i64),
+                        true,
+                        false,
+                    )?;
                     stopped.setregs(&oldregs)?;
                     set_sigmask(&stopped, original_mask)?;
                     return Ok((stopped, Errno::from_ret(ret as usize).map(|x| x as i64)));
@@ -11250,7 +11413,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 Wait::Stopped(stopped, Event::Signal(sig))
                     if !entered && is_group_stop(&stopped, sig)? =>
                 {
-                    running = self.syscall_stopped_any(stopped, None)?;
+                    running = self.syscall_stopped_any_input(stopped, None, Some(&native))?;
                 }
                 // An outside SIGKILL: the paths that handle a killed tracee
                 // take ESRCH, as from a ptrace request.
@@ -12743,7 +12906,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         task: Stopped,
         nr: Sysno,
         args: &SyscallArgs,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<(Stopped, SigtrapBeforeInjection), TraceError> {
         let kind = step_kind(nr, swaps_signal_mask(nr));
         let mask = sigmask(&task)?;
@@ -13071,7 +13234,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         wait: Wait,
         seccomp_trapped: bool,
         nr: Sysno,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<(Wait, bool), TraceError> {
         fn requeueable(sig: AnySignal) -> bool {
             !matches!(
@@ -13159,7 +13322,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         nr: Sysno,
         shield: u64,
         requeue: bool,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<(Wait, bool), TraceError> {
         let original_mask = task.getsigmask()?;
         let mask = original_mask | shield;
@@ -13200,7 +13363,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         nr: Sysno,
         plain_injection: bool,
         requeue: bool,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<(Wait, bool), TraceError> {
         fn requeueable(sig: AnySignal) -> bool {
             !matches!(
@@ -13292,7 +13455,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         task: Stopped,
         nr: Sysno,
         args: SyscallArgs,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<Result<i64, Errno>, TraceError> {
         let task = self.skip_seccomp_syscall(task).await?;
 
@@ -13353,7 +13516,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         wait_status: Wait,
         context: Option<libc::user_regs_struct>,
         child_context: Option<libc::user_regs_struct>,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
         seccomp_trapped: bool,
     ) -> Result<Result<i64, Errno>, TraceError> {
         self.note_injection_stop(&wait_status)?;
@@ -13377,6 +13540,13 @@ impl<L: Tool + 'static> TracedTask<L> {
                         self.hold_pending_signal(&stopped, sig);
                     }
                     self.last_injection_ran = false;
+                    self.native_result_at_stop(
+                        &stopped,
+                        input,
+                        Err(Errno::ERESTARTSYS),
+                        false,
+                        seccomp_trapped,
+                    )?;
                     self.input_result(input, &Err(Errno::ERESTARTSYS), false, seccomp_trapped)?;
                     Ok(Err(Errno::ERESTARTSYS))
                 }
@@ -13448,6 +13618,13 @@ impl<L: Tool + 'static> TracedTask<L> {
                         self.last_injection_ran = false;
                     }
                     let result = Errno::from_ret(regs.ret() as usize).map(|x| x as i64);
+                    self.native_result_at_stop(
+                        &stopped,
+                        input,
+                        result,
+                        self.last_injection_ran,
+                        seccomp_trapped,
+                    )?;
                     self.input_result(input, &result, self.last_injection_ran, seccomp_trapped)?;
                     if let Some(context) = context {
                         if child_context.is_some() {
@@ -13486,6 +13663,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 }
                 Event::NewChild(op, child) => {
                     let ret = child.pid().as_raw() as i64;
+                    self.native_result_at_stop(&stopped, input, Ok(ret), true, seccomp_trapped)?;
                     // A held-signal callback's injection keeps the guest's
                     // return register, as above. The kernel writes the
                     // child's PID after the event stop, so it is restored at
@@ -13551,6 +13729,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     Ok(Ok(ret))
                 }
                 Event::Exec(_new_pid) => {
+                    self.native_result_at_stop(&stopped, input, Ok(0), true, seccomp_trapped)?;
                     self.input_result(input, &Ok(0), true, seccomp_trapped)?;
                     // The callback that injected the exec never resumes, so
                     // the replacement image runs outside it
@@ -13562,6 +13741,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 Event::Syscall => {
                     let regs = stopped.getregs()?;
                     let result = Errno::from_ret(regs.ret() as usize).map(|x| x as i64);
+                    self.native_result_at_stop(&stopped, input, result, true, seccomp_trapped)?;
                     self.input_result(input, &result, true, seccomp_trapped)?;
                     Ok(result)
                 }
@@ -13591,11 +13771,21 @@ impl<L: Tool + 'static> TracedTask<L> {
         nr: Sysno,
         args: SyscallArgs,
     ) -> reverie::provider::ProviderOutcome<std::convert::Infallible> {
+        let context = NativeCallContext::application(None);
+        self.do_inject_outcome_with(nr, args, &context).await
+    }
+
+    async fn do_inject_outcome_with(
+        &mut self,
+        nr: Sysno,
+        args: SyscallArgs,
+        context: &NativeCallContext,
+    ) -> reverie::provider::ProviderOutcome<std::convert::Infallible> {
         use reverie::provider::LinuxProvider;
         self.injected_syscalls += 1;
         let request = host_linux::request(nr, args);
         let tid = self.tid();
-        match host_linux::HostLinux::<L>::new()
+        match host_linux::HostLinux::<L>::with_input(context)
             .execute(tid, &request, self)
             .await
         {
@@ -13604,20 +13794,39 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
+    async fn inject_backend_private_with_retry<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+    ) -> Result<i64, Errno> {
+        let (nr, args) = syscall.into_parts();
+        loop {
+            let native = NativeCallContext::internal();
+            let result =
+                host_linux::guest_result(self.do_inject_outcome_with(nr, args, &native).await);
+            match result {
+                Ok(Err(Errno::EINTR | Errno::ERESTARTSYS)) => continue,
+                Ok(result) => return result,
+                Err(error) => self.abort(Err(error)).await,
+            }
+        }
+    }
+
     async fn inner_inject(
         &mut self,
         nr: Sysno,
         args: SyscallArgs,
     ) -> Result<Result<i64, Errno>, TraceError> {
-        self.inner_inject_with_input(nr, args, None).await
+        let context = NativeCallContext::application(None);
+        self.inner_inject_with_input(nr, args, Some(&context)).await
     }
 
     async fn inner_inject_with_input(
         &mut self,
         nr: Sysno,
         args: SyscallArgs,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<Result<i64, Errno>, TraceError> {
+        self.retain_native_operation_owner(input)?;
         // A Tool's own `rt_sigaction` of SIGTRAP may change whether it is
         // ignored (`sigtrap_ignored`), here or, run in place, on the resume.
         if self.global_state.keeps_sigtrap_state && sets_sigtrap_action(nr, &args) {
@@ -13628,13 +13837,15 @@ impl<L: Tool + 'static> TracedTask<L> {
         // (`CLONE_UNTRACED` gives no new-child event).
         if self.global_state.keeps_sigtrap_state
             && matches!(nr, Sysno::clone | Sysno::clone3)
-            && input.map_or_else(
-                || self.clone_may_share_signal_actions(nr, &args),
-                |call| {
-                    call.future_flags(nr, &args)
-                        .is_none_or(|flags| flags & libc::CLONE_SIGHAND as u64 != 0)
-                },
-            )
+            && input
+                .and_then(|context| context.input.as_ref())
+                .map_or_else(
+                    || self.clone_may_share_signal_actions(nr, &args),
+                    |call| {
+                        call.future_flags(nr, &args)
+                            .is_none_or(|flags| flags & libc::CLONE_SIGHAND as u64 != 0)
+                    },
+                )
         {
             self.global_state
                 .sigtrap_tables
@@ -13668,7 +13879,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         &mut self,
         nr: Sysno,
         args: SyscallArgs,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<Result<i64, Errno>, TraceError> {
         let mut task = self.assume_stopped();
 
@@ -13697,6 +13908,9 @@ impl<L: Tool + 'static> TracedTask<L> {
                             .await;
                     }
                     let oldregs = task.getregs()?;
+                    if let Some(input) = input {
+                        self.observe_native_entry(&task, input)?;
+                    }
                     if let Err(error) = self.prepare_input_at_stop(&mut task, input) {
                         return Err(self.recover_input_not_run(
                             &task,
@@ -13733,6 +13947,15 @@ impl<L: Tool + 'static> TracedTask<L> {
     }
 
     async fn do_tail_inject(&mut self, nr: Sysno, args: SyscallArgs) -> ! {
+        self.do_tail_inject_with(nr, args, None).await
+    }
+
+    async fn do_tail_inject_with(
+        &mut self,
+        nr: Sysno,
+        args: SyscallArgs,
+        operation: Option<reverie::native_syscall::NativeOperation>,
+    ) -> ! {
         // A tail injection never returns to the signal callback that approved
         // a delivery (`Guest::deliver_signal`), so `report_signal` would never
         // enforce the approval. It is refused before anything runs.
@@ -13740,7 +13963,10 @@ impl<L: Tool + 'static> TracedTask<L> {
             let error = self.fail_broken_approval(approval, "then made a tail injection");
             self.abort(Err(error)).await
         }
-        match self.inner_tail_inject_observed(nr, args).await {
+        match self
+            .inner_tail_inject_observed(nr, args, NativeCallContext::application(operation))
+            .await
+        {
             Ok(_) => {
                 // Drop the handle_syscall_event future.
                 self.cancel_handler.store(true, Ordering::SeqCst);
@@ -13757,13 +13983,15 @@ impl<L: Tool + 'static> TracedTask<L> {
         &mut self,
         nr: Sysno,
         args: SyscallArgs,
+        native: NativeCallContext,
     ) -> Result<Result<i64, Errno>, TraceError> {
+        self.retain_native_operation_owner(Some(&native))?;
         let checks_clone = self.checks_segv_clone(nr, &args);
         if checks_clone {
             self.segv_new_task_seen = false;
         }
         let sets_segv = self.sets_segv_action(nr, &args);
-        let result = self.inner_tail_inject(nr, args).await?;
+        let result = self.inner_tail_inject(nr, args, native).await?;
         let runs_on_resume = self.segv_resume_syscall.load(Ordering::SeqCst) == nr as u64 + 1;
         // An original clone left to run on the final resume gives no result
         // here: a traced child's new-task event is the thread's next stop
@@ -13787,6 +14015,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         &mut self,
         nr: Sysno,
         args: SyscallArgs,
+        native: NativeCallContext,
     ) -> Result<Result<i64, Errno>, TraceError> {
         let tid = self.tid();
         // As for `inner_inject`: whichever path runs it, and whenever.
@@ -13814,7 +14043,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         if self.injected_syscall_frame.is_some() {
             let original = self.pending_syscall.take() == Some((nr, args));
             let result = self
-                .untraced_syscall_with(task, nr, args, original, None)
+                .untraced_syscall_with(task, nr, args, original, Some(&native))
                 .await?;
             // `handle_injected_syscall` owns the frame and applies this after
             // the callback is dropped, restarting the trap for a Linux restart
@@ -13825,7 +14054,7 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         if is_liteinst_mapping_syscall(nr) && self.pending_syscall == Some((nr, args)) {
             self.pending_syscall = None;
-            let result = self.private_inject(task, nr, args, None).await?;
+            let result = self.private_inject(task, nr, args, Some(&native)).await?;
             let task = self.assume_stopped();
             set_ret(
                 &task,
@@ -13838,12 +14067,31 @@ impl<L: Tool + 'static> TracedTask<L> {
             Some(original) if original == (nr, args) => {
                 // The callback is cancelled next. Its final resume still owns
                 // execution of this original syscall; no second skip is due.
+                let callback = self
+                    .native_callback
+                    .ok_or_else(|| self.input_failure("native-tail-without-callback-owner"))?;
+                let pending = self
+                    .native_entry_pending
+                    .clone()
+                    .ok_or_else(|| self.input_failure("native-tail-without-entry-owner"))?;
+                if self.deferred_native_call.is_some() {
+                    return Err(self.input_failure("native-tail-duplicate-completion"));
+                }
+                self.deferred_native_call = Some(DeferredNativeCall {
+                    callback,
+                    owner: task.generation(),
+                    pending,
+                    context: native,
+                });
                 self.segv_resume_syscall
                     .store(nr as u64 + 1, Ordering::SeqCst);
                 Ok(Ok(0))
             }
-            Some(_) => self.private_inject(task, nr, args, None).await,
-            None => self.untraced_syscall(task, nr, args).await,
+            Some(_) => self.private_inject(task, nr, args, Some(&native)).await,
+            None => {
+                self.untraced_syscall_with(task, nr, args, false, Some(&native))
+                    .await
+            }
         }
     }
 
@@ -14998,13 +15246,86 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         self.inspect_reserved_input_descriptor(fd)
     }
 
+    fn supports_native_operations(&self) -> bool {
+        true
+    }
+
+    fn bind_native_request<S: SyscallInfo>(
+        &self,
+        operation: &reverie::native_syscall::NativeOperation,
+        syscall: S,
+    ) -> Result<reverie::native_syscall::NativeOperation, reverie::Error> {
+        let (nr, args) = syscall.into_parts();
+        self.bind_native_request_at_current_grant(operation, nr, args)
+    }
+
+    async fn inject_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: reverie::native_syscall::NativeOperation,
+    ) -> Result<i64, Errno> {
+        let (nr, args) = syscall.into_parts();
+        let context = NativeCallContext::application(Some(operation));
+        let outcome = self.do_inject_outcome_with(nr, args, &context).await;
+        match host_linux::guest_result(outcome) {
+            Ok(result) => result,
+            Err(error) => self.abort(Err(error)).await,
+        }
+    }
+    async fn inject_restartable_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: reverie::native_syscall::NativeOperation,
+    ) -> Result<i64, Errno> {
+        let (nr, args) = syscall.into_parts();
+        loop {
+            let context = NativeCallContext::application(Some(operation.clone()));
+            let outcome = self.do_inject_outcome_with(nr, args, &context).await;
+            match host_linux::restartable(outcome, self.pending_signal.is_some()) {
+                Ok(host_linux::Restart::Retry) => continue,
+                Ok(host_linux::Restart::Return(result)) => return result,
+                Err(error) => self.abort(Err(error)).await,
+            }
+        }
+    }
+    async fn tail_inject_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: reverie::native_syscall::NativeOperation,
+    ) -> Never {
+        let (nr, args) = syscall.into_parts();
+        self.do_tail_inject_with(nr, args, Some(operation)).await
+    }
+    async fn inject_observed_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        receipt: reverie::reserved_input::PhysicalInjectionReceipt,
+        operation: reverie::native_syscall::NativeOperation,
+    ) -> Result<Result<i64, Errno>, reverie::reserved_input::InputInjectionError> {
+        let (nr, args) = syscall.into_parts();
+        self.do_input_inject(nr, args, None, receipt, Some(operation))
+            .await
+    }
+    async fn inject_staged_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        scope: &reverie::reserved_input::InputOperationScope,
+        image: reverie::reserved_input::ReservedInputImage,
+        receipt: reverie::reserved_input::PhysicalInjectionReceipt,
+        operation: reverie::native_syscall::NativeOperation,
+    ) -> Result<Result<i64, Errno>, reverie::reserved_input::InputInjectionError> {
+        let (nr, args) = syscall.into_parts();
+        self.do_input_inject(nr, args, Some((scope, image)), receipt, Some(operation))
+            .await
+    }
+
     async fn inject_observed<S: SyscallInfo>(
         &mut self,
         syscall: S,
         receipt: reverie::reserved_input::PhysicalInjectionReceipt,
     ) -> Result<Result<i64, Errno>, reverie::reserved_input::InputInjectionError> {
         let (nr, args) = syscall.into_parts();
-        self.do_input_inject(nr, args, None, receipt).await
+        self.do_input_inject(nr, args, None, receipt, None).await
     }
 
     async fn inject_staged_input<S: SyscallInfo>(
@@ -15015,7 +15336,7 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
         receipt: reverie::reserved_input::PhysicalInjectionReceipt,
     ) -> Result<Result<i64, Errno>, reverie::reserved_input::InputInjectionError> {
         let (nr, args) = syscall.into_parts();
-        self.do_input_inject(nr, args, Some((scope, image)), receipt)
+        self.do_input_inject(nr, args, Some((scope, image)), receipt, None)
             .await
     }
 

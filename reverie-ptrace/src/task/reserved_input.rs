@@ -35,15 +35,25 @@ impl InputNativeExitObserver for NativeInputExitObserver {
             .0
             .upgrade()
             .ok_or_else(|| InputUnavailable::new("input-native-session-ended"))?;
-        let generations = session.input_generations.lock().unwrap();
-        let terminal = generations
+        let terminal = session
+            .input_generations
+            .lock()
+            .unwrap()
             .iter()
             .find(|(_, owner)| *owner == task)
-            .map(|(terminal, _)| terminal)
+            .map(|(terminal, _)| terminal.clone())
             .ok_or_else(|| InputUnavailable::new("input-native-generation-not-retained"))?;
-        terminal.exit_effects_complete().map_err(|error| {
+        let complete = terminal.exit_effects_complete().map_err(|error| {
             InputUnavailable::new(format!("input-native-exit-observation:{error}"))
-        })
+        })?;
+        if complete {
+            session
+                .complete_native_effects(&terminal)
+                .map_err(|error| {
+                    InputUnavailable::new(format!("input-native-effects-observer:{error}"))
+                })?;
+        }
+        Ok(complete)
     }
 }
 
@@ -51,7 +61,7 @@ impl InputNativeExitObserver for NativeInputExitObserver {
 /// provider without this value; cancellation leaves its registry entry owned.
 pub(super) struct NativeInputCall {
     receipt: PhysicalInjectionReceipt,
-    image: Option<ReservedInputImage>,
+    pub(super) image: Option<ReservedInputImage>,
     unavailable: StdMutex<Option<InputUnavailable>>,
 }
 
@@ -362,6 +372,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         args: SyscallArgs,
         scope_image: Option<(&InputOperationScope, ReservedInputImage)>,
         receipt: PhysicalInjectionReceipt,
+        operation: Option<reverie::native_syscall::NativeOperation>,
     ) -> Result<Result<i64, Errno>, InputInjectionError> {
         use reverie::provider::LinuxProvider;
         let task = self
@@ -387,11 +398,20 @@ impl<L: Tool + 'static> TracedTask<L> {
             image: scope_image.map(|(_, image)| image),
             unavailable: StdMutex::new(None),
         };
+        let context = NativeCallContext::with_input(input, operation);
         self.injected_syscalls += 1;
-        let result = host_linux::HostLinux::<L>::with_input(&input)
+        let result = host_linux::HostLinux::<L>::with_input(&context)
             .execute(self.tid, &request, self)
             .await;
-        if let Some(error) = input.unavailable.lock().unwrap().take() {
+        if let Some(error) = context
+            .input
+            .as_ref()
+            .unwrap()
+            .unavailable
+            .lock()
+            .unwrap()
+            .take()
+        {
             return Err(error.into());
         }
         match result.and_then(host_linux::guest_result) {
@@ -408,9 +428,9 @@ impl<L: Tool + 'static> TracedTask<L> {
     pub(super) fn prepare_input_at_stop(
         &self,
         task: &mut Stopped,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<(), InputInjectionError> {
-        let Some(input) = input else {
+        let Some(input) = input.and_then(|context| context.input.as_ref()) else {
             return Ok(());
         };
         let control = input.control();
@@ -447,11 +467,24 @@ impl<L: Tool + 'static> TracedTask<L> {
         &self,
         task: &Stopped,
         registers: libc::user_regs_struct,
-        input: &NativeInputCall,
+        context: &NativeCallContext,
         error: InputInjectionError,
     ) -> TraceError {
+        let input = context
+            .input
+            .as_ref()
+            .expect("image recovery has an input receipt");
         match error {
             InputInjectionError::Unavailable(reason) => {
+                if let Err(error) = self.native_result_at_stop(
+                    task,
+                    Some(context),
+                    Err(Errno::ECANCELED),
+                    false,
+                    false,
+                ) {
+                    return error;
+                }
                 if let Err(error) = task.setregs(&registers) {
                     return self.input_failure(error);
                 }
@@ -465,8 +498,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
-    pub(super) fn issue_input(&self, input: Option<&NativeInputCall>) -> Result<(), TraceError> {
-        if let Some(input) = input {
+    pub(super) fn issue_input(&self, input: Option<&NativeCallContext>) -> Result<(), TraceError> {
+        if let Some(input) = input.and_then(|context| context.input.as_ref()) {
             input
                 .control()
                 .backend_issued(input.id())
@@ -489,11 +522,16 @@ impl<L: Tool + 'static> TracedTask<L> {
 
     pub(super) fn input_continuation(
         &self,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
     ) -> Result<(), TraceError> {
         if let (Some(control), Some(task)) = (self.input_control(), self.reserved_input_task) {
             control
-                .backend_continuation(task, input.map(NativeInputCall::id))
+                .backend_continuation(
+                    task,
+                    input
+                        .and_then(|context| context.input.as_ref())
+                        .map(NativeInputCall::id),
+                )
                 .map_err(|e| self.input_failure(e))?;
         }
         Ok(())
@@ -501,12 +539,12 @@ impl<L: Tool + 'static> TracedTask<L> {
 
     pub(super) fn input_result(
         &self,
-        input: Option<&NativeInputCall>,
+        input: Option<&NativeCallContext>,
         result: &Result<i64, Errno>,
         ran: bool,
         seccomp_trapped: bool,
     ) -> Result<(), TraceError> {
-        let Some(input) = input else {
+        let Some(input) = input.and_then(|context| context.input.as_ref()) else {
             return Ok(());
         };
         let control = input.control();
@@ -590,6 +628,20 @@ impl<L: Tool + 'static> TracedTask<L> {
             return Ok(());
         };
         let former = former.ok_or_else(|| self.input_failure("input-exec-former-not-retained"))?;
+        let old_owners = self
+            .fatal_session()
+            .input_generations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, identity)| *identity == displaced || *identity == former)
+            .map(|(owner, _)| owner.clone())
+            .collect::<Vec<_>>();
+        for owner in old_owners {
+            self.fatal_session()
+                .complete_native_effects(&owner)
+                .map_err(|error| self.input_failure(error))?;
+        }
         let registered = control
             .backend_exec_replacement(displaced, former)
             .map_err(|error| self.input_failure(error))?;
@@ -626,6 +678,20 @@ impl<L: Tool + 'static> TracedTask<L> {
         Ok(())
     }
 
+    fn authenticate_native_fact_stop(&self, stop: &Stopped) -> Result<(), InputUnavailable> {
+        let retained = self
+            .preinit_generation
+            .as_ref()
+            .cloned()
+            .or_else(|| self.ptracer_waits.generation());
+        if stop.pid() != self.tid || retained.as_ref() != Some(&stop.generation()) {
+            return Err(InputUnavailable::new(
+                "native-facts-stop-generation-mismatch",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn inspect_input_descriptors(
         &self,
     ) -> Result<InputDescriptorSnapshot, InputUnavailable> {
@@ -634,7 +700,14 @@ impl<L: Tool + 'static> TracedTask<L> {
                 "input-native-descriptors-unsupported",
             ));
         }
-        let task = self.assume_stopped();
+        self.inspect_input_descriptors_at(&self.assume_stopped())
+    }
+
+    pub(super) fn inspect_input_descriptors_at(
+        &self,
+        task: &Stopped,
+    ) -> Result<InputDescriptorSnapshot, InputUnavailable> {
+        self.authenticate_native_fact_stop(task)?;
         task.getregs()
             .map_err(|_| InputUnavailable::new("input-stop-unavailable"))?;
         let entries = descriptors(self.tid.as_raw())
@@ -684,6 +757,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     }
 
     pub(super) fn input_cancelled(&self) -> Result<(), TraceError> {
+        self.cancel_native_attempts()?;
         if let (Some(control), Some(task)) = (self.input_control(), self.reserved_input_task) {
             control
                 .backend_cancel_injections(task)
@@ -693,6 +767,12 @@ impl<L: Tool + 'static> TracedTask<L> {
     }
 
     pub(super) fn input_terminal(&self) -> Result<(), TraceError> {
+        self.cancel_native_attempts()?;
+        if let Some(owner) = self.ptracer_waits.terminal_cleanup() {
+            self.fatal_session()
+                .complete_native_effects(&owner)
+                .map_err(|error| self.input_failure(error))?;
+        }
         if let (Some(control), Some(task)) = (self.input_control(), self.reserved_input_task) {
             control
                 .backend_terminal(task)
@@ -708,7 +788,15 @@ impl<L: Tool + 'static> TracedTask<L> {
         if self.input_control().is_none() || self.reserved_input_task.is_none() {
             return Err(InputUnavailable::new("input-native-descriptor-unsupported"));
         }
-        let stopped = self.assume_stopped();
+        self.inspect_reserved_input_descriptor_at(&self.assume_stopped(), fd)
+    }
+
+    pub(super) fn inspect_reserved_input_descriptor_at(
+        &self,
+        stopped: &Stopped,
+        fd: i32,
+    ) -> Result<PinnedInputDescriptor, InputUnavailable> {
+        self.authenticate_native_fact_stop(stopped)?;
         stopped
             .getregs()
             .map_err(|_| InputUnavailable::new("input-stop-unavailable"))?;
@@ -1005,6 +1093,9 @@ impl FatalSession {
     /// Actual terminal cleanup can precede Tool initialization for a newborn.
     /// Match the retained native generation, never a newly reused numeric TID.
     pub(super) fn finish_input_generation(&self, terminal: &safeptrace::TerminalCleanup) {
+        if let Err(error) = self.complete_native_effects(terminal) {
+            self.fail(error);
+        }
         let Some(control) = &self.reserved_input else {
             return;
         };

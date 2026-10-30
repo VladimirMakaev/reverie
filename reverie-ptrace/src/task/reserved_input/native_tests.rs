@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use reverie::Error;
 use reverie::GlobalTool;
 use reverie::Subscription;
 use serde::Deserialize;
@@ -29,6 +30,7 @@ enum Fault {
     ReadbackTail,
     Normalization,
     Debugger,
+    FutureView,
 }
 
 #[derive(Default)]
@@ -46,6 +48,7 @@ struct Evidence {
     debugger_requests: usize,
     exec_old_tasks: Vec<InputTaskId>,
     exec_callbacks: usize,
+    before_fill: Vec<(Vec<u8>, ReservedInputImage)>,
 }
 
 thread_local! {
@@ -199,6 +202,42 @@ impl Tool for PageTool {
 
     fn reserved_input_requirement(_: &Fault) -> Option<ReservedInputRequirement> {
         Some(ReservedInputRequirement::sealed_page())
+    }
+
+    fn observes_native_syscalls(config: &Fault) -> bool {
+        *config == Fault::FutureView
+    }
+
+    fn observe_native_syscall(
+        &self,
+        _: &(),
+        facts: &dyn reverie::native_syscall::NativeSyscallFacts,
+        call: &reverie::native_syscall::NativeSyscallCall,
+    ) -> Result<Option<Arc<dyn reverie::native_syscall::NativeSyscallObserver>>, Error> {
+        if let Some(image) = &call.staged_image {
+            let mut actual = vec![0u8; image.bytes().len()];
+            let local = libc::iovec {
+                iov_base: actual.as_mut_ptr().cast(),
+                iov_len: actual.len(),
+            };
+            let remote = libc::iovec {
+                iov_base: image.layout().base as *mut libc::c_void,
+                iov_len: actual.len(),
+            };
+            let tid = facts.task().expect("owned stopped image").native_tid();
+            let read = unsafe { libc::process_vm_readv(tid, &local, 1, &remote, 1, 0) };
+            assert_eq!(
+                read,
+                actual.len() as isize,
+                "real old page must remain fully readable before fill"
+            );
+            evidence()
+                .lock()
+                .unwrap()
+                .before_fill
+                .push((actual, image.clone()));
+        }
+        Ok(None)
     }
 
     fn subscriptions(_: &Fault) -> Subscription {
@@ -635,7 +674,7 @@ pub(super) fn debugger_requests(
     }
     let layout = control.layout(identity).unwrap();
     let before = read_image(task, layout).unwrap();
-    let stack_address = task.getregs().unwrap().sp() as u64;
+    let stack_address = task.getregs().unwrap().stack_ptr() as u64;
     let stack = AddrMut::<u64>::from_raw(stack_address as usize).unwrap();
     let saved: u64 = task.read_value(stack).unwrap();
     let breakpoints = Mutex::new(HashMap::new());
@@ -776,7 +815,7 @@ impl Tool for ExitFactsTool {
                 control.freeze_tasks(&[*task]).unwrap();
             }
             evidence().lock().unwrap().exec_old_tasks = old;
-            return guest.tail_inject(call).await;
+            guest.tail_inject(call).await;
         }
         if matches!(number, Sysno::clone | Sysno::clone3) {
             control.grant(owner, InputGrantKind::Ordinary).unwrap();
@@ -1088,4 +1127,30 @@ fn native_exec_and_nonleader_exec_keep_old_fences_separate_from_new_page_owner()
             assert!(control.observe_exit_effects(*old).unwrap());
         }
     }
+}
+
+#[test]
+fn native_final_observation_sees_immutable_future_b_while_the_real_page_is_still_a() {
+    let (output, _) = run_page_control(Fault::FutureView, libc::SIGCHLD as u64).unwrap();
+    assert!(output.status.success());
+    let state = evidence();
+    let state = state.lock().unwrap();
+    assert_eq!(
+        state.before_fill.len(),
+        1,
+        "one final observer, never a callback after fill"
+    );
+    let (actual, future) = &state.before_fill[0];
+    assert!(actual.iter().all(|byte| *byte == 0), "initial real page A");
+    assert_ne!(
+        actual.as_slice(),
+        future.bytes(),
+        "future clone input B is distinct"
+    );
+    assert_eq!(actual.len(), future.layout().page_bytes);
+    assert_eq!(state.expected.as_ref().unwrap(), future);
+    assert_eq!(
+        state.child_page_reads, 1,
+        "the copied child subsequently saw complete B"
+    );
 }

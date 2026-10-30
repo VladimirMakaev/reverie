@@ -761,6 +761,25 @@ pub trait Tool: Send + Sync + Default {
         ToolStreamRole::Unknown
     }
 
+    /// Pure opt-in to synchronous final-native-call observations. The default
+    /// performs no additional native queries or descriptor pinning.
+    fn observes_native_syscalls(_cfg: &<Self::GlobalState as GlobalTool>::Config) -> bool {
+        false
+    }
+
+    /// Observe an actual request after all guest-capable preparation and before
+    /// native issue. The provider cannot inject, resume or await. Returned
+    /// cookies are retained by the backend, independently of callback lifetime.
+    fn observe_native_syscall(
+        &self,
+        _state: &Self::ThreadState,
+        _facts: &dyn crate::native_syscall::NativeSyscallFacts,
+        _call: &crate::native_syscall::NativeSyscallCall,
+    ) -> Result<Option<std::sync::Arc<dyn crate::native_syscall::NativeSyscallObserver>>, Error>
+    {
+        Ok(None)
+    }
+
     /// Operational facility admission before global initialization or launch.
     /// Backends call this explicitly; subscription queries must remain pure.
     fn facility_admission(_cfg: &<Self::GlobalState as GlobalTool>::Config) -> Result<(), Error> {

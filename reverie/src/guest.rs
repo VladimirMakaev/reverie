@@ -487,6 +487,83 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// injects it again.
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno>;
 
+    /// The exact explicitly bound caller operation, if this is a forwarding
+    /// operation wrapper. Backends and nested Tool callbacks default to None.
+    fn native_operation(&self) -> Option<crate::native_syscall::NativeOperation> {
+        None
+    }
+
+    /// Whether this backend transports explicit native-operation ownership.
+    /// False by default; constructing NativeOperationGuest then fails before
+    /// issuing anything. Backends returning true implement every method below.
+    fn supports_native_operations(&self) -> bool {
+        false
+    }
+
+    /// Bind this exact physical request while the caller still owns its live
+    /// execution grant, before releasing coverage for a background operation.
+    /// The result retains the same operation owner/completion proof. Later
+    /// operand or ABI changes fail native ownership before issue, not as errno.
+    /// Helpers must use their own view rather than inherit this constraint.
+    fn bind_native_request<S: SyscallInfo>(
+        &self,
+        _operation: &crate::native_syscall::NativeOperation,
+        _syscall: S,
+    ) -> Result<crate::native_syscall::NativeOperation, Error> {
+        Err(Error::Tool(anyhow::anyhow!(
+            "native-request-binding-unsupported"
+        )))
+    }
+
+    /// Issue with an explicit operation owner. Call only after checking support.
+    async fn inject_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        _syscall: S,
+        _operation: crate::native_syscall::NativeOperation,
+    ) -> Result<i64, Errno> {
+        panic!("native-operation injection is unsupported by this backend")
+    }
+
+    /// Restartable injection with the same explicit caller operation.
+    async fn inject_restartable_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        _syscall: S,
+        _operation: crate::native_syscall::NativeOperation,
+    ) -> Result<i64, Errno> {
+        panic!("native-operation restart is unsupported by this backend")
+    }
+
+    /// Transfer the explicit operation to this exact nonreturning injection.
+    async fn tail_inject_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        _syscall: S,
+        _operation: crate::native_syscall::NativeOperation,
+    ) -> Never {
+        panic!("native-operation tail is unsupported by this backend")
+    }
+
+    /// Observed injection with both independent call-local capabilities.
+    async fn inject_observed_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        _syscall: S,
+        _receipt: crate::reserved_input::PhysicalInjectionReceipt,
+        _operation: crate::native_syscall::NativeOperation,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        Err(crate::reserved_input::InputUnavailable::new("native-operation-unsupported").into())
+    }
+
+    /// Staged injection with an explicit caller operation; scope remains borrowed.
+    async fn inject_staged_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        _syscall: S,
+        _scope: &crate::reserved_input::InputOperationScope,
+        _image: crate::reserved_input::ReservedInputImage,
+        _receipt: crate::reserved_input::PhysicalInjectionReceipt,
+        _operation: crate::native_syscall::NativeOperation,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        Err(crate::reserved_input::InputUnavailable::new("native-operation-unsupported").into())
+    }
+
     /// Run-local private-input facade, when this backend installed one.
     /// This observation alone grants neither execution nor stopped memory access.
     fn reserved_input_control(&self) -> Option<crate::reserved_input::ReservedInputControl> {
@@ -1639,6 +1716,70 @@ where
         self.inner.inject(syscall).await
     }
 
+    fn native_operation(&self) -> Option<crate::native_syscall::NativeOperation> {
+        self.inner.native_operation()
+    }
+
+    fn supports_native_operations(&self) -> bool {
+        self.inner.supports_native_operations()
+    }
+    fn bind_native_request<S: SyscallInfo>(
+        &self,
+        operation: &crate::native_syscall::NativeOperation,
+        syscall: S,
+    ) -> Result<crate::native_syscall::NativeOperation, Error> {
+        self.inner.bind_native_request(operation, syscall)
+    }
+    async fn inject_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<i64, Errno> {
+        self.inner
+            .inject_with_native_operation(syscall, operation)
+            .await
+    }
+    async fn inject_restartable_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<i64, Errno> {
+        self.inner
+            .inject_restartable_with_native_operation(syscall, operation)
+            .await
+    }
+    async fn tail_inject_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Never {
+        self.inner
+            .tail_inject_with_native_operation(syscall, operation)
+            .await
+    }
+    async fn inject_observed_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        receipt: crate::reserved_input::PhysicalInjectionReceipt,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        self.inner
+            .inject_observed_with_native_operation(syscall, receipt, operation)
+            .await
+    }
+    async fn inject_staged_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        scope: &crate::reserved_input::InputOperationScope,
+        image: crate::reserved_input::ReservedInputImage,
+        receipt: crate::reserved_input::PhysicalInjectionReceipt,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        self.inner
+            .inject_staged_with_native_operation(syscall, scope, image, receipt, operation)
+            .await
+    }
+
     fn reserved_input_control(&self) -> Option<crate::reserved_input::ReservedInputControl> {
         self.inner.reserved_input_control()
     }
@@ -1706,6 +1847,521 @@ where
     async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
         #![allow(unreachable_code)]
         self.inner.tail_inject(syscall).await
+    }
+
+    async fn cancel_current_thread(&mut self) -> Never {
+        self.inner.cancel_current_thread().await
+    }
+
+    async fn retire_current_thread(&mut self) -> Never {
+        self.inner.retire_current_thread().await
+    }
+
+    async fn defer_signal_delivery(&mut self, event: SignalEvent) -> Result<(), Error> {
+        self.inner.defer_signal_delivery(event).await
+    }
+
+    async fn queue_child_exit_signal(
+        &mut self,
+        event: SignalEvent,
+    ) -> crate::ChildExitSignalOutcome {
+        self.inner.queue_child_exit_signal(event).await
+    }
+
+    async fn queue_process_alarm_signal(
+        &mut self,
+        event: SignalEvent,
+    ) -> crate::ProcessAlarmSignalOutcome {
+        self.inner.queue_process_alarm_signal(event).await
+    }
+
+    fn signal_info(&self) -> Option<[u8; crate::SIGNAL_INFO_SIZE]> {
+        self.inner.signal_info()
+    }
+    fn set_signal_info(&mut self, info: [u8; crate::SIGNAL_INFO_SIZE]) -> Result<(), Errno> {
+        self.inner.set_signal_info(info)
+    }
+    async fn deliver_signal(
+        &mut self,
+        delivery: crate::SignalDelivery,
+    ) -> crate::SignalDeliveryOutcome {
+        self.inner.deliver_signal(delivery).await
+    }
+    fn signal_report_path(&self) -> Option<crate::SignalReportPath> {
+        self.inner.signal_report_path()
+    }
+    fn signal_task_identity(&self) -> Option<crate::SignalTaskIdentity> {
+        self.inner.signal_task_identity()
+    }
+    fn signal_control_mode(&self) -> crate::BackendSignalControlMode {
+        self.inner.signal_control_mode()
+    }
+    fn parked_signal_site(&self) -> Option<crate::CallbackSignalSite> {
+        self.inner.parked_signal_site()
+    }
+    fn polled_read_signal_site(
+        &self,
+        call: crate::syscalls::Read,
+    ) -> Option<crate::CallbackSignalSite> {
+        self.inner.polled_read_signal_site(call)
+    }
+    fn captured_write_signal_site(
+        &self,
+        call: crate::syscalls::Write,
+    ) -> Option<crate::CallbackSignalSite> {
+        self.inner.captured_write_signal_site(call)
+    }
+    fn parent_death_syscall_preflight(
+        &self,
+        call: crate::syscalls::Syscall,
+    ) -> Result<crate::ParentDeathSyscallAdmission, crate::Error> {
+        self.inner.parent_death_syscall_preflight(call)
+    }
+    fn signal_observation_lease(&self) -> Option<crate::ParkedObservationLease> {
+        self.inner.signal_observation_lease()
+    }
+    async fn observe_parked_signal(
+        &mut self,
+        site: crate::CallbackSignalSite,
+        lease: crate::ParkedObservationLease,
+    ) -> Result<crate::ParkedSignalObservation, crate::SignalObservationFailure> {
+        self.inner.observe_parked_signal(site, lease).await
+    }
+    async fn terminate_from_parked_signal(
+        &mut self,
+        selection: crate::PreparedSignalToken,
+    ) -> Result<Never, crate::SignalObservationFailure> {
+        self.inner.terminate_from_parked_signal(selection).await
+    }
+    fn parked_signal_failure_context(&self) -> Option<crate::ParkedSignalFailureContext> {
+        self.inner.parked_signal_failure_context()
+    }
+    async fn cancel_parked_signal(
+        &mut self,
+        context: crate::ParkedSignalFailureContext,
+    ) -> Result<Never, crate::SignalObservationFailure> {
+        self.inner.cancel_parked_signal(context).await
+    }
+
+    async fn set_blocked_signals(&mut self, mask: u64) -> Result<u64, MaskChangeRefused> {
+        self.inner.set_blocked_signals(mask).await
+    }
+
+    fn resume_signal_mask(&self) -> Option<u64> {
+        self.inner.resume_signal_mask()
+    }
+
+    fn set_timer(&mut self, sched: TimerSchedule) -> Result<(), Error> {
+        self.inner.set_timer(sched)
+    }
+
+    fn set_timer_precise(&mut self, sched: TimerSchedule) -> Result<(), Error> {
+        self.inner.set_timer_precise(sched)
+    }
+
+    fn read_clock(&mut self) -> Result<u64, Error> {
+        self.inner.read_clock()
+    }
+
+    fn backtrace(&mut self) -> Option<Backtrace> {
+        self.inner.backtrace()
+    }
+
+    fn set_watchpoints(&mut self, specs: &[crate::WatchSpec]) -> Result<(), crate::WatchError> {
+        self.inner.set_watchpoints(specs)
+    }
+
+    fn watch_hits_keep_timer_events(&self) -> bool {
+        self.inner.watch_hits_keep_timer_events()
+    }
+
+    fn has_cpuid_interception(&self) -> bool {
+        self.inner.has_cpuid_interception()
+    }
+
+    fn detlog_memory_regions(&self) -> Option<Vec<DetlogMemoryRegion>> {
+        self.inner.detlog_memory_regions()
+    }
+
+    fn take_unsupported_refusal(&mut self) -> Option<crate::UnsupportedRefusal> {
+        self.inner.take_unsupported_refusal()
+    }
+
+    fn injected_syscalls(&self) -> Option<u64> {
+        self.inner.injected_syscalls()
+    }
+
+    fn pidfd_self_spelling(&self) -> crate::PidfdSelfSpelling {
+        self.inner.pidfd_self_spelling()
+    }
+
+    fn storable_memory_ranges(&self) -> Result<Vec<(u64, u64)>, crate::Error> {
+        self.inner.storable_memory_ranges()
+    }
+
+    fn user_address_limit(&self) -> Result<crate::UserAddressLimit, crate::Error> {
+        self.inner.user_address_limit()
+    }
+
+    fn descriptor_status(&self, fd: i32) -> Result<crate::DescriptorStatus, crate::FactError> {
+        self.inner.descriptor_status(fd)
+    }
+
+    fn signal_sets(&self, tid: Pid) -> Result<crate::SignalSets, crate::FactError> {
+        self.inner.signal_sets(tid)
+    }
+
+    fn link_path(
+        &self,
+        tid: Pid,
+        link: crate::PathLink,
+    ) -> Result<crate::LinkPath, crate::FactError> {
+        self.inner.link_path(tid, link)
+    }
+
+    fn memory_map(&self, tid: Pid) -> Result<crate::MemoryMap, crate::FactError> {
+        self.inner.memory_map(tid)
+    }
+}
+
+/// A forwarding Guest carrying one explicit caller-owned native operation.
+/// Nested Tool callbacks receive the backend Guest, not this wrapper. Dropping
+/// the wrapper does not settle its operation or any copyout/readmission lease.
+pub struct NativeOperationGuest<'a, G: ?Sized, U> {
+    inner: &'a mut G,
+    operation: Option<crate::native_syscall::NativeOperation>,
+    _phantom: core::marker::PhantomData<U>,
+}
+impl<'a, G: Guest<U> + ?Sized, U: Tool> NativeOperationGuest<'a, G, U> {
+    /// Bind an operation before releasing logical ownership. Unsupported
+    /// backends fail here, before any native call; no guest errno is invented.
+    pub fn new(
+        guest: &'a mut G,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<Self, Error> {
+        Self::optional(guest, Some(operation))
+    }
+
+    /// Forward unchanged when no operation is supplied; this arm does not
+    /// require support or introduce native observations on other backends.
+    pub fn optional(
+        guest: &'a mut G,
+        operation: Option<crate::native_syscall::NativeOperation>,
+    ) -> Result<Self, Error> {
+        if operation.is_some() && !guest.supports_native_operations() {
+            return Err(Error::Tool(anyhow::anyhow!("native-operation-unsupported")));
+        }
+        Ok(Self {
+            inner: guest,
+            operation,
+            _phantom: core::marker::PhantomData,
+        })
+    }
+}
+
+#[async_trait]
+impl<'a, G, U> GlobalRPC<U::GlobalState> for NativeOperationGuest<'a, G, U>
+where
+    G: Guest<U> + ?Sized,
+    U: Tool,
+{
+    async fn send_rpc(
+        &self,
+        message: <U::GlobalState as GlobalTool>::Request,
+    ) -> <U::GlobalState as GlobalTool>::Response {
+        self.inner.send_rpc(message).await
+    }
+
+    fn try_send_rpc_sync(
+        &self,
+        message: <U::GlobalState as GlobalTool>::Request,
+    ) -> Result<<U::GlobalState as GlobalTool>::Response, <U::GlobalState as GlobalTool>::Request>
+    {
+        self.inner.try_send_rpc_sync(message)
+    }
+
+    fn config(&self) -> &<U::GlobalState as GlobalTool>::Config {
+        self.inner.config()
+    }
+}
+
+#[async_trait]
+impl<'a, G, U> Guest<U> for NativeOperationGuest<'a, G, U>
+where
+    G: Guest<U> + ?Sized,
+    U: Tool,
+{
+    type Memory = G::Memory;
+    type Stack = G::Stack;
+
+    fn tid(&self) -> Pid {
+        self.inner.tid()
+    }
+
+    fn pid(&self) -> Pid {
+        self.inner.pid()
+    }
+
+    fn controller_capture_fact(&self) -> Option<ControllerCaptureFact> {
+        self.inner.controller_capture_fact()
+    }
+
+    fn ppid(&self) -> Option<Pid> {
+        self.inner.ppid()
+    }
+
+    fn is_command_bootstrap(&self) -> bool {
+        self.inner.is_command_bootstrap()
+    }
+
+    fn is_backend_runtime_bootstrap(&self) -> bool {
+        self.inner.is_backend_runtime_bootstrap()
+    }
+
+    fn is_runtime_owned_fd(&self, fd: i32) -> bool {
+        self.inner.is_runtime_owned_fd(fd)
+    }
+
+    fn runtime_private_memory_regions(&self) -> Option<RuntimePrivateMemory> {
+        self.inner.runtime_private_memory_regions()
+    }
+
+    fn runtime_private_memory_is_current(&self, snapshot: &RuntimePrivateMemorySnapshot) -> bool {
+        self.inner.runtime_private_memory_is_current(snapshot)
+    }
+
+    fn try_mapping_capture(
+        &self,
+        prepared: crate::PreparedMappingCapture<<U::GlobalState as GlobalTool>::Request>,
+    ) -> Result<<U::GlobalState as GlobalTool>::Response, crate::MappingCaptureError> {
+        self.inner.try_mapping_capture(prepared)
+    }
+
+    fn is_main_thread(&self) -> bool {
+        self.inner.is_main_thread()
+    }
+
+    fn is_root_process(&self) -> bool {
+        self.inner.is_root_process()
+    }
+
+    fn is_root_thread(&self) -> bool {
+        self.inner.is_root_thread()
+    }
+
+    fn memory(&self) -> Self::Memory {
+        self.inner.memory()
+    }
+
+    unsafe fn tool_syscall(&self, number: Sysno, args: [usize; 6]) -> Result<usize, Errno> {
+        // SAFETY: forwarding preserves the caller's syscall and safety obligations.
+        unsafe { self.inner.tool_syscall(number, args) }
+    }
+
+    fn thread_state_mut(&mut self) -> &mut U::ThreadState {
+        self.inner.thread_state_mut()
+    }
+
+    fn thread_state(&self) -> &U::ThreadState {
+        self.inner.thread_state()
+    }
+
+    async fn regs(&mut self) -> libc::user_regs_struct {
+        self.inner.regs().await
+    }
+
+    async fn set_regs(&mut self, regs: libc::user_regs_struct) -> Result<(), Error> {
+        self.inner.set_regs(regs).await
+    }
+
+    async fn stack(&mut self) -> Self::Stack {
+        self.inner.stack().await
+    }
+
+    async fn daemonize(&mut self) {
+        self.inner.daemonize().await
+    }
+
+    async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+        match self.operation.clone() {
+            Some(operation) => {
+                self.inner
+                    .inject_with_native_operation(syscall, operation)
+                    .await
+            }
+            None => self.inner.inject(syscall).await,
+        }
+    }
+
+    fn native_operation(&self) -> Option<crate::native_syscall::NativeOperation> {
+        self.operation
+            .clone()
+            .or_else(|| self.inner.native_operation())
+    }
+
+    fn supports_native_operations(&self) -> bool {
+        self.inner.supports_native_operations()
+    }
+    fn bind_native_request<S: SyscallInfo>(
+        &self,
+        operation: &crate::native_syscall::NativeOperation,
+        syscall: S,
+    ) -> Result<crate::native_syscall::NativeOperation, Error> {
+        self.inner.bind_native_request(operation, syscall)
+    }
+    async fn inject_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<i64, Errno> {
+        self.inner
+            .inject_with_native_operation(syscall, operation)
+            .await
+    }
+    async fn inject_restartable_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<i64, Errno> {
+        self.inner
+            .inject_restartable_with_native_operation(syscall, operation)
+            .await
+    }
+    async fn tail_inject_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Never {
+        self.inner
+            .tail_inject_with_native_operation(syscall, operation)
+            .await
+    }
+    async fn inject_observed_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        receipt: crate::reserved_input::PhysicalInjectionReceipt,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        self.inner
+            .inject_observed_with_native_operation(syscall, receipt, operation)
+            .await
+    }
+    async fn inject_staged_with_native_operation<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        scope: &crate::reserved_input::InputOperationScope,
+        image: crate::reserved_input::ReservedInputImage,
+        receipt: crate::reserved_input::PhysicalInjectionReceipt,
+        operation: crate::native_syscall::NativeOperation,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        self.inner
+            .inject_staged_with_native_operation(syscall, scope, image, receipt, operation)
+            .await
+    }
+
+    fn reserved_input_control(&self) -> Option<crate::reserved_input::ReservedInputControl> {
+        self.inner.reserved_input_control()
+    }
+
+    fn reserved_input_task(&self) -> Option<crate::reserved_input::InputTaskId> {
+        self.inner.reserved_input_task()
+    }
+
+    /// Complete actual native descriptor snapshot, retaining every OFD pin.
+    fn reserved_input_descriptors(
+        &self,
+    ) -> Result<
+        crate::reserved_input::InputDescriptorSnapshot,
+        crate::reserved_input::InputUnavailable,
+    > {
+        self.inner.reserved_input_descriptors()
+    }
+
+    fn reserved_input_process_exit_signal(
+        &self,
+    ) -> Result<i32, crate::reserved_input::InputUnavailable> {
+        self.inner.reserved_input_process_exit_signal()
+    }
+
+    fn reserved_input_descriptor(
+        &self,
+        fd: i32,
+    ) -> Result<crate::reserved_input::PinnedInputDescriptor, crate::reserved_input::InputUnavailable>
+    {
+        self.inner.reserved_input_descriptor(fd)
+    }
+
+    async fn inject_observed<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        receipt: crate::reserved_input::PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        match self.operation.clone() {
+            Some(operation) => {
+                self.inner
+                    .inject_observed_with_native_operation(syscall, receipt, operation)
+                    .await
+            }
+            None => self.inner.inject_observed(syscall, receipt).await,
+        }
+    }
+
+    async fn inject_staged_input<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        scope: &crate::reserved_input::InputOperationScope,
+        image: crate::reserved_input::ReservedInputImage,
+        receipt: crate::reserved_input::PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        match self.operation.clone() {
+            Some(operation) => {
+                self.inner
+                    .inject_staged_with_native_operation(syscall, scope, image, receipt, operation)
+                    .await
+            }
+            None => {
+                self.inner
+                    .inject_staged_input(syscall, scope, image, receipt)
+                    .await
+            }
+        }
+    }
+
+    async fn inject_with_purpose<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        purpose: InjectionPurpose,
+    ) -> Result<i64, Error> {
+        if self.operation.is_none() {
+            return self.inner.inject_with_purpose(syscall, purpose).await;
+        }
+        match purpose {
+            InjectionPurpose::Application | InjectionPurpose::Pselect6WrapperValidation => {
+                self.inject(syscall).await.map_err(Error::from)
+            }
+        }
+    }
+
+    async fn inject_restartable<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
+        match self.operation.clone() {
+            Some(operation) => {
+                self.inner
+                    .inject_restartable_with_native_operation(syscall, operation)
+                    .await
+            }
+            None => self.inner.inject_restartable(syscall).await,
+        }
+    }
+
+    async fn tail_inject<S: SyscallInfo>(&mut self, syscall: S) -> Never {
+        match self.operation.clone() {
+            Some(operation) => {
+                self.inner
+                    .tail_inject_with_native_operation(syscall, operation)
+                    .await
+            }
+            None => self.inner.tail_inject(syscall).await,
+        }
     }
 
     async fn cancel_current_thread(&mut self) -> Never {

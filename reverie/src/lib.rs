@@ -85,6 +85,7 @@ pub use in_guest_rcb::InGuestRcbCounter;
 pub use perf::is_perf_supported;
 pub use pidfd_self::PidfdSelfSpelling;
 mod mapping_capture;
+pub mod native_syscall;
 mod process_signal_control;
 pub mod provider;
 #[cfg(target_arch = "x86_64")]
