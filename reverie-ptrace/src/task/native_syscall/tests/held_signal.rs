@@ -132,10 +132,12 @@ fn guest_with_pending_signal() {
         let mut blocked: libc::sigset_t = std::mem::zeroed();
         assert_eq!(libc::sigemptyset(&mut blocked), 0);
         assert_eq!(libc::sigaddset(&mut blocked, signal), 0);
+        let mut expected: libc::sigset_t = std::mem::zeroed();
         assert_eq!(
-            libc::sigprocmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut()),
+            libc::sigprocmask(libc::SIG_BLOCK, &blocked, &mut expected),
             0
         );
+        assert_eq!(libc::sigaddset(&mut expected, signal), 0);
         let tid = libc::syscall(libc::SYS_gettid);
         assert!(tid > 0);
         assert_eq!(libc::syscall(libc::SYS_tgkill, tid, tid, signal), 0);
@@ -150,6 +152,16 @@ fn guest_with_pending_signal() {
             0
         );
         assert_eq!(libc::sigismember(&current, signal), 1);
+        for candidate in 1..=64 {
+            let expected_member = libc::sigismember(&expected, candidate);
+            let current_member = libc::sigismember(&current, candidate);
+            assert!(matches!(expected_member, 0 | 1));
+            assert!(matches!(current_member, 0 | 1));
+            assert_eq!(
+                current_member, expected_member,
+                "held-signal preparation changed mask membership for signal {candidate}"
+            );
+        }
         assert_eq!(SIGNAL_HITS.load(Ordering::SeqCst), 0);
         assert_eq!(
             libc::sigprocmask(libc::SIG_UNBLOCK, &blocked, std::ptr::null_mut()),
