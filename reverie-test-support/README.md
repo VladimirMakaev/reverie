@@ -28,8 +28,9 @@ remain unchanged.
 
 The optional `dbt` feature adds five `dbt_` command identities, sharing all
 thirteen original command assertions. The original thirteen basics tests and
-the default command helpers keep using ptrace. The eight inherited function
-tests do not run through DBT.
+the default command helpers keep using ptrace. Their inherited-function
+invocations remain ptrace-only; `run_fn_test` additionally executes its shared
+Rust body as an ordinary command under the `dbt` feature.
 
 Produce the two concrete caller artifacts before selecting DBT tests:
 
@@ -60,6 +61,39 @@ setup refusal as evidence. The caller protocol's initial-process domain still
 applies; signal termination is a launch error, not supported signal-status
 fidelity. These command cases do not establish raw-environment transparency,
 function-guest execution, or arbitrary-program support.
+
+## Original basic Rust command body
+
+The existing `run_fn_test` retains its inherited ptrace invocation and all
+three assertions: exit0, empty stderr, and actual returned CounterGlobal count
+strictly greater than one. Its literal getpid/println/raw-write/getgid body is
+also shared with a Cargo-built ordinary Rust command. With `dbt`, the same
+image runs natively, through ptrace, authenticated CounterLocal, and the real
+Noop caller. All existing basics and `dbt_command` tests remain; the basics
+feature/default listings stay 18/13, and the support controls stay three.
+
+Only the command wrapper adds the exact `basics-rust-body-complete\n` marker,
+using one raw write after the shared body returns. Every command must exit0,
+have empty stderr, and contain exactly one complete marker. A short or failed
+marker write exits97, with a nonreturning trap if that exit returns. Full raw
+stdout is retained; buffering order and different process IDs are not compared
+or normalized. The marker witnesses return from the shared body, not a syscall
+instruction trace. Startup and wrapper syscalls can contribute to the count.
+
+Both traced CounterLocal runs must satisfy the original count oracle using the
+real returned state. The authenticated Noop run must first succeed with that
+same image, marker and empty stderr, return actual CounterGlobal count zero,
+and then fail the unchanged positive count oracle. No state is synthesized;
+this reuses the existing support control's unit-Config compatibility. Both
+caller manifests are authenticated before the commands run. Setup refusal is
+not a successful negative witness.
+
+Cargo discovers `basics-rust-command-guest` only with `dbt`. The ordinary binary
+uses the same libc/nix versions and features as the original tests, promoted to
+normal dependencies and mirrored in BUCK. Default and Buck ptrace cases do not
+need Cargo's binary-path environment variable. Rust/libc/loader startup is part
+of command execution, not inherited-function execution. No Tool policy or
+caller lifecycle/signal contract changes.
 
 ## Injected-exit commands
 

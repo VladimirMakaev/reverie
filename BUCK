@@ -236,13 +236,19 @@ rust_library(
                 "test": False,
                 "bench": False,
                 "required-features": ["dbt"],
+            }, {
+                "name": "basics-rust-command-guest",
+                "path": "../tests/fixtures/basics-rust-command.rs",
+                "test": False,
+                "bench": False,
+                "required-features": ["dbt"],
             }],
             "dependencies_override": {
                 "dependencies": {
+                    "nix": {"features": ["fs", "process", "signal"]},
                     "reverie-dbt": {"version": "0.5.4", "path": "../reverie-dbt", "default-features": False, "optional": True},
                 },
                 "dev-dependencies": {
-                    "nix": {"features": ["fs", "process", "signal"]},
                     "reverie-ptrace": {"features": ["nightly"]},
                     "serde": {"features": ["derive"]},
                 },
@@ -260,7 +266,6 @@ rust_library(
     },
     test_deps = [
         "fbsource//third-party/rust:close-err",
-        "fbsource//third-party/rust:nix",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:tracing",
@@ -268,6 +273,7 @@ rust_library(
     ],
     deps = [
         "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
         ":reverie",
         ":reverie-ptrace",
     ],
@@ -275,7 +281,12 @@ rust_library(
 
 rust_unittest(
     name = "generic-basics",
-    srcs = ["tests/basics.rs", "tests/support/basics_commands.rs", "tests/tool_fixtures/basics.rs"],
+    srcs = [
+        "tests/basics.rs",
+        "tests/support/basics_commands.rs",
+        "tests/support/basics_rust_guest.rs",
+        "tests/tool_fixtures/basics.rs",
+    ],
     crate_root = "tests/basics.rs",
     rustc_flags = sanitized_feature,
     deps = [

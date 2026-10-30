@@ -16,13 +16,13 @@ dbt = ["dep:reverie-dbt"]
 
 [dependencies]
 libc = "0.2.186"
+nix = { version = "0.30.1", features = ["fs", "process", "signal"] }
 reverie = { version = "0.5.4", path = "../reverie", package = "reverie-core" }
 reverie-ptrace = { version = "0.5.4", path = "../reverie-ptrace" }
 reverie-dbt = { version = "0.5.4", path = "../reverie-dbt", default-features = false, optional = true }
 
 [dev-dependencies]
 close-err = "1.0.2"
-nix = { version = "0.30.1", features = ["fs", "process", "signal"] }
 # Inherited function guests must clear libtest's thread-local output capture.
 # The workspace already pins nightly; ordinary library users need no feature.
 reverie-ptrace = { version = "0.5.4", path = "../reverie-ptrace", features = ["nightly"] }
@@ -72,6 +72,13 @@ required-features = ["dbt"]
 [[bin]]
 name = "exit-rust-command-guest"
 path = "../tests/fixtures/exit-rust-command.rs"
+test = false
+bench = false
+required-features = ["dbt"]
+
+[[bin]]
+name = "basics-rust-command-guest"
+path = "../tests/fixtures/basics-rust-command.rs"
 test = false
 bench = false
 required-features = ["dbt"]
