@@ -18,6 +18,35 @@ use reverie::reserved_input::*;
 
 use super::*;
 
+#[cfg(test)]
+mod native_tests;
+
+struct NativeInputExitObserver(std::sync::Weak<FatalSession>);
+
+impl std::fmt::Debug for NativeInputExitObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NativeInputExitObserver")
+    }
+}
+
+impl InputNativeExitObserver for NativeInputExitObserver {
+    fn effects_complete(&self, task: InputTaskId) -> Result<bool, InputUnavailable> {
+        let session = self
+            .0
+            .upgrade()
+            .ok_or_else(|| InputUnavailable::new("input-native-session-ended"))?;
+        let generations = session.input_generations.lock().unwrap();
+        let terminal = generations
+            .iter()
+            .find(|(_, owner)| *owner == task)
+            .map(|(terminal, _)| terminal)
+            .ok_or_else(|| InputUnavailable::new("input-native-generation-not-retained"))?;
+        terminal.exit_effects_complete().map_err(|error| {
+            InputUnavailable::new(format!("input-native-exit-observation:{error}"))
+        })
+    }
+}
+
 /// The physical request's local carrier. Preparatory injections use a distinct
 /// provider without this value; cancellation leaves its registry entry owned.
 pub(super) struct NativeInputCall {
@@ -123,6 +152,13 @@ struct NativeOwner {
     pid: i32,
 }
 
+// Linux UAPI asm-generic/fcntl.h, used by both supported x86_64 and
+// aarch64 ABIs: F_GETSIG=11 and F_GETOWN_EX=16. libc does not expose these
+// constants on every supported target. F_GETOWN cannot substitute for
+// F_GETOWN_EX: it loses the stored PID/TID/process-group owner kind.
+const NATIVE_F_GETSIG: libc::c_int = 11;
+const NATIVE_F_GETOWN_EX: libc::c_int = 16;
+
 fn fcntl_value(fd: i32, command: i32, name: &'static str) -> Result<i32, InputNativeError> {
     let result = unsafe { libc::fcntl(fd, command) };
     if result == -1 {
@@ -176,7 +212,7 @@ fn descriptor_facts(
         Ok(fs.f_type as u64)
     };
     let mut owner = NativeOwner::default();
-    let async_owner = if unsafe { libc::fcntl(native, libc::F_GETOWN_EX, &mut owner) } == -1 {
+    let async_owner = if unsafe { libc::fcntl(native, NATIVE_F_GETOWN_EX, &mut owner) } == -1 {
         Err(native_error("F_GETOWN_EX"))
     } else {
         Ok((owner.kind, owner.pid))
@@ -215,7 +251,7 @@ fn descriptor_facts(
     let facts = InputDescriptorFacts {
         fd,
         status_flags: fcntl_value(native, libc::F_GETFL, "F_GETFL"),
-        async_signal: fcntl_value(native, libc::F_GETSIG, "F_GETSIG"),
+        async_signal: fcntl_value(native, NATIVE_F_GETSIG, "F_GETSIG"),
         async_owner,
         identity,
         filesystem,
@@ -384,16 +420,16 @@ impl<L: Tool + 'static> TracedTask<L> {
         let image = control.backend_prepared_stopped(input.id())?;
         authenticate_mapping(task, image.layout())?;
         control.backend_initializing(input.id())?;
-        let first = force_image(task, &image)
-            .and_then(|()| read_image(task, image.layout()))
+        let first = force_transaction_image(task, &image, false)
+            .and_then(|()| read_transaction_image(task, image.layout(), false))
             .map_err(|error| InputUnavailable::new(format!("input-image-write:{error}")))
             .and_then(|bytes| control.backend_verified_image(input.id(), &bytes));
         if let Err(error) = first {
             control.backend_normalizing(input.id()).map_err(|error| {
                 InputInjectionError::Fatal(self.input_failure(error).to_string())
             })?;
-            let normalized = force_image(task, &image)
-                .and_then(|()| read_image(task, image.layout()))
+            let normalized = force_transaction_image(task, &image, true)
+                .and_then(|()| read_transaction_image(task, image.layout(), true))
                 .map_err(|error| InputUnavailable::new(format!("input-normalization:{error}")))
                 .and_then(|bytes| control.backend_verified_image(input.id(), &bytes));
             if let Err(fatal) = normalized {
@@ -437,6 +473,18 @@ impl<L: Tool + 'static> TracedTask<L> {
                 .map_err(|e| self.input_failure(e))?;
         }
         Ok(())
+    }
+
+    pub(super) fn check_input_debug_write(
+        &self,
+        address: u64,
+        length: usize,
+    ) -> Result<(), TraceError> {
+        super::gdb_stop::check_reserved_input_write(
+            self.input_control().zip(self.reserved_input_task).as_ref(),
+            address,
+            length,
+        )
     }
 
     pub(super) fn input_continuation(
@@ -483,15 +531,23 @@ impl<L: Tool + 'static> TracedTask<L> {
         settled.map_err(|e| self.input_failure(e))
     }
 
-    pub(super) fn initialize_reserved_input_root(
+    pub(crate) fn initialize_reserved_input_root(
         &mut self,
         task: &Stopped,
     ) -> Result<(), TraceError> {
         let Some(control) = self.input_control() else {
             return Ok(());
         };
+        control
+            .backend_install_exit_observer(Arc::new(NativeInputExitObserver(Arc::downgrade(
+                &self.global_state.fatal_session,
+            ))))
+            .map_err(|error| self.input_failure(error))?;
         let registered = control
             .backend_register_root(task.pid().as_raw(), self.pid.as_raw())
+            .map_err(|error| self.input_failure(error))?;
+        let registered = control
+            .backend_bind_tool_identity(registered.task, self.tid().as_raw(), self.pid().as_raw())
             .map_err(|error| self.input_failure(error))?;
         self.reserved_input_task = Some(registered.task);
         self.global_state
@@ -520,18 +576,46 @@ impl<L: Tool + 'static> TracedTask<L> {
         Ok(())
     }
 
-    pub(super) fn reserved_input_exec_begin(&mut self, task: &Stopped) -> Result<(), TraceError> {
-        let (Some(control), Some(identity)) = (self.input_control(), self.reserved_input_task)
+    /// Bind the actual replacement before the old owner can be retired. The
+    /// native stop's generation is retained; only its input image incarnation
+    /// changes. A later final wait therefore accounts for the replacement,
+    /// while old input identities remain independently available to fences.
+    pub(super) fn reserved_input_exec_transfer(
+        &mut self,
+        task: &Stopped,
+        former: Option<InputTaskId>,
+    ) -> Result<(), TraceError> {
+        let (Some(control), Some(displaced)) = (self.input_control(), self.reserved_input_task)
         else {
             return Ok(());
         };
+        let former = former.ok_or_else(|| self.input_failure("input-exec-former-not-retained"))?;
         let registered = control
-            .backend_exec(identity)
+            .backend_exec_replacement(displaced, former)
             .map_err(|error| self.input_failure(error))?;
+        let registered = control
+            .backend_bind_tool_identity(registered.task, self.tid().as_raw(), self.pid().as_raw())
+            .map_err(|error| self.input_failure(error))?;
+        self.fatal_session()
+            .rebind_input_exec_generation(
+                &task.generation().terminal_cleanup(),
+                displaced,
+                registered.task,
+            )
+            .map_err(|error| self.input_failure(error))?;
+        self.reserved_input_task = Some(registered.task);
+        self.reserved_input_exec_transferred = true;
         self.global_state
             .gs_ref
             .on_reserved_input_task(registered)
             .map_err(|error| self.input_failure(error))?;
+        Ok(())
+    }
+
+    pub(super) fn reserved_input_exec_begin(&mut self, task: &Stopped) -> Result<(), TraceError> {
+        let Some(identity) = self.reserved_input_task else {
+            return Ok(());
+        };
         let facts = native_facts(task, identity, InputImagePhase::Target)?;
         self.reserved_input_initial = Some(
             self.global_state
@@ -749,6 +833,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         control
             .backend_set_layout(identity, layout)
             .map_err(|error| self.input_failure(error))?;
+        #[cfg(test)]
+        native_tests::debugger_requests(&mut task, &control, identity);
         self.input_setup_observation(InputSetupOutcome::Qualified(layout))?;
         Ok(task)
     }
@@ -815,6 +901,31 @@ fn authenticate_mapping(
 }
 
 fn force_image(task: &mut Stopped, image: &ReservedInputImage) -> Result<(), Errno> {
+    force_words(task, image, |_, _| Ok(()))
+}
+
+/// The production transport is identical for first fill and normalization.
+/// Tests may fail a real word request before or after its actual POKEDATA;
+/// they never substitute a mock page or a successful write result.
+fn force_transaction_image(
+    task: &mut Stopped,
+    image: &ReservedInputImage,
+    _normalizing: bool,
+) -> Result<(), Errno> {
+    force_words(task, image, |index, after| {
+        #[cfg(test)]
+        native_tests::write_fault(index, after, _normalizing)?;
+        #[cfg(not(test))]
+        let _ = (index, after);
+        Ok(())
+    })
+}
+
+fn force_words(
+    task: &mut Stopped,
+    image: &ReservedInputImage,
+    mut boundary: impl FnMut(usize, bool) -> Result<(), Errno>,
+) -> Result<(), Errno> {
     let layout = image.layout();
     for (index, word) in image.bytes().chunks_exact(8).enumerate() {
         let address = layout
@@ -825,11 +936,24 @@ fn force_image(task: &mut Stopped, image: &ReservedInputImage) -> Result<(), Err
             return Err(Errno::EFAULT);
         }
         let address = AddrMut::<u64>::from_raw(address as usize).ok_or(Errno::EFAULT)?;
+        boundary(index, false)?;
         // An exact aligned word selects safeptrace's POKEDATA path, whose
         // stopped-generation/ptracer-thread checks wrap each native request.
         task.write_value(address, &u64::from_ne_bytes(word.try_into().unwrap()))?;
+        boundary(index, true)?;
     }
     Ok(())
+}
+
+fn read_transaction_image(
+    task: &Stopped,
+    layout: ReservedInputLayout,
+    _normalizing: bool,
+) -> Result<Vec<u8>, Errno> {
+    let bytes = read_image(task, layout)?;
+    #[cfg(test)]
+    let bytes = native_tests::readback_fault(bytes, _normalizing);
+    Ok(bytes)
 }
 
 fn read_image(task: &Stopped, layout: ReservedInputLayout) -> Result<Vec<u8>, Errno> {
@@ -842,7 +966,7 @@ fn read_image(task: &Stopped, layout: ReservedInputLayout) -> Result<Vec<u8>, Er
 impl FatalSession {
     fn bind_input_generation(
         &self,
-        terminal: Arc<safeptrace::TerminalCleanup>,
+        terminal: safeptrace::TerminalCleanup,
         task: InputTaskId,
     ) -> Result<(), TraceError> {
         let mut generations = self.input_generations.lock().unwrap();
@@ -857,6 +981,24 @@ impl FatalSession {
             };
         }
         generations.push((terminal, task));
+        Ok(())
+    }
+
+    fn rebind_input_exec_generation(
+        &self,
+        terminal: &safeptrace::TerminalCleanup,
+        displaced: InputTaskId,
+        replacement: InputTaskId,
+    ) -> Result<(), TraceError> {
+        let mut generations = self.input_generations.lock().unwrap();
+        let (_, owner) = generations
+            .iter_mut()
+            .find(|(entry, _)| entry.same_generation(terminal))
+            .ok_or(Errno::ENODATA)?;
+        if *owner != displaced {
+            return Err(Errno::EPROTO.into());
+        }
+        *owner = replacement;
         Ok(())
     }
 
@@ -884,7 +1026,7 @@ impl FatalSession {
                     tid,
                     phase: "ptrace input terminal generation",
                 },
-                error.into(),
+                anyhow::Error::new(error).into(),
             );
         }
     }
@@ -936,7 +1078,7 @@ impl FatalSession {
                     tid: child.pid(),
                     phase: "ptrace input birth capture",
                 },
-                error.into(),
+                anyhow::Error::new(error).into(),
             );
         }
     }

@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -67,6 +68,11 @@ pub struct InputTaskRegistration {
     pub native_tid: i32,
     /// Actual native thread-group number.
     pub native_pid: i32,
+    /// Actual `Guest::tid()` bound by the constructed backend Tool view.
+    /// Decoder-only native retention has no such binding yet.
+    pub tool_tid: Option<i32>,
+    /// Actual `Guest::pid()` from that same Tool view, not an inferred alias.
+    pub tool_pid: Option<i32>,
     /// Retained native group incarnation.
     pub group: ThreadGroupLifetime,
     /// Retained creator, if this is a child.
@@ -337,6 +343,7 @@ struct Task {
     grant: Option<(u64, InputGrantKind, bool)>,
     frozen: BTreeSet<u64>,
     native_terminal: bool,
+    native_effects_complete: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -397,7 +404,7 @@ impl State {
         }
         self.tasks
             .get(&task)
-            .filter(|task| !task.native_terminal)
+            .filter(|task| !task.native_terminal && !task.native_effects_complete)
             .ok_or_else(|| InputUnavailable::new("input-task-not-live"))
     }
 
@@ -430,11 +437,22 @@ impl State {
     }
 }
 
-/// Run-owned leaf registry. No method runs a callback or holds a lock over await.
+/// A backend's read-only observer of retained native task generations.
+/// It must not recapture a numeric task, resume, wait or enter Tool code.
+/// The registry calls it only outside its leaf lock.
+pub trait InputNativeExitObserver: std::fmt::Debug + Send + Sync {
+    /// True proves this exact task's kernel exit effects ended, independently
+    /// of final group wait/notifier retirement. False/error proves no exit.
+    fn effects_complete(&self, task: InputTaskId) -> Result<bool, InputUnavailable>;
+}
+
+/// Run-owned leaf registry. State mutation never calls out or awaits. The
+/// explicit native observation method releases the leaf lock before querying.
 #[derive(Debug, Clone)]
 pub struct ReservedInputControl {
     run: u64,
     state: Arc<Mutex<State>>,
+    native_exit_observer: Arc<OnceLock<Arc<dyn InputNativeExitObserver>>>,
 }
 
 impl ReservedInputControl {
@@ -447,7 +465,45 @@ impl ReservedInputControl {
         Ok(Self {
             run,
             state: Arc::new(Mutex::new(State::default())),
+            native_exit_observer: Arc::new(OnceLock::new()),
         })
+    }
+
+    /// Backend-only: install the run's exact-generation native observer once.
+    pub fn backend_install_exit_observer(
+        &self,
+        observer: Arc<dyn InputNativeExitObserver>,
+    ) -> Result<(), InputUnavailable> {
+        self.native_exit_observer
+            .set(observer)
+            .map_err(|_| InputUnavailable::new("input-exit-observer-already-installed"))
+    }
+
+    /// Observe native completion after an existing Tool fence, without waiting
+    /// for group reap. True does not settle the logical fence or remove a native
+    /// identity. The observer runs outside the leaf lock and can only report
+    /// facts for a generation already retained by the backend.
+    pub fn observe_exit_effects(&self, task: InputTaskId) -> Result<bool, InputUnavailable> {
+        {
+            let state = self.state.lock().unwrap();
+            let owner = state
+                .tasks
+                .get(&task)
+                .ok_or_else(|| InputUnavailable::new("input-task-not-owned"))?;
+            if owner.native_effects_complete || owner.native_terminal {
+                return Ok(true);
+            }
+        }
+        let observer = self
+            .native_exit_observer
+            .get()
+            .ok_or_else(|| InputUnavailable::new("input-exit-observer-unavailable"))?;
+        if !observer.effects_complete(task)? {
+            return Ok(false);
+        }
+        let mut state = self.state.lock().unwrap();
+        Self::effects_complete_locked(&mut state, task)?;
+        Ok(true)
     }
 
     /// Resolve a currently retained native TID to its exact incarnation.
@@ -474,6 +530,27 @@ impl ReservedInputControl {
             .tasks
             .get(&task)
             .map(|task| task.registration)
+    }
+
+    /// Backend-only: bind the actual Tool view before any consuming callback.
+    /// Rebinding the same image to a different Tool identity is refused.
+    pub fn backend_bind_tool_identity(
+        &self,
+        task: InputTaskId,
+        tid: i32,
+        pid: i32,
+    ) -> Result<InputTaskRegistration, InputUnavailable> {
+        let mut state = self.state.lock().unwrap();
+        state.live(task)?;
+        let registration = &mut state.tasks.get_mut(&task).unwrap().registration;
+        if registration.tool_tid.is_some_and(|old| old != tid)
+            || registration.tool_pid.is_some_and(|old| old != pid)
+        {
+            return Err(InputUnavailable::new("input-tool-identity-conflict"));
+        }
+        registration.tool_tid = Some(tid);
+        registration.tool_pid = Some(pid);
+        Ok(*registration)
     }
 
     /// Publish an actual Tool grant at its existing authoritative boundary.
@@ -960,7 +1037,9 @@ impl ReservedInputControl {
         // generations are accounted for. Do not return success while silently
         // retaining one of their unsettled native accesses: the caller may
         // discard its fence handles after this method succeeds.
-        if fenced.iter().any(|task| !state.tasks[task].native_terminal)
+        if fenced
+            .iter()
+            .any(|task| !state.tasks[task].native_effects_complete)
             || state
                 .accesses
                 .values()
@@ -974,7 +1053,9 @@ impl ReservedInputControl {
             .filter_map(|(id, members)| {
                 (!members.is_empty()
                     && members.is_subset(&fenced)
-                    && members.iter().all(|task| state.tasks[task].native_terminal)
+                    && members
+                        .iter()
+                        .all(|task| state.tasks[task].native_effects_complete)
                     && !state
                         .accesses
                         .values()
@@ -1012,7 +1093,10 @@ impl ReservedInputControl {
             .freezes
             .get(&cohort.id)
             .ok_or_else(|| InputUnavailable::new("input-freeze-missing"))?;
-        if tasks.iter().any(|task| state.tasks[task].native_terminal) {
+        if tasks
+            .iter()
+            .any(|task| state.tasks[task].native_effects_complete)
+        {
             return Err(InputUnavailable::new("input-retirement-has-native-effect"));
         }
         let tasks = state.freezes.remove(&cohort.id).unwrap();
@@ -1041,7 +1125,9 @@ impl ReservedInputControl {
             .freezes
             .get(&cohort.id)
             .ok_or_else(|| InputUnavailable::new("input-freeze-missing"))?;
-        if tasks.iter().any(|task| !state.tasks[task].native_terminal)
+        if tasks
+            .iter()
+            .any(|task| !state.tasks[task].native_effects_complete)
             || state
                 .accesses
                 .values()
@@ -1101,6 +1187,8 @@ impl ReservedInputControl {
             task,
             native_tid: tid,
             native_pid: pid,
+            tool_tid: None,
+            tool_pid: None,
             group,
             parent: None,
             region,
@@ -1120,6 +1208,7 @@ impl ReservedInputControl {
                 grant: None,
                 frozen: BTreeSet::new(),
                 native_terminal: false,
+                native_effects_complete: false,
             },
         );
         Ok(registration)
@@ -1194,6 +1283,8 @@ impl ReservedInputControl {
             task,
             native_tid: tid,
             native_pid: pid,
+            tool_tid: None,
+            tool_pid: None,
             group,
             parent: Some(parent),
             region,
@@ -1230,6 +1321,7 @@ impl ReservedInputControl {
                 grant: None,
                 frozen: freezes,
                 native_terminal: false,
+                native_effects_complete: false,
             },
         );
         Ok(registration)
@@ -1258,15 +1350,58 @@ impl ReservedInputControl {
         })
     }
 
-    /// Backend-only: actual exec installs a distinct image and descriptor table.
-    /// Old lifetimes and their exposures remain retained for surviving aliases.
+    /// Backend-only: an authenticated Exec edge replaces this image.
     pub fn backend_exec(
         &self,
         task: InputTaskId,
     ) -> Result<InputTaskRegistration, InputUnavailable> {
+        self.backend_exec_replacement(task, task)
+    }
+
+    /// Backend-only: an actual nonleader Exec edge binds the surviving native
+    /// leader to a fresh image/task generation. The displaced and former
+    /// generations keep their old regions, accesses and fence membership.
+    /// This must precede retiring the former native owner. Neither ECHILD nor
+    /// disappearance of a numeric TID is authority to call this operation.
+    pub fn backend_exec_replacement(
+        &self,
+        displaced: InputTaskId,
+        former: InputTaskId,
+    ) -> Result<InputTaskRegistration, InputUnavailable> {
         let mut state = self.state.lock().unwrap();
-        let old = state.live(task)?.registration;
-        Self::terminal_gate_locked(&mut state, task)?;
+        if state.fatal.is_some() {
+            return Err(InputUnavailable::new("input-run-terminal"));
+        }
+        let old_leader = state
+            .tasks
+            .get(&displaced)
+            .ok_or_else(|| InputUnavailable::new("input-exec-owner-not-retained"))?
+            .registration;
+        let old_former = state
+            .tasks
+            .get(&former)
+            .ok_or_else(|| InputUnavailable::new("input-exec-former-not-retained"))?
+            .registration;
+        if old_leader.group != old_former.group || old_leader.native_tid != old_leader.native_pid {
+            return Err(InputUnavailable::new("input-exec-owner-mismatch"));
+        }
+        // Singleton exec/retirement fences name the old image, not its live
+        // replacement. A separately retained whole-group intent is sticky
+        // and must still include every replacement published in that group.
+        let freezes = state
+            .frozen_groups
+            .get(&old_former.group)
+            .cloned()
+            .unwrap_or_default();
+        Self::effects_complete_locked(&mut state, displaced)?;
+        if former != displaced {
+            Self::effects_complete_locked(&mut state, former)?;
+        }
+        let task = InputTaskId {
+            run: self.run,
+            generation: state.next()?,
+            tid: old_leader.native_tid,
+        };
         let region = RegionLifetime {
             run: self.run,
             generation: state.next()?,
@@ -1278,13 +1413,36 @@ impl ReservedInputControl {
         state.regions.insert(region, Region::default());
         state.files_possibly_shared.insert(files, false);
         let registration = InputTaskRegistration {
+            task,
+            native_tid: old_leader.native_tid,
+            native_pid: old_leader.native_pid,
+            tool_tid: None,
+            tool_pid: None,
             region,
             files,
-            ..old
+            ..old_former
         };
-        let task = state.tasks.get_mut(&task).unwrap();
-        task.registration = registration;
-        task.grant = None;
+        for old in [displaced, former] {
+            if state.by_tid.get(&old.tid) == Some(&old) {
+                state.by_tid.remove(&old.tid);
+            }
+        }
+        state.by_tid.insert(task.tid, task);
+        // Old exact-image cohort handles remain valid until the Tool's fence;
+        // only the independent sticky group intent follows this new image.
+        for freeze in &freezes {
+            state.freezes.get_mut(freeze).unwrap().insert(task);
+        }
+        state.tasks.insert(
+            task,
+            Task {
+                registration,
+                grant: None,
+                frozen: freezes,
+                native_terminal: false,
+                native_effects_complete: false,
+            },
+        );
         Ok(registration)
     }
 
@@ -1749,17 +1907,77 @@ impl ReservedInputControl {
     /// retained preparation before any terminal/exec owner can publish or await.
     /// This does not assert that the native task itself is dead.
     pub fn backend_cancel_injections(&self, task: InputTaskId) -> Result<(), InputUnavailable> {
-        Self::terminal_gate_locked(&mut self.state.lock().unwrap(), task)
+        let mut state = self.state.lock().unwrap();
+        let owner = state
+            .tasks
+            .get_mut(&task)
+            .ok_or_else(|| InputUnavailable::new("input-task-not-owned"))?;
+        owner.grant = None;
+        let unfinished: Vec<_> = state
+            .injections
+            .iter()
+            .filter(|(_, call)| {
+                call.task == task
+                    && matches!(
+                        call.state,
+                        PhysicalInjectionState::Prepared | PhysicalInjectionState::Issued
+                    )
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in unfinished {
+            let call = &state.injections[&id];
+            if matches!(
+                call.phase,
+                Some(
+                    InputTransactionPhase::Initializing
+                        | InputTransactionPhase::Normalizing
+                        | InputTransactionPhase::Ready
+                        | InputTransactionPhase::Launched
+                )
+            ) {
+                state.fatal = Some("input-terminal-before-settlement".to_owned());
+                return Err(InputUnavailable::new("input-terminal-before-settlement"));
+            }
+            if call.state == PhysicalInjectionState::Issued {
+                if let Some(exposure) = call.description.unknown_lifecycle.clone() {
+                    Self::add_exposure_locked(&mut state, exposure)?;
+                }
+                Self::finish_locked(&mut state, id, PhysicalInjectionState::OutcomeUnknown)?;
+            }
+            // Prepared/Preparing has not issued or changed the page. Keep it
+            // owned until actual exit effects or an authenticated Exec settle
+            // the old context. Callback Drop alone is not ProvedNoChild.
+        }
+        Ok(())
+    }
+
+    fn effects_complete_locked(
+        state: &mut State,
+        task: InputTaskId,
+    ) -> Result<(), InputUnavailable> {
+        Self::terminal_gate_locked(state, task)?;
+        let owner = state
+            .tasks
+            .get_mut(&task)
+            .ok_or_else(|| InputUnavailable::new("input-task-not-owned"))?;
+        owner.native_effects_complete = true;
+        owner.grant = None;
+        for access in state
+            .accesses
+            .values_mut()
+            .filter(|access| access.task == task)
+        {
+            access.native_complete = true;
+        }
+        Ok(())
     }
 
     /// Backend-only: before terminal publication or cancellation releases ownership.
     pub fn backend_terminal(&self, task: InputTaskId) -> Result<(), InputUnavailable> {
         let mut state = self.state.lock().unwrap();
-        Self::terminal_gate_locked(&mut state, task)?;
-        let owner = state
-            .tasks
-            .get_mut(&task)
-            .ok_or_else(|| InputUnavailable::new("input-task-not-owned"))?;
+        Self::effects_complete_locked(&mut state, task)?;
+        let owner = state.tasks.get_mut(&task).unwrap();
         owner.native_terminal = true;
         owner.grant = None;
         if state.by_tid.get(&task.tid) == Some(&task) {
@@ -2190,5 +2408,61 @@ mod tests {
         assert_ne!(first.region, second.region);
         assert!(control.grant(first.task, InputGrantKind::Ordinary).is_err());
         assert!(control.grant(second.task, InputGrantKind::Ordinary).is_ok());
+    }
+
+    #[test]
+    fn nonleader_exec_keeps_old_fence_and_rebinds_only_the_surviving_view() {
+        let (control, leader) = root();
+        let leader = control
+            .backend_bind_tool_identity(leader.task, 5000, 5000)
+            .unwrap();
+        let former = control
+            .backend_register_child(leader.task, 11, 10, Some(true), Some(true))
+            .unwrap();
+        let former = control
+            .backend_bind_tool_identity(former.task, 5001, 5000)
+            .unwrap();
+        let fence = control.freeze_tasks(&[leader.task]).unwrap();
+        let former_fence = control.freeze_tasks(&[former.task]).unwrap();
+        let replacement = control
+            .backend_exec_replacement(leader.task, former.task)
+            .unwrap();
+        assert_eq!(control.cohort_members(&fence).unwrap(), [leader.task]);
+        assert_eq!(
+            control.cohort_members(&former_fence).unwrap(),
+            [former.task]
+        );
+        assert_eq!(
+            replacement.tool_tid, None,
+            "new image cannot inherit the former logical binding by accident"
+        );
+        let replacement = control
+            .backend_bind_tool_identity(replacement.task, 5000, 5000)
+            .unwrap();
+        assert_ne!(replacement.task, leader.task);
+        assert_ne!(replacement.region, leader.region);
+        assert_eq!(
+            control.registration(former.task).unwrap().tool_tid,
+            Some(5001)
+        );
+        assert_eq!(control.registration(leader.task).unwrap(), leader);
+        assert_eq!(control.task_identity(10), Some(replacement.task));
+        assert_eq!(control.task_identity(11), None);
+        assert!(control.observe_exit_effects(leader.task).unwrap());
+        assert!(control.observe_exit_effects(former.task).unwrap());
+        control.settle_fenced_tasks(&[leader.task]).unwrap();
+        control.settle_fenced_tasks(&[former.task]).unwrap();
+        assert!(
+            control
+                .grant(leader.task, InputGrantKind::Ordinary)
+                .is_err()
+        );
+        assert!(
+            control
+                .grant(replacement.task, InputGrantKind::Ordinary)
+                .is_ok()
+        );
+        control.backend_terminal(former.task).unwrap();
+        assert_eq!(control.task_identity(10), Some(replacement.task));
     }
 }

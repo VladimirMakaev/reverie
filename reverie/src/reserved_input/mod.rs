@@ -72,6 +72,44 @@ impl ReservedInputLayout {
                 .zip(self.base.checked_add(self.page_bytes as u64))
                 .is_some_and(|(end, page_end)| end <= page_end)
     }
+
+    /// Conservatively test every supported effective user-address spelling.
+    ///
+    /// This does not claim that a tagging mode is enabled. Linux arm64's
+    /// `untagged_addr` removes the top byte only for the lower address half;
+    /// x86 LAM U48/U57 remove bits 62:48/62:57 and preserve bit 63. A caller
+    /// must not authorize a force-write merely because the raw spelling misses
+    /// the page. An overflowing candidate is unknown, never disjoint.
+    pub fn possibly_overlaps(self, address: u64, length: usize) -> Result<bool, InputUnavailable> {
+        if length == 0 {
+            return Ok(false);
+        }
+        let candidates = match self.abi {
+            InputAbi::Aarch64 => {
+                let untagged = if address & (1 << 55) == 0 {
+                    address & 0x00ff_ffff_ffff_ffff
+                } else {
+                    address
+                };
+                [address, untagged, untagged]
+            }
+            InputAbi::X86_64 => [
+                address,
+                address & 0x8000_ffff_ffff_ffff,
+                address & 0x81ff_ffff_ffff_ffff,
+            ],
+        };
+        let page_end = self.base + self.page_bytes as u64;
+        for start in candidates {
+            let end = start
+                .checked_add(length as u64)
+                .ok_or_else(|| InputUnavailable::new("address-normalization-unavailable"))?;
+            if start < page_end && end > self.base {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// A mechanism refusal with no application errno interpretation.
@@ -419,5 +457,40 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn protected_range_includes_tag_aliases_and_full_breakpoint_word() {
+        for abi in [InputAbi::X86_64, InputAbi::Aarch64] {
+            let page = ReservedInputLayout { abi, ..layout() };
+            for address in [page.base, page.base - 7, page.base + 4095] {
+                assert!(
+                    page.possibly_overlaps(address, 8).unwrap(),
+                    "{abi:?} {address:#x}"
+                );
+            }
+            assert!(!page.possibly_overlaps(page.base - 8, 8).unwrap());
+            assert!(!page.possibly_overlaps(page.base + 4096, 8).unwrap());
+            assert!(!page.possibly_overlaps(page.base + 10, 0).unwrap());
+            assert!(page.possibly_overlaps(u64::MAX - 3, 8).is_err());
+        }
+        let x86 = layout();
+        for tag in [1u64 << 48, 1 << 57, 0x7e00_0000_0000_0000] {
+            assert!(x86.possibly_overlaps(x86.base | tag, 8).unwrap());
+            assert!(!x86.possibly_overlaps((x86.base + 4096) | tag, 8).unwrap());
+        }
+        // Bit63 is not metadata in either LAM mode.
+        assert!(!x86.possibly_overlaps(x86.base | (1 << 63), 8).unwrap());
+        let arm = ReservedInputLayout {
+            abi: InputAbi::Aarch64,
+            ..layout()
+        };
+        for tag in [1u64, 0x80, 0xff] {
+            assert!(arm.possibly_overlaps(arm.base | (tag << 56), 8).unwrap());
+            assert!(
+                !arm.possibly_overlaps((arm.base + 4096) | (tag << 56), 8)
+                    .unwrap()
+            );
+        }
     }
 }

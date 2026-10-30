@@ -181,6 +181,7 @@ fn is_legacy_vsyscall_ip(ip: Reg) -> bool {
 
 #[derive(Debug)]
 struct Suspended {
+    input_task: Option<reverie::reserved_input::InputTaskId>,
     waker: Option<mpsc::Sender<Pid>>,
     suspended: Arc<AtomicBool>,
 }
@@ -2485,7 +2486,7 @@ pub(crate) struct FatalSession {
     reserved_input: Option<reverie::reserved_input::ReservedInputControl>,
     input_generations: StdMutex<
         Vec<(
-            Arc<safeptrace::TerminalCleanup>,
+            safeptrace::TerminalCleanup,
             reverie::reserved_input::InputTaskId,
         )>,
     >,
@@ -3957,6 +3958,7 @@ pub struct TracedTask<L: Tool> {
     // Native registry identity; never stored in serialized Tool thread state.
     reserved_input_task: Option<reverie::reserved_input::InputTaskId>,
     reserved_input_initial: Option<reverie::reserved_input::InputAdmission>,
+    reserved_input_exec_transferred: bool,
     // Shared with the original fatal owner before any callback can suspend.
     // Driver refusals and cancelled adapters keep their exact core here.
     pub(crate) ptracer_waits: Arc<PtracerWaitOwner>,
@@ -4473,6 +4475,7 @@ impl<L: Tool> TracedTask<L> {
         Self {
             reserved_input_task: None,
             reserved_input_initial: None,
+            reserved_input_exec_transferred: false,
             tid,
             pid: tid,
             ppid: None,
@@ -4595,6 +4598,7 @@ impl<L: Tool> TracedTask<L> {
                 .as_ref()
                 .and_then(|control| control.task_identity(child.as_raw())),
             reserved_input_initial: self.reserved_input_initial.clone(),
+            reserved_input_exec_transferred: false,
             tid: child,
             pid: self.pid,
             ppid: self.ppid,
@@ -4729,6 +4733,7 @@ impl<L: Tool> TracedTask<L> {
                 .as_ref()
                 .and_then(|control| control.task_identity(child.as_raw())),
             reserved_input_initial: self.reserved_input_initial.clone(),
+            reserved_input_exec_transferred: false,
             tid: child,
             pid: child,
             ppid: Some(self.pid),
@@ -6075,7 +6080,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         tid: task.pid(),
                         phase: "ptrace input timer continuation",
                     },
-                    error.into(),
+                    anyhow::Error::new(error).into(),
                 );
                 return Err(Errno::ECANCELED.into());
             }
@@ -6792,6 +6797,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 .send((
                     task.pid(),
                     Suspended {
+                        input_task: self.reserved_input_task,
                         waker: self.exit_suspend_tx.clone(),
                         suspended: suspended_flag,
                     },
@@ -7668,6 +7674,10 @@ impl<L: Tool + 'static> TracedTask<L> {
         // still own guards until the injected exec unwinds; those retain the
         // old Arc, so their Drop cannot release a frame of this new image.
         self.stack_arena = Arc::new(StackArena::default());
+        if !std::mem::take(&mut self.reserved_input_exec_transferred) {
+            self.reserved_input_exec_transfer(&task, self.reserved_input_task)?;
+            self.reserved_input_exec_transferred = false;
+        }
         // Linux enables CPUID again on every successful replacement exec.
         // This old-image fact must not survive until the new arm is verified.
         self.has_cpuid_interception = false;
@@ -8628,16 +8638,6 @@ impl<L: Tool + 'static> TracedTask<L> {
         input: Option<&NativeInputCall>,
     ) -> Result<Wait, TraceError> {
         self.segv_new_task_seen = true;
-        if let Some(control) = self.input_control() {
-            let task = control
-                .task_identity(child.pid().as_raw())
-                .and_then(|task| control.registration(task))
-                .ok_or_else(|| self.input_failure("input-child-not-retained"))?;
-            self.global_state
-                .gs_ref
-                .on_reserved_input_task(task)
-                .map_err(|e| self.input_failure(e))?;
-        }
         tracing::debug!(
             "[scheduler] handling fork from parent {} to child {}: {:?}",
             parent.pid(),
@@ -8682,6 +8682,21 @@ impl<L: Tool + 'static> TracedTask<L> {
             ChildOp::Fork | ChildOp::Vfork => Ok(Some(self.pid)),
         };
         let is_thread = op == ChildOp::Clone && !matches!(own_process_parent, Ok(Some(_)));
+        if let Some(control) = self.input_control() {
+            let identity = control
+                .task_identity(child.pid().as_raw())
+                .ok_or_else(|| self.input_failure("input-child-not-retained"))?;
+            // These are exactly the `tid`/`pid` operands used below by
+            // cloned()/forked(), before their Tool state constructors run.
+            let tool_pid = if is_thread { self.pid } else { child.pid() };
+            let registration = control
+                .backend_bind_tool_identity(identity, child.pid().as_raw(), tool_pid.as_raw())
+                .map_err(|error| self.input_failure(error))?;
+            self.global_state
+                .gs_ref
+                .on_reserved_input_task(registration)
+                .map_err(|error| self.input_failure(error))?;
+        }
         // Read once: a clone3's flags are guest memory, and the table the
         // child is given and the check of it below must see the same value.
         let issued_flags = input.and_then(|input| {
@@ -9723,6 +9738,10 @@ impl<L: Tool + 'static> TracedTask<L> {
                     result = drive => Some(Some(result)),
                 }
             };
+            // The outer transfer/lost arms can cancel drive_ordinary before
+            // its own post-drop gate. Preserve its registry obligations before
+            // publishing a boxed owner or retiring its native generation.
+            let _ = self.input_cancelled();
             match outcome {
                 Some(None) => {
                     // This former thread became the leader through de_thread
@@ -9847,6 +9866,11 @@ impl<L: Tool + 'static> TracedTask<L> {
                     // the request; the actual kernel Exec supplies the edge.
                     assert!(Arc::ptr_eq(&self.process_state, &former_task.process_state));
                     self.ordinary_exec.lock().unwrap().remove(&former);
+                    // This actual Exec edge owns the surviving leader stop.
+                    // Transfer input ownership before former retirement or any
+                    // consuming Tool hook can publish a replacement task.
+                    let _ = self
+                        .reserved_input_exec_transfer(&stopped, former_task.reserved_input_task);
                     session.finished(&former_slot.stop);
                     // The exec'ing thread was stopped for its whole callback,
                     // so an approval it holds means its own signal callback
@@ -13883,6 +13907,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             regs,
             core_regs,
             breakpoints: self.breakpoints.clone(),
+            reserved_input: self.input_control().zip(self.reserved_input_task),
             view: self.gdb_view.clone(),
             ports: self.gdb_ports.clone(),
             stop_tx: self.gdb_stop_tx.clone(),
@@ -13959,6 +13984,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         let was_suspended = self.suspended.swap(true, Ordering::SeqCst);
         if let Some((suspended, stop_tx)) = self.get_stop_tx().await {
             let frozen = Suspended {
+                input_task: self.reserved_input_task,
                 waker: None,
                 suspended,
             };
@@ -14143,6 +14169,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             task: &mut task,
             breakpoints: &self.breakpoints,
             parked_registers: shown,
+            reserved_input: self.input_control().zip(self.reserved_input_task),
         };
         let result = gdb_stop::serve_gdb_stop(&mut ports, self.gdb_stop_tx.clone(), |request| {
             tracee.answer(request)
@@ -14258,6 +14285,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         if !self.shares_breakpoint_memory {
             let insn = self.breakpoints().remove(&addr).ok_or(Errno::ENOENT)?;
             let current: u64 = task.read_value(at)?;
+            self.check_input_debug_write(addr, std::mem::size_of::<u64>())?;
             task.write_value(at, &breakpoint_removed(current, insn))?;
             let task = self.disregard_stop_for_timer(task).await?;
             return self
@@ -14278,6 +14306,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 .await;
         };
         let current: u64 = task.read_value(at)?;
+        self.check_input_debug_write(addr, std::mem::size_of::<u64>())?;
         task.write_value(at, &breakpoint_removed(current, insn))?;
         // The step's trap must not reset a blocked or ignored SIGTRAP, as at
         // Reverie's other steps (`sigtrap_state`).
@@ -14312,6 +14341,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         // gdb removed it meanwhile.
         if self.breakpoints().contains_key(&addr) {
             let current: u64 = task.read_value(at)?;
+            self.check_input_debug_write(addr, std::mem::size_of::<u64>())?;
             task.write_value(at, &breakpoint_inserted(current))?;
         }
         drop(step_over);
@@ -14347,6 +14377,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 .send((
                     self.tid(),
                     Suspended {
+                        input_task: self.reserved_input_task,
                         waker: None,
                         suspended: suspended_flag,
                     },
@@ -14559,6 +14590,18 @@ impl<L: Tool + 'static> TracedTask<L> {
 
     /// thaw all threads.
     async fn thaw_all(&mut self) -> Result<(), TraceError> {
+        // Check the complete publication before waking any member. A later
+        // failed resume cannot revoke an earlier callback continuation.
+        if let Some(control) = self.input_control() {
+            for suspended in self.suspended_tasks.values() {
+                let task = suspended
+                    .input_task
+                    .ok_or_else(|| self.input_failure("input-gdb-suspended-owner-missing"))?;
+                control
+                    .backend_continuation(task, None)
+                    .map_err(|error| self.input_failure(error))?;
+            }
+        }
         for (_pid, suspended_task) in core::mem::take(&mut self.suspended_tasks) {
             if let Some(tx) = suspended_task.waker.as_ref() {
                 suspended_task.suspended.store(false, Ordering::SeqCst);

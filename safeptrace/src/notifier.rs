@@ -6667,6 +6667,15 @@ thread_local! {
 }
 
 fn read_bound_stat_flags(identity: &WorkerIdentity) -> Result<u32, ProcStatError> {
+    read_bound_stat(identity, |bytes| {
+        parse_bound_stat_flags(bytes, identity.pid)
+    })
+}
+
+fn read_bound_stat<T>(
+    identity: &WorkerIdentity,
+    parse: impl FnOnce(&[u8]) -> Result<T, ProcStatError>,
+) -> Result<T, ProcStatError> {
     let _open = launch_window::TransientOpen::begin();
     let raw = unsafe {
         libc::openat(
@@ -6695,7 +6704,7 @@ fn read_bound_stat_flags(identity: &WorkerIdentity) -> Result<u32, ProcStatError
     if eof != 0 {
         return Err(ProcStatError::Format("record continued after bounded read"));
     }
-    parse_bound_stat_flags(&bytes[..count as usize], identity.pid)
+    parse(&bytes[..count as usize])
 }
 
 fn parse_bound_stat_flags(bytes: &[u8], pid: Pid) -> Result<u32, ProcStatError> {
@@ -6912,6 +6921,45 @@ impl TerminalCleanup {
             INVALID_STATUS => Ok(None),
             ECHILD_STATUS => Err(Errno::ECHILD),
             status => Ok(Some(crate::ExitStatus::from_raw(status))),
+        }
+    }
+
+    /// Observe that this retained task's memory/descriptor exit effects ended.
+    ///
+    /// This is weaker than final wait/notifier retirement: a zombie group
+    /// leader can have live siblings, so its final wait may not be available.
+    /// A final status or Z/X state proves the task passed exit_mm/exit_files
+    /// before exit_notify. PTRACE_EVENT_EXIT alone does not. The proc read is
+    /// relative to the original inode's retained PID object; a numeric TID is
+    /// never recaptured. ENOENT/ESRCH from that inode means this old task is gone,
+    /// not that a newly reused number was inspected. Other errors stay errors.
+    /// This performs no resume, wait, signal or notifier registration.
+    pub fn exit_effects_complete(&self) -> Result<bool, ProcStatError> {
+        if self
+            .observed_exit_status()
+            .is_ok_and(|status| status.is_some())
+        {
+            return Ok(true);
+        }
+        let identity = self
+            .event
+            .identity()
+            .ok_or(ProcStatError::Io(Errno::ENODATA))?;
+        if identity.pid != self.pid {
+            return Err(ProcStatError::PidMismatch);
+        }
+        match read_bound_stat(identity, |bytes| {
+            // Reuse the bounded parser's PID, comm and field validation.
+            parse_bound_stat_flags(bytes, self.pid)?;
+            let close = bytes.iter().rposition(|byte| *byte == b')').unwrap();
+            let state = bytes[close + 2..]
+                .split(|byte| byte.is_ascii_whitespace())
+                .find(|field| !field.is_empty())
+                .unwrap();
+            Ok(matches!(state, b"Z" | b"X" | b"x"))
+        }) {
+            Err(ProcStatError::Io(Errno::ENOENT | Errno::ESRCH)) => Ok(true),
+            result => result,
         }
     }
 
@@ -12102,6 +12150,60 @@ mod test {
             !Arc::ptr_eq(old_event.event(), replacement.event()),
             "terminal cleanup retained a stale PID registry entry"
         );
+    }
+
+    #[test]
+    fn exit_effects_observer_is_bound_to_the_original_task_not_a_reused_number() {
+        const INNER: &str = "SAFEPTRACE_EXIT_EFFECTS_REUSE_INNER";
+        if env::var_os(INNER).is_none() {
+            let output = run_exact_in_pid_namespace_bounded(
+                "notifier::test::exit_effects_observer_is_bound_to_the_original_task_not_a_reused_number",
+                &[(INNER, "1")],
+            ).expect("the actual reuse control requires the owned PID namespace launcher");
+            assert!(
+                output.status.success(),
+                "actual reuse control failed: {output:?}"
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("EXIT_EFFECTS_ACTUAL_REUSE"));
+            return;
+        }
+        let (pid, mut cleanup) =
+            spawn_stopped_process(Some(100)).expect("create original fixed-ID task");
+        let running = Running::new(pid.into());
+        let terminal = running.terminal_cleanup();
+        terminal.ensure_registered().unwrap();
+        assert!(!terminal.exit_effects_complete().unwrap());
+        // A mismatched generation/PID pair cannot borrow this original inode.
+        let mismatched = TerminalCleanup {
+            pid: crate::Pid::from_raw(101),
+            event: terminal.event.clone(),
+        };
+        assert!(matches!(
+            mismatched.exit_effects_complete(),
+            Err(ProcStatError::PidMismatch)
+        ));
+        cleanup
+            .store_terminal(TerminalCleanup::new_unregistered(pid.into(), &running.1))
+            .unwrap();
+        cleanup.cleanup().unwrap();
+        assert!(terminal.exit_effects_complete().unwrap());
+        let (replacement, replacement_cleanup) =
+            spawn_stopped_process(Some(100)).expect("reuse the exact old number");
+        assert_eq!(replacement, pid);
+        let replacement_running = Running::new(replacement.into());
+        let replacement_terminal = replacement_running.terminal_cleanup();
+        replacement_terminal.ensure_registered().unwrap();
+        assert!(!terminal.same_generation(&replacement_terminal));
+        assert!(
+            terminal.exit_effects_complete().unwrap(),
+            "old completion remains about the old task"
+        );
+        assert!(
+            !replacement_terminal.exit_effects_complete().unwrap(),
+            "old completion cannot certify the live replacement"
+        );
+        reap_stopped_process(replacement_cleanup);
+        println!("EXIT_EFFECTS_ACTUAL_REUSE");
     }
 
     #[test]

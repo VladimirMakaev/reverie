@@ -181,10 +181,39 @@ pub(super) fn send_signal(pid: Pid, tid: Pid, sig: AnySignal) {
 /// shown instead of its live ones, and which it may not change: the callback
 /// may be part way through injecting a syscall, and resumes the thread from
 /// registers it keeps.
+pub(super) fn check_reserved_input_write(
+    input: Option<&(
+        reverie::reserved_input::ReservedInputControl,
+        reverie::reserved_input::InputTaskId,
+    )>,
+    address: u64,
+    length: usize,
+) -> Result<(), TraceError> {
+    let Some((control, task)) = input else {
+        return Ok(());
+    };
+    let Some(layout) = control.layout(*task) else {
+        return Ok(());
+    };
+    if layout
+        .possibly_overlaps(address, length)
+        .map_err(|_| Errno::EFAULT)?
+    {
+        // This error belongs to the debugger request, not a guest syscall.
+        // Ordinary application memory keeps its existing debugger semantics.
+        return Err(Errno::EPERM.into());
+    }
+    Ok(())
+}
+
 pub(super) struct GdbTracee<'a> {
     pub(super) task: &'a mut Stopped,
     pub(super) breakpoints: &'a StdMutex<HashMap<u64, u64>>,
     pub(super) parked_registers: Option<&'a CoreRegs>,
+    pub(super) reserved_input: Option<(
+        reverie::reserved_input::ReservedInputControl,
+        reverie::reserved_input::InputTaskId,
+    )>,
 }
 
 fn lock_breakpoints(
@@ -230,6 +259,11 @@ impl GdbTracee<'_> {
     }
 
     fn add_breakpoint(&mut self, addr: u64) -> Result<(), TraceError> {
+        check_reserved_input_write(
+            self.reserved_input.as_ref(),
+            addr,
+            std::mem::size_of::<u64>(),
+        )?;
         if let Some(bkpt_addr) = AddrMut::from_raw(addr as usize) {
             let task = &mut *self.task;
             // The word read here can include the int3 of another live
@@ -253,6 +287,11 @@ impl GdbTracee<'_> {
     }
 
     fn remove_breakpoint(&mut self, addr: u64) -> Result<(), TraceError> {
+        check_reserved_input_write(
+            self.reserved_input.as_ref(),
+            addr,
+            std::mem::size_of::<u64>(),
+        )?;
         let insn = lock_breakpoints(self.breakpoints)
             .remove(&addr)
             .ok_or(Errno::ENOENT)?;
@@ -299,6 +338,7 @@ impl GdbTracee<'_> {
 
     fn write_memory(&mut self, addr: u64, size: usize, data: Vec<u8>) -> Result<(), TraceError> {
         let size = std::cmp::min(size, data.len());
+        check_reserved_input_write(self.reserved_input.as_ref(), addr, size)?;
         let addr = AddrMut::from_raw(addr as usize).ok_or(Errno::EFAULT)?;
         self.task.write(addr, &data[..size])?;
         Ok(())
@@ -371,6 +411,10 @@ pub(super) struct ParkedForGdb {
     pub(super) regs: libc::user_regs_struct,
     pub(super) core_regs: CoreRegs,
     pub(super) breakpoints: Arc<StdMutex<HashMap<u64, u64>>>,
+    pub(super) reserved_input: Option<(
+        reverie::reserved_input::ReservedInputControl,
+        reverie::reserved_input::InputTaskId,
+    )>,
     pub(super) view: ThreadView,
     pub(super) ports: GdbPorts,
     pub(super) stop_tx: Option<mpsc::Sender<StoppedInferior>>,
@@ -506,6 +550,7 @@ impl ParkedForGdb {
                 task: &mut self.task,
                 breakpoints: &self.breakpoints,
                 parked_registers: Some(&self.core_regs),
+                reserved_input: self.reserved_input.clone(),
             };
             let resumed =
                 serve_gdb_stop(&mut ports, Some(stop_tx), |request| tracee.answer(request)).await;
