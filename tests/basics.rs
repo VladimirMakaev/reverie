@@ -114,6 +114,18 @@ fn record_rust_command(
         output.stdout,
         output.stderr,
     );
+    // The command and controller have completed before this snapshot or output.
+    let (count, sequence) = {
+        let sequence = state.syscall_sequence.lock().unwrap();
+        (state.num_syscalls.load(Ordering::SeqCst), sequence.clone())
+    };
+    let entries: Vec<_> = sequence
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (sender, sysno))| (ordinal, sender, *sysno as usize, sysno))
+        .collect();
+    eprintln!("basics Rust syscall sequence {label}: count={count} entries={entries:?}");
+    assert_eq!(count, u64::try_from(sequence.len()).unwrap());
     assert_eq!(output.status, ExitStatus::Exited(0));
     assert_eq!(output.stderr.len(), 0);
     assert_rust_marker(&output.stdout);
