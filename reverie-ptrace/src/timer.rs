@@ -54,7 +54,7 @@
 //!
 //! Proper use of timers requires that all delivered signals of type
 //! `Timer::signal_type()` be passed through `Timer::accept_signal` and
-//! `Timer::deliver_accepted`, and that `Timer::observe_event()` be called
+//! `Timer::deliver_accepted`, and that `Timer::observe_stop()` be called
 //! whenever a Tool-observable reverie event occurs. A caller that observes a
 //! stop before it knows whether the Tool observes it must pass a stop that
 //! the Tool does not observe to `Timer::disregard_stop()`, and finish what of
