@@ -1160,7 +1160,6 @@ pub(super) fn munlock_range(address: u64, length: u64) -> Option<(u64, u64)> {
     (page_start.wrapping_add(page_length) >= page_start).then_some((page_start, page_length))
 }
 
-
 /// `mincore(2)` range validation only. Residency is the Tool's decision,
 /// because host page residency is nondeterministic: a Tool that answers
 /// mincore writes the residency bytes after this call. LinuxEmu keeps
