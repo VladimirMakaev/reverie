@@ -381,3 +381,32 @@ Tool; the producer authenticates the complete current dependency closure.
 when the test target enables `dbt`. DBT startup tail completion is unsupported;
 this returning-injection case does not claim otherwise. These generic tests do
 not establish syscall-stream parity, exact hook counts, or deterministic time.
+## Guarded stack allocations through the shared Tool
+
+The `stack` target registers all three original ptrace identities in both default
+and `dbt` modes. `tests::stack_two_allocs_good` shares its original raw
+`exit_group(0)` guest and `LocalState3` with an ordinary Rust command image.
+The Tool preserves both scoped stack guards and the exact write/read assertions
+for 3333 and 4444. Only after both scopes have ended, before the existing terminal
+exit injection, it sends an awaited unit RPC. A shared test-only GlobalTool records
+that message in a default-false `AtomicBool`. The original function test and the
+ptrace/DBT command runs check the actual returned flag; this is an additive Tool
+observation, not an unchanged-Tool claim. The same native image is an exit-zero,
+empty-stream launch control without a Tool receipt. Raw command output, status
+and returned flag are printed before assertions.
+
+The default target has three tests; feature `dbt` adds an independent typed
+missing-manifest guard, for four. The good identity additionally runs native,
+ptrace and authenticated DBT commands. The other two original Tools, guest bodies
+and the broad `#[should_panic]` predicate remain unchanged and ptrace-only.
+Focused validation must retain the bad case's raw panic and require the intended
+live-guard checkout invariant from `reverie-ptrace/src/stack.rs`, rather than
+accepting an unrelated setup panic as the negative control.
+
+This tests Tool-accessible scratch memory while each guard is alive. It does not
+establish application stack layout, kernel pointer marshalling, exact hook counts,
+Noop sensitivity or general Stack parity. The allocator sibling drops guards
+before using addresses, while DBT guards own their arena. The bad sibling expects
+ptrace's single-live-checkout invariant; DBT uses independent arenas. Neither is
+ported to DBT here.
+

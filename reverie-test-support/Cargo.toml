@@ -62,6 +62,10 @@ path = "../tests/inject_then_tail.rs"
 name = "at_random"
 path = "../tests/at_random.rs"
 
+[[test]]
+name = "stack"
+path = "../tests/stack.rs"
+
 [[bin]]
 name = "stat-rust-command-guest"
 path = "../tests/fixtures/stat-rust-command.rs"
@@ -107,6 +111,13 @@ required-features = ["dbt"]
 [[bin]]
 name = "thread-start-rust-command-guest"
 path = "../tests/fixtures/thread-start-rust-command.rs"
+test = false
+bench = false
+required-features = ["dbt"]
+
+[[bin]]
+name = "stack-rust-command-guest"
+path = "../tests/fixtures/stack-rust-command.rs"
 test = false
 bench = false
 required-features = ["dbt"]

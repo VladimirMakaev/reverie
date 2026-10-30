@@ -225,6 +225,7 @@ rust_library(
                 {"name": "vdso", "path": "../tests/vdso.rs"},
                 {"name": "inject_then_tail", "path": "../tests/inject_then_tail.rs"},
                 {"name": "at_random", "path": "../tests/at_random.rs"},
+                {"name": "stack", "path": "../tests/stack.rs"},
                 {"name": "dbt_command", "path": "tests/dbt_command.rs", "required-features": ["dbt"]},
             ],
             "bin": [
@@ -262,6 +263,12 @@ rust_library(
             }, {
                 "name": "thread-start-rust-command-guest",
                 "path": "../tests/fixtures/thread-start-rust-command.rs",
+                "test": False,
+                "bench": False,
+                "required-features": ["dbt"],
+            }, {
+                "name": "stack-rust-command-guest",
+                "path": "../tests/fixtures/stack-rust-command.rs",
                 "test": False,
                 "bench": False,
                 "required-features": ["dbt"],
@@ -415,6 +422,24 @@ rust_unittest(
     deps = [
         "fbsource//third-party/rust:tempfile",
         ":reverie",
+        ":reverie-test-support",
+    ],
+)
+
+rust_unittest(
+    name = "generic-stack",
+    srcs = [
+        "tests/stack.rs",
+        "tests/support/stack_rust_guest.rs",
+        "tests/tool_fixtures/stack.rs",
+    ],
+    crate_root = "tests/stack.rs",
+    rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+        ":reverie",
+        ":reverie-ptrace",
         ":reverie-test-support",
     ],
 )

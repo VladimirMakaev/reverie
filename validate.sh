@@ -830,6 +830,10 @@ run_check "DBT generic at-random caller artifact and standalone gates" \
     "$ROOT_DIR/reverie-dbt/scripts/build-client.sh" \
     --caller-manifest "$ROOT_DIR/tests/fixtures/at-random-dbt-runtime/Cargo.toml" \
     --profile debug --jobs 8 --check
+run_check "DBT generic good stack caller artifact and standalone gates" \
+    "$ROOT_DIR/reverie-dbt/scripts/build-client.sh" \
+    --caller-manifest "$ROOT_DIR/tests/fixtures/stack-dbt-runtime/Cargo.toml" \
+    --profile debug --jobs 8 --check
 # The counted runner accepts only a command that starts with `cargo test`, so
 # the fixture paths reach the tests through the environment rather than an
 # `env NAME=VALUE` prefix. They are exported for this step alone.

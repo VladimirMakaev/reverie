@@ -56,4 +56,5 @@ exclude = [
     "tests/fixtures/inject-then-tail-dbt-runtime",
     "tests/fixtures/at-random-dbt-runtime",
     "tests/fixtures/thread-start-dbt-runtime",
+    "tests/fixtures/stack-dbt-runtime",
 ]
