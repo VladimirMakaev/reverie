@@ -491,7 +491,7 @@ impl ReservedInputControl {
     /// This does not grant setup, stopped-task ownership or Tool execution.
     pub fn new_backend() -> Result<Self, InputUnavailable> {
         let run = NEXT_RUN
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| InputUnavailable::new("input-run-generation-exhausted"))?;
         Ok(Self {
             run,

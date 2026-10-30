@@ -94,11 +94,6 @@ impl NativeCallContext {
             None => task.read_value(Addr::<u64>::from_raw(address)?).ok(),
         }
     }
-    pub(super) fn future_flags(&self, nr: Sysno, args: &SyscallArgs) -> Option<u64> {
-        self.input
-            .as_ref()
-            .and_then(|input| input.future_flags(nr, args))
-    }
 }
 
 struct NativeCallActivity(NativeOperationAttempt);
@@ -698,7 +693,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             .global_state
             .fatal_session
             .native_sequence
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 old.checked_add(1)
             })
             .map_err(|_| self.input_failure("native-attempt-identity-exhausted"))?;

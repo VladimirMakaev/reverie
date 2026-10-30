@@ -582,7 +582,7 @@ const NEVER_SHIELDED: u64 = 1 << (reverie::PERF_EVENT_SIGNAL as u64 - 1)
     | 1 << (Signal::SIGSTOP as u64 - 1);
 
 /// Whether the registers of the syscall `nr` with `args` may name a temporary
-/// signal mask that `temporary_signal_mask` reads: a non-NULL mask argument
+/// signal mask that `temporary_signal_mask_prepared` reads: a non-NULL mask argument
 /// of size 8, or, for pselect6, a non-NULL wrapper. Checked before any read
 /// or ptrace request, so a call that installs no mask, such as a wait probe
 /// with a NULL mask, costs nothing.
@@ -596,23 +596,6 @@ fn may_name_temporary_signal_mask(nr: Sysno, args: &SyscallArgs) -> bool {
     }
 }
 
-/// The temporary signal mask that the syscall `nr` with `args` installs, read
-/// from the tracee: ppoll's, pselect6's, epoll_pwait's and epoll_pwait2's
-/// mask argument, or rt_sigsuspend's. `None` when the call installs none (a
-/// NULL mask), names a size other than 8, or names memory that is not mapped.
-///
-/// The words are read with `PTRACE_PEEKDATA`, which, like the kernel's own
-/// `copy_from_user`, reads an x86 write-only mapping: a valid write-only mask
-/// is shielded as a readable one is (Codex review of
-/// https://github.com/rrnewton/reverie/pull/996). It also reads a `PROT_NONE`
-/// page, which the kernel's copy faults on. Such a call is shielded too: it
-/// still fails with EFAULT at entry, before it would wait, and a pending
-/// signal is then taken after it returns, as it is after the guest's own
-/// call. io_pgetevents and io_uring_enter are not read.
-fn temporary_signal_mask(task: &Stopped, nr: Sysno, args: &SyscallArgs) -> Option<u64> {
-    temporary_signal_mask_prepared(task, nr, args, None)
-}
-
 fn preparation_word(
     task: &Stopped,
     input: Option<&NativeCallContext>,
@@ -624,6 +607,19 @@ fn preparation_word(
     }
 }
 
+/// The temporary signal mask that the syscall `nr` with `args` installs, read
+/// from the prepared input view: ppoll's, pselect6's, epoll_pwait's and
+/// epoll_pwait2's mask argument, or rt_sigsuspend's. `None` when the call installs
+/// none (a NULL mask), names a size other than 8, or names memory that is not mapped.
+///
+/// Outside a staged image, words are read with `PTRACE_PEEKDATA`, which, like
+/// the kernel's own `copy_from_user`, reads an x86 write-only mapping: a valid
+/// write-only mask is shielded as a readable one is (Codex review of
+/// https://github.com/rrnewton/reverie/pull/996). It also reads a `PROT_NONE`
+/// page, which the kernel's copy faults on. Such a call is shielded too: it
+/// still fails with EFAULT at entry, before it would wait, and a pending
+/// signal is then taken after it returns, as it is after the guest's own
+/// call. io_pgetevents and io_uring_enter are not read.
 fn temporary_signal_mask_prepared(
     task: &Stopped,
     nr: Sysno,
@@ -8302,7 +8298,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 .global_state
                 .fatal_session
                 .native_sequence
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                     old.checked_add(1)
                 })
                 .map_err(|_| self.input_failure("native-callback-identity-exhausted"))?;
@@ -8718,15 +8714,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
-    /// `syscall_stopped` for a signal that may be one nix cannot name.
-    fn syscall_stopped_any(
-        &self,
-        task: Stopped,
-        signal: Option<AnySignal>,
-    ) -> Result<Running, TraceError> {
-        self.syscall_stopped_any_input(task, signal, None)
-    }
-
+    /// `syscall_stopped_input` for a signal that may be one nix cannot name.
     fn syscall_stopped_any_input(
         &self,
         task: Stopped,
@@ -13283,7 +13271,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     ///   losing it and its siginfo.
     /// - A mask-swapping injection (`swaps_signal_mask`) shields the signals
     ///   its temporary mask blocks and the thread's own mask admits
-    ///   (`temporary_signal_mask`), except the timer's own and SIGTRAP
+    ///   (`temporary_signal_mask_prepared`), except the timer's own and SIGTRAP
     ///   (`NEVER_SHIELDED`). The private-page step returns to user space
     ///   under the thread's own mask before the syscall installs its
     ///   temporary one, so such a signal would stop the step there, and the
@@ -13528,7 +13516,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         && context.is_none() =>
                 {
                     // The guest's own pending syscall, resumed from its
-                    // syscall stop to its exit (`inner_inject`). Linux reports
+                    // syscall stop to its exit (`inner_inject_with_input`). Linux reports
                     // the exit stop before any signal-delivery stop for a
                     // syscall it ran, so this one did not run, and RAX holds
                     // no result of it. Report that it did not run, holding the
@@ -13753,7 +13741,7 @@ impl<L: Tool + 'static> TracedTask<L> {
 
     /// Runs an injection through ptrace's [`LinuxProvider`], the host kernel
     /// ([`host_linux::HostLinux`]), which runs it in this stopped tracee with
-    /// [`Self::inner_inject`].
+    /// [`Self::inner_inject_with_input`].
     ///
     /// [`LinuxProvider`]: reverie::provider::LinuxProvider
     async fn do_inject(&mut self, nr: Sysno, args: SyscallArgs) -> Result<i64, Errno> {
@@ -13811,15 +13799,6 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
     }
 
-    async fn inner_inject(
-        &mut self,
-        nr: Sysno,
-        args: SyscallArgs,
-    ) -> Result<Result<i64, Errno>, TraceError> {
-        let context = NativeCallContext::application(None);
-        self.inner_inject_with_input(nr, args, Some(&context)).await
-    }
-
     async fn inner_inject_with_input(
         &mut self,
         nr: Sysno,
@@ -13874,7 +13853,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         Ok(result)
     }
 
-    /// `inner_inject`, without forgetting SIGTRAP's disposition.
+    /// `inner_inject_with_input`, without forgetting SIGTRAP's disposition.
     async fn inner_inject_unobserved(
         &mut self,
         nr: Sysno,
@@ -13977,7 +13956,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     }
 
     /// `inner_tail_inject`, with the bookkeeping of SIGSEGV's state
-    /// (`segv_state`) that `inner_inject` keeps. An original syscall left to
+    /// (`segv_state`) that `inner_inject_with_input` keeps. An original syscall left to
     /// run on the final resume is accounted there (`note_segv_resume`).
     async fn inner_tail_inject_observed(
         &mut self,
@@ -14018,7 +13997,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         native: NativeCallContext,
     ) -> Result<Result<i64, Errno>, TraceError> {
         let tid = self.tid();
-        // As for `inner_inject`: whichever path runs it, and whenever.
+        // As for `inner_inject_with_input`: whichever path runs it, and whenever.
         if self.global_state.keeps_sigtrap_state && sets_sigtrap_action(nr, &args) {
             self.mark_sigtrap_changing();
         }

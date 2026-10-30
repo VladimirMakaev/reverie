@@ -53,13 +53,6 @@ pub(super) struct HostLinux<'a, L> {
 }
 
 impl<'a, L> HostLinux<'a, L> {
-    pub(super) fn new() -> Self {
-        Self {
-            input: None,
-            tool: PhantomData,
-        }
-    }
-
     pub(super) fn with_input(input: &'a NativeCallContext) -> Self {
         Self {
             input: Some(input),
