@@ -205,6 +205,22 @@ these tests have no local timeout.
 
 ## vDSO commands
 
+The original Rust `run_guest_vdso_clock_getres_test` keeps its ptrace function
+invocation and shares the literal body with `vdso-rust-command-guest`. With
+`dbt`, that same test also runs this ordinary Cargo-discovered image through
+ptrace and the authenticated DBT caller, using the same `LocalState`. The body
+starts with `(1,0)`, calls libc `clock_getres(CLOCK_MONOTONIC)`, and requires
+return 0 and `(0,42)`. Each command must exit 0 with empty streams; actual status
+and streams are printed before the assertions. The default and Buck function
+tests do not need Cargo's binary-path environment variable.
+
+The 42 ns result is Tool-specific; this Rust command is not a native-success
+control. Existing native-first C commands and the missing-manifest guard remain
+unchanged. Unit GlobalState does not provide application RPC evidence. This
+checks libc-mediated original-body execution, not DBT inherited-function
+support, deterministic time, exact syscall parity, or the unresolved libc/rseq
+getcpu path.
+
 The `vdso` target retains all four original ptrace function tests and shares
 their actual `LocalState` with a command fixture. The fixture resolves the
 versioned `LINUX_2.6` clock_gettime, gettimeofday, getcpu and clock_getres entries

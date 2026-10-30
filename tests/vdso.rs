@@ -14,6 +14,10 @@ mod vdso_tool;
 use vdso_tool::LocalState;
 
 #[cfg(all(not(sanitized), test))]
+#[path = "support/vdso_rust_guest.rs"]
+mod rust_guest;
+
+#[cfg(all(not(sanitized), test))]
 mod tests {
     use std::mem::MaybeUninit;
     use std::time;
@@ -103,19 +107,9 @@ mod tests {
 
     #[test]
     fn run_guest_vdso_clock_getres_test() {
-        check_fn::<LocalState, _>(|| {
-            let mut res = libc::timespec {
-                tv_sec: 1,
-                tv_nsec: 0,
-            };
-
-            let ret = unsafe { libc::clock_getres(libc::CLOCK_MONOTONIC, &mut res as *mut _) };
-
-            assert_eq!(ret, 0);
-
-            assert_eq!(res.tv_sec, 0);
-            assert_eq!(res.tv_nsec, 42);
-        });
+        check_fn::<LocalState, _>(rust_guest::clock_getres);
+        #[cfg(feature = "dbt")]
+        rust_clock_getres_command();
     }
 }
 
@@ -198,4 +192,20 @@ fn dbt_vdso_missing_artifact_refuses() {
         panic!("expected missing manifest I/O error: {error}");
     };
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[cfg(all(not(sanitized), test, feature = "dbt"))]
+fn rust_clock_getres_command() {
+    let manifest = caller_manifest();
+    reverie_dbt::CallerArtifact::load(&manifest).unwrap();
+    let program = env!("CARGO_BIN_EXE_vdso-rust-command-guest");
+    eprintln!("vdso Rust clock_getres command: image={program}");
+
+    let (output, ()) = reverie_test_support::test_cmd::<LocalState>(program, &[]).unwrap();
+    assert_command_output("rust/clock_getres/ptrace", &output);
+
+    let (output, ()) =
+        reverie_test_support::test_dbt_cmd_with_config::<LocalState>(program, &[], (), &manifest)
+            .unwrap();
+    assert_command_output("rust/clock_getres/dbt", &output);
 }

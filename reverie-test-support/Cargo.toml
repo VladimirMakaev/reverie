@@ -82,3 +82,10 @@ path = "../tests/fixtures/basics-rust-command.rs"
 test = false
 bench = false
 required-features = ["dbt"]
+
+[[bin]]
+name = "vdso-rust-command-guest"
+path = "../tests/fixtures/vdso-rust-command.rs"
+test = false
+bench = false
+required-features = ["dbt"]

@@ -218,9 +218,6 @@ rust_library(
             # DBT caller artifacts use the explicit OSS producer. Buck's
             # generic conformance targets retain their ptrace selections.
             "features": {"default": [], "dbt": ["dep:reverie-dbt"]},
-            "bin": [
-                {"name": "stat-rust-command-guest", "path": "../tests/fixtures/stat-rust-command.rs", "test": False, "bench": False, "required-features": ["dbt"]},
-            ],
             "test": [
                 {"name": "basics", "path": "../tests/basics.rs"},
                 {"name": "exit", "path": "../tests/exit.rs"},
@@ -230,7 +227,9 @@ rust_library(
                 {"name": "at_random", "path": "../tests/at_random.rs"},
                 {"name": "dbt_command", "path": "tests/dbt_command.rs", "required-features": ["dbt"]},
             ],
-            "bin": [{
+            "bin": [
+                {"name": "stat-rust-command-guest", "path": "../tests/fixtures/stat-rust-command.rs", "test": False, "bench": False, "required-features": ["dbt"]},
+            {
                 "name": "exit-rust-command-guest",
                 "path": "../tests/fixtures/exit-rust-command.rs",
                 "test": False,
@@ -239,6 +238,12 @@ rust_library(
             }, {
                 "name": "basics-rust-command-guest",
                 "path": "../tests/fixtures/basics-rust-command.rs",
+                "test": False,
+                "bench": False,
+                "required-features": ["dbt"],
+            }, {
+                "name": "vdso-rust-command-guest",
+                "path": "../tests/fixtures/vdso-rust-command.rs",
                 "test": False,
                 "bench": False,
                 "required-features": ["dbt"],
@@ -347,6 +352,7 @@ rust_unittest(
         "tests/vdso.rs",
         "tests/fixtures/vdso-command.c",
         "tests/support/vdso_command.rs",
+        "tests/support/vdso_rust_guest.rs",
         "tests/tool_fixtures/vdso.rs",
     ],
     crate_root = "tests/vdso.rs",
