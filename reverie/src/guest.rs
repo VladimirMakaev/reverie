@@ -487,6 +487,83 @@ pub trait Guest<T: Tool>: Send + GlobalRPC<T::GlobalState> {
     /// injects it again.
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno>;
 
+    /// Run-local private-input facade, when this backend installed one.
+    /// This observation alone grants neither execution nor stopped memory access.
+    fn reserved_input_control(&self) -> Option<crate::reserved_input::ReservedInputControl> {
+        None
+    }
+
+    /// Current native task incarnation in the installed input registry.
+    fn reserved_input_task(&self) -> Option<crate::reserved_input::InputTaskId> {
+        None
+    }
+
+    /// Complete actual native descriptor snapshot, retaining every OFD pin.
+    /// Pins must be dropped before logical readmission or an await.
+    fn reserved_input_descriptors(
+        &self,
+    ) -> Result<
+        crate::reserved_input::InputDescriptorSnapshot,
+        crate::reserved_input::InputUnavailable,
+    > {
+        Err(crate::reserved_input::InputUnavailable::new(
+            "input-native-descriptors-unsupported",
+        ))
+    }
+
+    /// Actual inherited exit signal of the caller's owned native process.
+    /// This is a native observation, not the requested creation argument.
+    fn reserved_input_process_exit_signal(
+        &self,
+    ) -> Result<i32, crate::reserved_input::InputUnavailable> {
+        Err(crate::reserved_input::InputUnavailable::new(
+            "input-native-exit-signal-unsupported",
+        ))
+    }
+
+    /// Inspect an actual native descriptor while retaining its open description.
+    /// The returned pin must be dropped before logical readmission or an await.
+    fn reserved_input_descriptor(
+        &self,
+        _fd: i32,
+    ) -> Result<crate::reserved_input::PinnedInputDescriptor, crate::reserved_input::InputUnavailable>
+    {
+        Err(crate::reserved_input::InputUnavailable::new(
+            "input-native-descriptor-unsupported",
+        ))
+    }
+
+    /// Inject one physical call with an explicit, backend-owned receipt.
+    /// Helper and preparation injections cannot consume this receipt.
+    async fn inject_observed<S: SyscallInfo>(
+        &mut self,
+        _syscall: S,
+        _receipt: crate::reserved_input::PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        Err(
+            crate::reserved_input::InputUnavailable::new("input-observed-injection-unsupported")
+                .into(),
+        )
+    }
+
+    /// Prepare an injection before filling the authenticated private input page.
+    /// On Ok, the exact full image was read back and the native return settled;
+    /// the inner result is the unchanged native value or errno. Unavailable is
+    /// permitted only after proved no-effect/normalization and entry settlement.
+    /// The operation scope is borrowed so a settled fallback uses the same grant.
+    async fn inject_staged_input<S: SyscallInfo>(
+        &mut self,
+        _syscall: S,
+        _scope: &crate::reserved_input::InputOperationScope,
+        _image: crate::reserved_input::ReservedInputImage,
+        _receipt: crate::reserved_input::PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        Err(
+            crate::reserved_input::InputUnavailable::new("input-staged-injection-unsupported")
+                .into(),
+        )
+    }
+
     /// Inject with the closed interception purpose described by [InjectionPurpose].
     ///
     /// The actual task/provider, ownership checks and register restoration are
@@ -1560,6 +1637,58 @@ where
 
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
         self.inner.inject(syscall).await
+    }
+
+    fn reserved_input_control(&self) -> Option<crate::reserved_input::ReservedInputControl> {
+        self.inner.reserved_input_control()
+    }
+
+    fn reserved_input_task(&self) -> Option<crate::reserved_input::InputTaskId> {
+        self.inner.reserved_input_task()
+    }
+
+    /// Complete actual native descriptor snapshot, retaining every OFD pin.
+    fn reserved_input_descriptors(
+        &self,
+    ) -> Result<
+        crate::reserved_input::InputDescriptorSnapshot,
+        crate::reserved_input::InputUnavailable,
+    > {
+        self.inner.reserved_input_descriptors()
+    }
+
+    fn reserved_input_process_exit_signal(
+        &self,
+    ) -> Result<i32, crate::reserved_input::InputUnavailable> {
+        self.inner.reserved_input_process_exit_signal()
+    }
+
+    fn reserved_input_descriptor(
+        &self,
+        fd: i32,
+    ) -> Result<crate::reserved_input::PinnedInputDescriptor, crate::reserved_input::InputUnavailable>
+    {
+        self.inner.reserved_input_descriptor(fd)
+    }
+
+    async fn inject_observed<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        receipt: crate::reserved_input::PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        self.inner.inject_observed(syscall, receipt).await
+    }
+
+    async fn inject_staged_input<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        scope: &crate::reserved_input::InputOperationScope,
+        image: crate::reserved_input::ReservedInputImage,
+        receipt: crate::reserved_input::PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, crate::reserved_input::InputInjectionError> {
+        self.inner
+            .inject_staged_input(syscall, scope, image, receipt)
+            .await
     }
 
     async fn inject_with_purpose<S: SyscallInfo>(

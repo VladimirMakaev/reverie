@@ -3877,6 +3877,23 @@ type AttachedRun = (
     Arc<FatalSession>,
 );
 
+fn input_facility<T: Tool>(
+    config: &<T::GlobalState as GlobalTool>::Config,
+) -> Result<Option<reverie::reserved_input::ReservedInputControl>, Error> {
+    if T::reserved_input_requirement(config).is_none() {
+        return Ok(None);
+    }
+    if !T::enforces_serialized_execution(config) {
+        return Err(reverie::Error::Tool(anyhow::Error::new(
+            reverie::reserved_input::InputUnavailable::new("input-serialized-execution-required"),
+        ))
+        .into());
+    }
+    reverie::reserved_input::ReservedInputControl::new_backend()
+        .map(Some)
+        .map_err(|error| reverie::Error::Tool(anyhow::Error::new(error)).into())
+}
+
 /// Helper function for everything after the child is spawned.
 #[tracing::instrument(
     target = "reverie_ptrace::lifecycle",
@@ -3951,6 +3968,7 @@ async fn postspawn<L: Tool + 'static>(
     tests::retain_fatal_root_observer_for_test(&child);
     tracer.arm_liteinst_root_stop(&child, &Event::Signal(Signal::SIGSTOP));
     ordinary_session.capture_root(&child);
+    tracer.initialize_reserved_input_root(&child)?;
     if !ordinary_session.is_failed() {
         child = match tracer.postspawn_preinit(child).await? {
             PostspawnPreinit::Outcome(PreinitOutcome::Ready(child)) => child,
@@ -4231,7 +4249,12 @@ impl<T: Tool + 'static> TracerBuilder<T> {
 
         // Because this ptrace backend is CENTRALIZED, it can keep all the
         // tool's state here in a single address space.
-        let global_state = <T::GlobalState as GlobalTool>::init_global_state(&config).await;
+        T::facility_admission(&config)?;
+        let reserved_input = input_facility::<T>(&config)?;
+        let mut global_state = <T::GlobalState as GlobalTool>::init_global_state(&config).await;
+        if let Some(control) = reserved_input.clone() {
+            global_state.install_reserved_input_control(control)?;
+        }
         let events = T::subscriptions(&config);
         let gref = Arc::new(global_state);
 
@@ -4315,6 +4338,7 @@ impl<T: Tool + 'static> TracerBuilder<T> {
             gref.clone(),
             config,
             TracedTaskOptions {
+                reserved_input,
                 command_bootstrap: true,
                 events: &events,
                 injected_syscall_trap: self.injected_syscall_trap,
@@ -4450,7 +4474,12 @@ where
     let _ordinary_admission = OrdinaryAdmission::acquire()?;
     // Because this ptrace backend is CENTRALIZED, it can keep all the
     // tool's state here in a single address space.
-    let global_state = <L::GlobalState as GlobalTool>::init_global_state(&config).await;
+    L::facility_admission(&config)?;
+    let reserved_input = input_facility::<L>(&config)?;
+    let mut global_state = <L::GlobalState as GlobalTool>::init_global_state(&config).await;
+    if let Some(control) = reserved_input.clone() {
+        global_state.install_reserved_input_control(control)?;
+    }
     let events = L::subscriptions(&config);
     let gref = Arc::new(global_state);
 
@@ -4529,6 +4558,7 @@ where
                 gref.clone(),
                 config,
                 TracedTaskOptions {
+                    reserved_input,
                     command_bootstrap: false,
                     events: &events,
                     injected_syscall_trap: None,

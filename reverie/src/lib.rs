@@ -90,6 +90,8 @@ pub mod provider;
 #[cfg(target_arch = "x86_64")]
 mod rdtsc;
 mod regs;
+/// Nonserialized ownership for private input and physical native attempts.
+pub mod reserved_input;
 mod signal;
 mod signal_delivery;
 mod signal_observation;

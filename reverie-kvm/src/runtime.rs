@@ -2320,6 +2320,12 @@ impl<T: Tool> Guest<T> for KvmGuest<'_, T> {
         self.executor.pidfd_self_spelling()
     }
 
+    // This backend has no stopped-generation private input implementation.
+    // The typed default injection methods refuse without issuing a native call.
+    fn reserved_input_control(&self) -> Option<reverie::reserved_input::ReservedInputControl> {
+        None
+    }
+
     type Memory = UserMemory;
     type Stack = KvmStack;
 
@@ -5707,6 +5713,7 @@ impl KvmBackend {
         T: Tool,
         E: SyscallExecutor,
     {
+        T::facility_admission(&config).map_err(Error::Reverie)?;
         // Any return finishes the run. Only a dropped or unwinding run leaves
         // its backend abandoned.
         let admission = RunAdmission::begin(&self.abandoned_runs)?;
@@ -6098,6 +6105,7 @@ impl KvmBackend {
         T::GlobalState: 'static,
         <T::GlobalState as GlobalTool>::Config: 'static,
     {
+        T::facility_admission(&config).map_err(Error::Reverie)?;
         // Any return, including a setup error, finishes the run. Only a
         // dropped or unwinding run leaves its backend abandoned.
         let admission = RunAdmission::begin(&self.abandoned_runs)?;

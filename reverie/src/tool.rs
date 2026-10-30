@@ -31,6 +31,23 @@ use crate::rdtsc::Rdtsc;
 #[cfg(target_arch = "x86_64")]
 use crate::rdtsc::RdtscResult;
 
+/// Static stream role of a Tool, independent of mutable run configuration.
+///
+/// This pure declaration is not serialized. A composing Tool must explicitly
+/// propagate its inner role; absence of a declaration is not a plain stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolStreamRole {
+    /// The stream contract is not known.
+    #[default]
+    Unknown,
+    /// No binary recording or replay stream is interpreted.
+    Plain,
+    /// Produces a binary stream.
+    BinaryRecord,
+    /// Interprets a binary stream.
+    BinaryReplay,
+}
+
 /// Whether code running in the observed address space creates execution only
 /// through the backend's managed runtime.
 ///
@@ -154,6 +171,44 @@ pub trait GlobalTool: Send + Sync + Default {
     /// Initialize the tool, allocating the global state.
     async fn init_global_state(_cfg: &Self::Config) -> Self {
         Default::default()
+    }
+
+    /// Install the backend-owned local input registry before guest creation.
+    /// The handle is never part of Config, RPC, or serialized thread state.
+    fn install_reserved_input_control(
+        &mut self,
+        _control: crate::reserved_input::ReservedInputControl,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Observe a native task incarnation before logical retirement can name it.
+    /// Called synchronously outside all registry locks.
+    fn on_reserved_input_task(
+        &self,
+        _task: crate::reserved_input::InputTaskRegistration,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Admit physical initial facts before callbacks can expose a target image.
+    /// The default does not certify an environment for private input.
+    fn admit_reserved_input_initial_state(
+        &self,
+        _facts: &crate::reserved_input::InputNativeFacts,
+    ) -> Result<crate::reserved_input::InputAdmission, Error> {
+        Ok(crate::reserved_input::InputAdmission::Unqualified(
+            crate::reserved_input::InputUnavailable::new("input-native-state-not-admitted"),
+        ))
+    }
+
+    /// Observe actual target-image setup, including unsuccessful qualification.
+    /// A launch bootstrap is not a target image. No default or Drop path emits it.
+    fn on_reserved_input_setup(
+        &self,
+        _receipt: crate::reserved_input::InputSetupReceipt,
+    ) -> Result<(), Error> {
+        Ok(())
     }
 
     /// Offer the actual launcher-created input before sharing this run's global
@@ -699,6 +754,25 @@ pub trait Tool: Send + Sync + Default {
     /// change.
     fn new(_pid: Pid, _cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
         Default::default()
+    }
+
+    /// Pure static role of this Tool's stream, independent of Config booleans.
+    fn stream_role() -> ToolStreamRole {
+        ToolStreamRole::Unknown
+    }
+
+    /// Operational facility admission before global initialization or launch.
+    /// Backends call this explicitly; subscription queries must remain pure.
+    fn facility_admission(_cfg: &<Self::GlobalState as GlobalTool>::Config) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Pure request for one fixed private input page, or no mapping at all.
+    /// Backends additionally require serialized execution before enabling it.
+    fn reserved_input_requirement(
+        _cfg: &<Self::GlobalState as GlobalTool>::Config,
+    ) -> Option<crate::reserved_input::ReservedInputRequirement> {
+        None
     }
 
     /// Events the tool subscribes to. This is only called *once* for the entire

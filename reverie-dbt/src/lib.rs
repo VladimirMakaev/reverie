@@ -1059,6 +1059,12 @@ impl<T> Guest<T> for DbtGuest<'_, T>
 where
     T: Tool,
 {
+    // This backend has no stopped-generation private input implementation.
+    // The typed default injection methods refuse without issuing a native call.
+    fn reserved_input_control(&self) -> Option<reverie::reserved_input::ReservedInputControl> {
+        None
+    }
+
     type Memory = DbtMemory;
     type Stack = DbtStack;
 

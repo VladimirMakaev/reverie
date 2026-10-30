@@ -1061,6 +1061,22 @@ impl std::hash::Hash for ExitStopMark {
     fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
 }
 
+/// Native Linux PTRACE_GET_RSEQ_CONFIGURATION reply, without Tool interpretation.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RseqConfiguration {
+    /// Registered userspace address, or zero.
+    pub address: u64,
+    /// Registered region size.
+    pub length: u32,
+    /// Registered instruction signature.
+    pub signature: u32,
+    /// Kernel-reported flags.
+    pub flags: u32,
+    /// Reserved ABI padding, retained for exact native request size.
+    pub padding: u32,
+}
+
 impl Stopped {
     /// Helper for converting from the Errno type.
     ///
@@ -1330,6 +1346,26 @@ impl Stopped {
             .map_err(|err| self.map_err(err))?;
 
         Ok(())
+    }
+
+    /// Read the kernel's actual rseq registration under this stopped generation.
+    /// A failed request remains an error, never an invented unregistered state.
+    pub fn rseq_configuration(&self) -> Result<RseqConfiguration, Errno> {
+        let mut config = RseqConfiguration::default();
+        let size = core::mem::size_of::<RseqConfiguration>();
+        let returned = self.1.on_held_tid(|| unsafe {
+            syscalls::syscall!(
+                Sysno::ptrace,
+                0x420f_u32,
+                self.0.as_raw(),
+                size,
+                &mut config as *mut _
+            )
+        })?;
+        if returned != size {
+            return Err(Errno::EPROTO);
+        }
+        Ok(config)
     }
 
     /// Reads the word at byte `offset` of the tracee's `struct user`

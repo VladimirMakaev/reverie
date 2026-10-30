@@ -165,6 +165,8 @@ fn observe_ready_thread_state<T: Tool>(
 
 mod gdb_stop;
 mod host_linux;
+mod reserved_input;
+use reserved_input::NativeInputCall;
 
 #[cfg(test)]
 mod thread_state_ready_tests;
@@ -604,7 +606,27 @@ fn may_name_temporary_signal_mask(nr: Sysno, args: &SyscallArgs) -> bool {
 /// signal is then taken after it returns, as it is after the guest's own
 /// call. io_pgetevents and io_uring_enter are not read.
 fn temporary_signal_mask(task: &Stopped, nr: Sysno, args: &SyscallArgs) -> Option<u64> {
-    let read = |address: usize| task.read_value(Addr::<u64>::from_raw(address)?).ok();
+    temporary_signal_mask_prepared(task, nr, args, None)
+}
+
+fn preparation_word(
+    task: &Stopped,
+    input: Option<&NativeInputCall>,
+    address: usize,
+) -> Option<u64> {
+    match input {
+        Some(input) => input.preparation_word(task, address),
+        None => task.read_value(Addr::<u64>::from_raw(address)?).ok(),
+    }
+}
+
+fn temporary_signal_mask_prepared(
+    task: &Stopped,
+    nr: Sysno,
+    args: &SyscallArgs,
+    input: Option<&NativeInputCall>,
+) -> Option<u64> {
+    let read = |address| preparation_word(task, input, address);
     let (mask, size) = match nr {
         Sysno::rt_sigsuspend => (args.arg0, args.arg1),
         Sysno::ppoll => (args.arg3, args.arg4),
@@ -1654,6 +1676,23 @@ fn next_instruction_raises_sigtrap(task: &Stopped) -> Result<bool, TraceError> {
 /// also reads a `PROT_NONE` page, and a foreign read ignores the guest's
 /// protection keys. Whether the call installed it is decided from the call's
 /// result (`repair_sigtrap_after_injection`).
+fn read_sigaction_prepared(
+    task: &Stopped,
+    address: usize,
+    input: Option<&NativeInputCall>,
+) -> Option<KernelSigaction> {
+    if input.is_none() {
+        return read_sigaction_forced(task, address);
+    }
+    let word = |offset| preparation_word(task, input, address.checked_add(offset)?);
+    Some(KernelSigaction {
+        handler: word(0)?,
+        flags: word(8)?,
+        restorer: word(16)?,
+        mask: word(24)?,
+    })
+}
+
 fn read_sigaction_forced(task: &Stopped, address: usize) -> Option<KernelSigaction> {
     if let Some(action) =
         Addr::<KernelSigaction>::from_raw(address).and_then(|address| task.read_value(address).ok())
@@ -2443,6 +2482,13 @@ fn kernel_task_flags(tid: Pid) -> std::io::Result<u64> {
 /// actual error until the entire tree has completed its real terminal waits.
 #[derive(Default)]
 pub(crate) struct FatalSession {
+    reserved_input: Option<reverie::reserved_input::ReservedInputControl>,
+    input_generations: StdMutex<
+        Vec<(
+            Arc<safeptrace::TerminalCleanup>,
+            reverie::reserved_input::InputTaskId,
+        )>,
+    >,
     ptracer_thread: Option<std::thread::ThreadId>,
     ptracer_controller: StdMutex<Option<PtracerController>>,
     callback_diagnostics: StdMutex<Vec<crate::PtraceCallbackDiagnostic>>,
@@ -2781,6 +2827,7 @@ impl FatalSession {
         tree.newborns
             .push(FatalNewborn::with_controller(parent, child, controller));
         drop(tree);
+        self.capture_input_birth(parent, child);
         match crate::tracer::TraceeIdentity::capture_event_child(child.pid(), parent, op) {
             Ok(identity) => self
                 .groups
@@ -2984,6 +3031,7 @@ impl FatalSession {
     }
 
     fn finished(&self, stop: &FatalTaskStop) {
+        self.finish_input_generation(&stop.terminal);
         let mut tree = self.tree.lock().unwrap();
         tree.tasks
             .retain(|task| !task.terminal.same_generation(&stop.terminal));
@@ -3005,6 +3053,7 @@ impl FatalSession {
     pub(crate) fn finished_unhanded(&self, terminal: &safeptrace::TerminalCleanup) {
         // Called by the sole newborn owner only after its actual final status
         // and worker retirement. A refusal/Pending keeps all these authorities.
+        self.finish_input_generation(terminal);
         let mut tree = self.tree.lock().unwrap();
         tree.unconfirmed_newborns
             .retain(|(_, entry)| !entry.same_generation(terminal));
@@ -3268,10 +3317,15 @@ impl FatalSession {
             changed.await;
         }
     }
-    fn new<G: GlobalTool + 'static>(global: &Arc<G>, root: Pid) -> Self {
+    fn new<G: GlobalTool + 'static>(
+        global: &Arc<G>,
+        root: Pid,
+        reserved_input: Option<reverie::reserved_input::ReservedInputControl>,
+    ) -> Self {
         let weak = Arc::downgrade(global);
         let fatal_weak = weak.clone();
         Self {
+            reserved_input,
             root: Some(root),
             ptracer_thread: Some(std::thread::current().id()),
             reporter: Some(Box::new(move |origin| {
@@ -3884,6 +3938,7 @@ impl fmt::Debug for SyscallArgsForLog {
 
 /// Event configuration supplied when a traced task is created.
 pub(crate) struct TracedTaskOptions<'a> {
+    pub(crate) reserved_input: Option<reverie::reserved_input::ReservedInputControl>,
     pub(crate) command_bootstrap: bool,
     pub(crate) events: &'a Subscription,
     pub(crate) injected_syscall_trap: Option<InjectedSyscallTrap>,
@@ -3899,6 +3954,9 @@ pub(crate) struct TracedTaskOptions<'a> {
 /// Our runtime representation of what Reverie knows about a guest thread. Its
 /// lifetime matches the lifetime of the thread.
 pub struct TracedTask<L: Tool> {
+    // Native registry identity; never stored in serialized Tool thread state.
+    reserved_input_task: Option<reverie::reserved_input::InputTaskId>,
+    reserved_input_initial: Option<reverie::reserved_input::InputAdmission>,
     // Shared with the original fatal owner before any callback can suspend.
     // Driver refusals and cancelled adapters keep their exact core here.
     pub(crate) ptracer_waits: Arc<PtracerWaitOwner>,
@@ -4320,7 +4378,11 @@ impl<L: Tool> TracedTask<L> {
         L::GlobalState: 'static,
     {
         let process_state = Arc::new(L::new(tid, &cfg));
-        let fatal_session = Arc::new(FatalSession::new(&gs_ref, tid));
+        let fatal_session = Arc::new(FatalSession::new(
+            &gs_ref,
+            tid,
+            options.reserved_input.clone(),
+        ));
         // The report reads an x86-64 signal frame (`report_sigreturn`).
         let reports_sigreturns =
             cfg!(target_arch = "x86_64") && L::observes_sigreturns(&cfg) && gdbserver.is_none();
@@ -4409,6 +4471,8 @@ impl<L: Tool> TracedTask<L> {
         let (exit_suspend_tx, exit_suspend_rx) = mpsc::channel(16);
         let sigtrap_table = global_state.sigtrap_tables.lock().unwrap().copy(tid, None);
         Self {
+            reserved_input_task: None,
+            reserved_input_initial: None,
             tid,
             pid: tid,
             ppid: None,
@@ -4524,6 +4588,13 @@ impl<L: Tool> TracedTask<L> {
         let (exit_suspend_tx, exit_suspend_rx) = mpsc::channel(16);
         self.ntasks.fetch_add(1, Ordering::SeqCst);
         Self {
+            reserved_input_task: self
+                .global_state
+                .fatal_session
+                .reserved_input
+                .as_ref()
+                .and_then(|control| control.task_identity(child.as_raw())),
+            reserved_input_initial: self.reserved_input_initial.clone(),
             tid: child,
             pid: self.pid,
             ppid: self.ppid,
@@ -4651,6 +4722,13 @@ impl<L: Tool> TracedTask<L> {
         let (exit_suspend_tx, exit_suspend_rx) = mpsc::channel(16);
         self.ntasks.fetch_add(1, Ordering::SeqCst);
         Self {
+            reserved_input_task: self
+                .global_state
+                .fatal_session
+                .reserved_input
+                .as_ref()
+                .and_then(|control| control.task_identity(child.as_raw())),
+            reserved_input_initial: self.reserved_input_initial.clone(),
             tid: child,
             pid: child,
             ppid: Some(self.pid),
@@ -5283,6 +5361,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             let shielded =
                 shield_sigtrap && owner.shield_sigtrap_for_step(&task, "pre-init mmap")?;
             // Execute the injected mmap call.
+            owner.input_continuation(None)?;
             let mut running = RootStopLease::new(task, held_root_stop.clone()).step(None)?;
             #[cfg(test)]
             at_preinit_point(
@@ -5334,6 +5413,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                                 reverie::UnreportedSignalReason::DuringInitialization,
                             )
                             .await;
+                        owner.input_continuation(None)?;
                         running =
                             RootStopLease::new(task, held_root_stop.clone()).resume_any(sig)?;
                     }
@@ -5341,6 +5421,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         // Injected mmap trapped. We may not necessarily
                         // intercept a seccomp event here if the tool hasn't
                         // subscribed to the mmap syscall.
+                        owner.input_continuation(None)?;
                         running = RootStopLease::new(task, held_root_stop.clone()).resume(None)?;
                     }
                     unknown => {
@@ -5625,6 +5706,8 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.has_cpuid_interception = true;
         }
 
+        let task = self.setup_reserved_input(task).await?;
+
         // Restore registers again after we've injected syscalls so that we
         // don't leave the return value register (%rax) in a dirty state.
         task.setregs(&regs)?;
@@ -5778,6 +5861,9 @@ impl<L: Tool + 'static> TracedTask<L> {
     /// Resumes the root from its exit stop during initialization and returns
     /// its final status.
     async fn preinit_exit_stop(&self, stopped: Stopped) -> Result<PreinitOutcome, TraceError> {
+        // Publish any unsettled input failure before the exit-drain continuation.
+        // Cleanup must still reap the actual task after a fatal publication.
+        let _ = self.input_cancelled();
         let held_root_stop = self.liteinst_root_stop_slot();
         let mut wait =
             match Self::wait_after_exit_event(stopped, &self.ptracer_waits, held_root_stop).await {
@@ -5974,7 +6060,25 @@ impl<L: Tool + 'static> TracedTask<L> {
         // wrote; every later one is a trap the kernel just reported, which
         // nothing here writes, so it takes the one-call probe.
         let mut first_step = self.held_siginfo_written.swap(false, Ordering::Relaxed);
+        let input_control = self.input_control();
+        let input_task = self.reserved_input_task;
+        let input_session = self.fatal_session();
+        let input_pid = self.pid();
         let mut step = move |task: Stopped, unit| {
+            if let (Some(control), Some(identity)) = (&input_control, input_task)
+                && let Err(error) = control.backend_continuation(identity, None)
+            {
+                control.backend_fail(error.to_string());
+                input_session.fail_at(
+                    BackendFailure {
+                        pid: input_pid,
+                        tid: task.pid(),
+                        phase: "ptrace input timer continuation",
+                    },
+                    error.into(),
+                );
+                return Err(Errno::ECANCELED.into());
+            }
             if !filtered {
                 step_shield.lock().unwrap().prepare(&task)?;
             }
@@ -6227,7 +6331,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                 .tracee_context(tid, "handle exec stop"),
             Event::Seccomp => self.handle_seccomp(stopped).await,
             Event::NewChild(op, child) => self
-                .handle_new_task(op, stopped, child, None, None)
+                .handle_new_task(op, stopped, child, None, None, None)
                 .await
                 .tracee_context(tid, "handle new tracee stop"),
             Event::VforkDone => self
@@ -7776,6 +7880,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             || task.terminal_cleanup(),
             PreinitPoint::PostExecDrained,
         );
+        self.reserved_input_exec_begin(&task)?;
         let task = match self.tracee_preinit(task, PreinitPlace::AtExec).await? {
             PreinitOutcome::Ready(task) => task,
             #[cfg(target_arch = "x86_64")]
@@ -8338,6 +8443,16 @@ impl<L: Tool + 'static> TracedTask<L> {
         task: Stopped,
         signal: T,
     ) -> Result<Running, TraceError> {
+        self.resume_stopped_input(task, signal, None)
+    }
+
+    fn resume_stopped_input<T: Into<Option<Signal>>>(
+        &self,
+        task: Stopped,
+        signal: T,
+        input: Option<&NativeInputCall>,
+    ) -> Result<Running, TraceError> {
+        self.input_continuation(input)?;
         if self.global_state.fatal_session.is_failed() {
             return Err(Errno::ECANCELED.into());
         }
@@ -8354,6 +8469,16 @@ impl<L: Tool + 'static> TracedTask<L> {
         task: Stopped,
         signal: T,
     ) -> Result<Running, TraceError> {
+        self.step_stopped_input(task, signal, None)
+    }
+
+    fn step_stopped_input<T: Into<Option<Signal>>>(
+        &self,
+        task: Stopped,
+        signal: T,
+        input: Option<&NativeInputCall>,
+    ) -> Result<Running, TraceError> {
+        self.input_continuation(input)?;
         if self.global_state.fatal_session.is_failed() {
             return Err(Errno::ECANCELED.into());
         }
@@ -8372,6 +8497,16 @@ impl<L: Tool + 'static> TracedTask<L> {
         task: Stopped,
         signal: T,
     ) -> Result<Running, TraceError> {
+        self.syscall_stopped_input(task, signal, None)
+    }
+
+    fn syscall_stopped_input<T: Into<Option<Signal>>>(
+        &self,
+        task: Stopped,
+        signal: T,
+        input: Option<&NativeInputCall>,
+    ) -> Result<Running, TraceError> {
+        self.input_continuation(input)?;
         if self.global_state.fatal_session.is_failed() {
             return Err(Errno::ECANCELED.into());
         }
@@ -8390,6 +8525,16 @@ impl<L: Tool + 'static> TracedTask<L> {
         task: Stopped,
         signal: Option<AnySignal>,
     ) -> Result<Running, TraceError> {
+        self.resume_stopped_any_input(task, signal, None)
+    }
+
+    fn resume_stopped_any_input(
+        &self,
+        task: Stopped,
+        signal: Option<AnySignal>,
+        input: Option<&NativeInputCall>,
+    ) -> Result<Running, TraceError> {
+        self.input_continuation(input)?;
         match signal {
             Some(signal) if signal.as_nix().is_none() => {
                 if self.global_state.fatal_session.is_failed() {
@@ -8403,7 +8548,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         .resume_raw(signal.raw())
                 }
             }
-            signal => self.resume_stopped(task, signal.and_then(AnySignal::as_nix)),
+            signal => self.resume_stopped_input(task, signal.and_then(AnySignal::as_nix), input),
         }
     }
 
@@ -8413,6 +8558,16 @@ impl<L: Tool + 'static> TracedTask<L> {
         task: Stopped,
         signal: Option<AnySignal>,
     ) -> Result<Running, TraceError> {
+        self.step_stopped_any_input(task, signal, None)
+    }
+
+    fn step_stopped_any_input(
+        &self,
+        task: Stopped,
+        signal: Option<AnySignal>,
+        input: Option<&NativeInputCall>,
+    ) -> Result<Running, TraceError> {
+        self.input_continuation(input)?;
         match signal {
             Some(signal) if signal.as_nix().is_none() => {
                 if self.global_state.fatal_session.is_failed() {
@@ -8428,7 +8583,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         .step_raw(signal.raw())
                 }
             }
-            signal => self.step_stopped(task, signal.and_then(AnySignal::as_nix)),
+            signal => self.step_stopped_input(task, signal.and_then(AnySignal::as_nix), input),
         }
     }
 
@@ -8438,6 +8593,16 @@ impl<L: Tool + 'static> TracedTask<L> {
         task: Stopped,
         signal: Option<AnySignal>,
     ) -> Result<Running, TraceError> {
+        self.syscall_stopped_any_input(task, signal, None)
+    }
+
+    fn syscall_stopped_any_input(
+        &self,
+        task: Stopped,
+        signal: Option<AnySignal>,
+        input: Option<&NativeInputCall>,
+    ) -> Result<Running, TraceError> {
+        self.input_continuation(input)?;
         match signal {
             Some(signal) if signal.as_nix().is_none() => {
                 if self.global_state.fatal_session.is_failed() {
@@ -8449,7 +8614,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     .guard_exit_stop(guard)
                     .syscall_raw(signal.raw())
             }
-            signal => self.syscall_stopped(task, signal.and_then(AnySignal::as_nix)),
+            signal => self.syscall_stopped_input(task, signal.and_then(AnySignal::as_nix), input),
         }
     }
 
@@ -8460,8 +8625,19 @@ impl<L: Tool + 'static> TracedTask<L> {
         child: Running,
         context: Option<libc::user_regs_struct>,
         child_context: Option<libc::user_regs_struct>,
+        input: Option<&NativeInputCall>,
     ) -> Result<Wait, TraceError> {
         self.segv_new_task_seen = true;
+        if let Some(control) = self.input_control() {
+            let task = control
+                .task_identity(child.pid().as_raw())
+                .and_then(|task| control.registration(task))
+                .ok_or_else(|| self.input_failure("input-child-not-retained"))?;
+            self.global_state
+                .gs_ref
+                .on_reserved_input_task(task)
+                .map_err(|e| self.input_failure(e))?;
+        }
         tracing::debug!(
             "[scheduler] handling fork from parent {} to child {}: {:?}",
             parent.pid(),
@@ -8508,14 +8684,29 @@ impl<L: Tool + 'static> TracedTask<L> {
         let is_thread = op == ChildOp::Clone && !matches!(own_process_parent, Ok(Some(_)));
         // Read once: a clone3's flags are guest memory, and the table the
         // child is given and the check of it below must see the same value.
-        let shares_actions = !is_thread && shares_signal_actions(&parent);
+        let issued_flags = input.and_then(|input| {
+            let desc = input.control().backend_description(input.id())?;
+            let nr = Sysno::new(desc.number as usize)?;
+            let args = SyscallArgs::from(&desc.args.map(|value| value as usize));
+            input.future_flags(nr, &args)
+        });
+        let shares_actions = !is_thread
+            && issued_flags.map_or_else(
+                || shares_signal_actions(&parent),
+                |flags| flags & libc::CLONE_SIGHAND as u64 != 0,
+            );
         let mut child_task = if is_thread {
             self.cloned(child.pid())
         } else {
             self.forked(
                 child.pid(),
                 shares_actions,
-                op == ChildOp::Vfork || shares_address_space(&parent),
+                if input.is_some() {
+                    reserved_input::kcmp_relation(parent.pid().as_raw(), child.pid().as_raw(), 1)
+                        .unwrap_or(true)
+                } else {
+                    op == ChildOp::Vfork || shares_address_space(&parent)
+                },
             )
         };
         // A process a `clone3` made: its `clone_args` flags, read from guest
@@ -9295,6 +9486,7 @@ impl<L: Tool + 'static> TracedTask<L> {
     }
 
     fn ordinary_trace_continuation(&self) -> Result<(), TraceError> {
+        self.input_continuation(None)?;
         if self.global_state.fatal_session.is_failed() {
             Err(Errno::ECANCELED.into())
         } else {
@@ -9582,6 +9774,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     // return, keeps its original owner registered until the
                     // notifier retires. Announce physical quiescence first so a
                     // later peer failure does not wait for this finished loop.
+                    let _ = self.input_terminal();
                     stop.frozen.store(true, Ordering::Release);
                     session.changed.notify_waiters();
                     crate::tracer::retire_ordinary_terminal(&stop.terminal, &stop.held).await;
@@ -9940,6 +10133,9 @@ impl<L: Tool + 'static> TracedTask<L> {
             }
         };
         drop(global);
+        // The callback future has been dropped. Settle its retained ledger
+        // before terminal ownership can publish or await another task.
+        let _ = self.input_cancelled();
         match outcome {
             Some(Either::Right(Ok(status))) => {
                 // The run loop consumed the final status itself; this path
@@ -10321,7 +10517,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         nr: Sysno,
         args: SyscallArgs,
     ) -> Result<Result<i64, Errno>, TraceError> {
-        self.untraced_syscall_with(task, nr, args, false).await
+        self.untraced_syscall_with(task, nr, args, false, None)
+            .await
     }
 
     /// `untraced_syscall`; `original` marks a frame-mode injection
@@ -10336,6 +10533,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         nr: Sysno,
         args: SyscallArgs,
         original: bool,
+        input: Option<&NativeInputCall>,
     ) -> Result<Result<i64, Errno>, TraceError> {
         self.timer.expire_overflow_records(&task);
         tracing::trace!(
@@ -10350,13 +10548,15 @@ impl<L: Tool + 'static> TracedTask<L> {
         // main.
         // An exec never returns to this injection's repair; the exec stop and
         // pre-init keep SIGTRAP across it (`handle_exec_event`).
-        let (task, sigtrap) =
+        let (mut task, sigtrap) =
             if !self.keeps_sigtrap_state() || matches!(nr, Sysno::execve | Sysno::execveat) {
                 (task, None)
             } else {
                 let task = self.apply_sigtrap_repair(task).await?;
                 let task = self.learn_segv_action(task).await?;
-                let (task, before) = self.read_sigtrap_before_injection(task, nr, &args).await?;
+                let (task, before) = self
+                    .read_sigtrap_before_injection(task, nr, &args, input)
+                    .await?;
                 (task, Some(before))
             };
         // TODO-HUMAN-REVIEW(PR-103): Review original-frame syscall injection.
@@ -10404,7 +10604,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             && swaps_signal_mask(nr)
             && may_name_temporary_signal_mask(nr, &args)
             && !thread_may_be_seccomp_filtered()
-            && let Some(temporary) = temporary_signal_mask(&task, nr, &args)
+            && let Some(temporary) = temporary_signal_mask_prepared(&task, nr, &args, input)
         {
             temporary_shield = temporary & !NEVER_SHIELDED;
         }
@@ -10423,16 +10623,21 @@ impl<L: Tool + 'static> TracedTask<L> {
         } else {
             0
         };
+        if let Err(error) = self.prepare_input_at_stop(&mut task, input) {
+            let input = input.expect("only an input call prepares an image");
+            return Err(self.recover_input_not_run(&task, oldregs, input, error));
+        }
+        self.issue_input(input)?;
         if shield != 0 {
             // The shielded injection runs the thread to the syscall's entry
             // first, so the state read before is not reused for its step.
             self.injection_proc_state = None;
             let requeue = self.in_held_signal_callback;
             let (wait, seccomp_trapped) = self
-                .step_shielded_injection(task, nr, shield, requeue)
+                .step_shielded_injection(task, nr, shield, requeue, input)
                 .await?;
             let result = self
-                .status_to_result(wait, Some(oldregs), child_context)
+                .status_to_result(wait, Some(oldregs), child_context, input, seccomp_trapped)
                 .await?;
             if let Some(sigtrap) = sigtrap {
                 self.repair_sigtrap_after_injection(sigtrap, &result)
@@ -10447,7 +10652,7 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         // Step to run the syscall instruction.
         let (mut wait, mut seccomp_trapped) = self
-            .step_private_syscall_discarding_late_timer(task, nr)
+            .step_private_syscall_discarding_late_timer(task, nr, input)
             .await?;
         // A SIGTRAP the guest or another process sent can stop the step
         // before the `syscall` ran; a stale step SIGTRAP was discarded there
@@ -10476,18 +10681,18 @@ impl<L: Tool + 'static> TracedTask<L> {
                 nr
             );
             (wait, seccomp_trapped) = self
-                .step_private_syscall_discarding_late_timer(stopped, nr)
+                .step_private_syscall_discarding_late_timer(stopped, nr, input)
                 .await?;
         }
         if (original && child_context.is_some()) || self.in_held_signal_callback {
             (wait, seccomp_trapped) = self
-                .requeue_signals_before_original_syscall(wait, seccomp_trapped, nr)
+                .requeue_signals_before_original_syscall(wait, seccomp_trapped, nr, input)
                 .await?;
         }
 
         // Get the result of the syscall to return to the caller.
         let result = self
-            .status_to_result(wait, Some(oldregs), child_context)
+            .status_to_result(wait, Some(oldregs), child_context, input, seccomp_trapped)
             .await?;
         if let Some(sigtrap) = sigtrap {
             self.repair_sigtrap_after_injection(sigtrap, &result)
@@ -10511,8 +10716,9 @@ impl<L: Tool + 'static> TracedTask<L> {
         &mut self,
         task: Stopped,
         nr: Sysno,
+        input: Option<&NativeInputCall>,
     ) -> Result<(Wait, bool), TraceError> {
-        let (mut wait, mut seccomp_trapped) = self.step_private_syscall(task, nr).await?;
+        let (mut wait, mut seccomp_trapped) = self.step_private_syscall(task, nr, input).await?;
 
         // A late overflow notification of the timer can be pending when the
         // step starts. Its delivery stop precedes the syscall instruction. No
@@ -10592,7 +10798,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             // stays queued past this step and reaches the timer's own
             // handling at the next run-loop stop. It is therefore never
             // requeued or held in `pending_signal` here.
-            (wait, seccomp_trapped) = self.step_private_syscall(stopped, nr).await?;
+            (wait, seccomp_trapped) = self.step_private_syscall(stopped, nr, input).await?;
         }
         Ok((wait, seccomp_trapped))
     }
@@ -10683,6 +10889,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         &mut self,
         task: Stopped,
         nr: Sysno,
+        input: Option<&NativeInputCall>,
     ) -> Result<(Wait, bool), TraceError> {
         let after_syscall = (cp::PRIVATE_PAGE_OFFSET + cp::SYSCALL_INSTR_SIZE) as u64;
         // Signals returned to the kernel queue during this step, still blocked
@@ -10699,7 +10906,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             }
             Ok(())
         };
-        let mut running = self.step_stopped(task, None)?;
+        let mut running = self.step_stopped_input(task, None, input)?;
         loop {
             let wait = running.next_state_with_owner(&self.ptracer_waits).await?;
             self.arm_liteinst_wait(&wait);
@@ -10715,7 +10922,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                             stopped.pid(),
                             nr
                         );
-                        running = self.step_stopped(stopped, None)?;
+                        running = self.step_stopped_input(stopped, None, input)?;
                         continue;
                     }
                     if sig == Signal::SIGTRAP {
@@ -10759,7 +10966,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     stopped.pid(),
                     sig
                 );
-                running = self.step_stopped(stopped, None)?;
+                running = self.step_stopped_input(stopped, None, input)?;
             } else if stopped.getregs()?.ip() == after_syscall {
                 let bit = signal_mask_bit(sig);
                 if returned & bit != 0 {
@@ -10796,7 +11003,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         nr
                     );
                     returned |= bit;
-                    running = self.step_stopped_any(stopped, Some(sig))?;
+                    running = self.step_stopped_any_input(stopped, Some(sig), input)?;
                 } else if let Some(mask) = mask {
                     tracing::debug!(
                         "[scheduler/tool] (pid = {}) requeueing {} delivered after injected {} completed",
@@ -10807,7 +11014,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     stopped.setsigmask(mask | bit)?;
                     requeued |= bit;
                     returned |= bit;
-                    running = self.step_stopped_any(stopped, Some(sig))?;
+                    running = self.step_stopped_any_input(stopped, Some(sig), input)?;
                 } else {
                     tracing::debug!(
                         "[scheduler/tool] (pid = {}) holding {} delivered after injected {} completed; later signals stay queued",
@@ -10900,6 +11107,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         &mut self,
         task: Stopped,
         nr: Sysno,
+        input: Option<&NativeInputCall>,
     ) -> Result<(Wait, bool), TraceError> {
         // The shield makes requests main does not, which a tracer filter may
         // refuse (`thread_may_be_seccomp_filtered`).
@@ -10925,7 +11133,9 @@ impl<L: Tool + 'static> TracedTask<L> {
             unshielded_mask,
             shielded,
         });
-        let (wait, seccomp_trapped) = self.step_private_syscall_unshielded(task, nr).await?;
+        let (wait, seccomp_trapped) = self
+            .step_private_syscall_unshielded(task, nr, input)
+            .await?;
         if shielded {
             reblock_sigtrap_after_step(&wait)?;
         }
@@ -12509,6 +12719,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         task: Stopped,
         nr: Sysno,
         args: &SyscallArgs,
+        input: Option<&NativeInputCall>,
     ) -> Result<(Stopped, SigtrapBeforeInjection), TraceError> {
         let kind = step_kind(nr, swaps_signal_mask(nr));
         let mask = sigmask(&task)?;
@@ -12580,7 +12791,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         }
         let sets_action = (sets_sigtrap_action(nr, args)
             && args.arg3 == std::mem::size_of::<u64>())
-        .then(|| read_sigaction_forced(&task, args.arg1))
+        .then(|| read_sigaction_prepared(&task, args.arg1, input))
         .flatten()
         .map(|action: KernelSigaction| {
             if action.handler == libc::SIG_DFL as u64 {
@@ -12610,9 +12821,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             } else {
                 (task, None)
             };
-        let read_u64 = |address: usize| {
-            Addr::<u64>::from_raw(address).and_then(|address| task.read_value(address).ok())
-        };
+        let read_u64 = |address: usize| preparation_word(&task, input, address);
         let sigaction_call = sets_action.is_some().then_some((args.arg1, args.arg2 != 0));
         let sets_mask = (kind == StepKind::SetsMask).then(|| {
             let set = (args.arg1 != 0 && args.arg3 == std::mem::size_of::<u64>())
@@ -12621,7 +12830,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             mask_after_sigprocmask(mask, args.arg0 as i32, set)
         });
         let temporary_mask = (kind == StepKind::SwapsMask)
-            .then(|| temporary_signal_mask(&task, nr, args))
+            .then(|| temporary_signal_mask_prepared(&task, nr, args, input))
             .flatten();
         Ok((
             task,
@@ -12838,6 +13047,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         wait: Wait,
         seccomp_trapped: bool,
         nr: Sysno,
+        input: Option<&NativeInputCall>,
     ) -> Result<(Wait, bool), TraceError> {
         fn requeueable(sig: AnySignal) -> bool {
             !matches!(
@@ -12864,6 +13074,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             nr,
             false,
             true,
+            input,
         )
         .await
     }
@@ -12924,17 +13135,26 @@ impl<L: Tool + 'static> TracedTask<L> {
         nr: Sysno,
         shield: u64,
         requeue: bool,
+        input: Option<&NativeInputCall>,
     ) -> Result<(Wait, bool), TraceError> {
         let original_mask = task.getsigmask()?;
         let mask = original_mask | shield;
         task.setsigmask(mask)?;
         let wait = self
-            .syscall_stopped_any(task, None)?
+            .syscall_stopped_any_input(task, None, input)?
             .next_state_with_owner(&self.ptracer_waits)
             .await?;
         self.arm_liteinst_wait(&wait);
-        self.requeue_signals_until_syscall_entry(wait, original_mask, mask, nr, true, requeue)
-            .await
+        self.requeue_signals_until_syscall_entry(
+            wait,
+            original_mask,
+            mask,
+            nr,
+            true,
+            requeue,
+            input,
+        )
+        .await
     }
 
     /// The loop of `requeue_signals_before_original_syscall` and
@@ -12956,6 +13176,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         nr: Sysno,
         plain_injection: bool,
         requeue: bool,
+        input: Option<&NativeInputCall>,
     ) -> Result<(Wait, bool), TraceError> {
         fn requeueable(sig: AnySignal) -> bool {
             !matches!(
@@ -12980,7 +13201,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         nr
                     );
                     wait = self
-                        .syscall_stopped_any(stopped, None)?
+                        .syscall_stopped_any_input(stopped, None, input)?
                         .next_state_with_owner(&self.ptracer_waits)
                         .await?;
                     self.arm_liteinst_wait(&wait);
@@ -13020,14 +13241,14 @@ impl<L: Tool + 'static> TracedTask<L> {
                         Some(sig)
                     };
                     wait = self
-                        .syscall_stopped_any(stopped, deliver)?
+                        .syscall_stopped_any_input(stopped, deliver, input)?
                         .next_state_with_owner(&self.ptracer_waits)
                         .await?;
                     self.arm_liteinst_wait(&wait);
                 }
                 Wait::Stopped(stopped, Event::Syscall) => {
                     stopped.setsigmask(original_mask)?;
-                    return self.step_private_syscall(stopped, nr).await;
+                    return self.step_private_syscall(stopped, nr, input).await;
                 }
                 other => {
                     if let Wait::Stopped(stopped, _) = &other {
@@ -13047,10 +13268,12 @@ impl<L: Tool + 'static> TracedTask<L> {
         task: Stopped,
         nr: Sysno,
         args: SyscallArgs,
+        input: Option<&NativeInputCall>,
     ) -> Result<Result<i64, Errno>, TraceError> {
         let task = self.skip_seccomp_syscall(task).await?;
 
-        self.untraced_syscall(task, nr, args).await
+        self.untraced_syscall_with(task, nr, args, false, input)
+            .await
     }
 
     /// Records the stop an injection ended at in `latest_injection_stop`.
@@ -13106,6 +13329,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         wait_status: Wait,
         context: Option<libc::user_regs_struct>,
         child_context: Option<libc::user_regs_struct>,
+        input: Option<&NativeInputCall>,
+        seccomp_trapped: bool,
     ) -> Result<Result<i64, Errno>, TraceError> {
         self.note_injection_stop(&wait_status)?;
         self.last_injection_ran = true;
@@ -13128,6 +13353,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         self.hold_pending_signal(&stopped, sig);
                     }
                     self.last_injection_ran = false;
+                    self.input_result(input, &Err(Errno::ERESTARTSYS), false, seccomp_trapped)?;
                     Ok(Err(Errno::ERESTARTSYS))
                 }
                 event if let Some(sig) = event.signal() => {
@@ -13198,6 +13424,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         self.last_injection_ran = false;
                     }
                     let result = Errno::from_ret(regs.ret() as usize).map(|x| x as i64);
+                    self.input_result(input, &result, self.last_injection_ran, seccomp_trapped)?;
                     if let Some(context) = context {
                         if child_context.is_some() {
                             // An injected-frame event temporarily replaces the
@@ -13246,7 +13473,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                         _ => None,
                     };
                     let wait = self
-                        .handle_new_task(op, stopped, child, context, child_context)
+                        .handle_new_task(op, stopped, child, context, child_context, input)
                         .await?;
                     // A vfork parent's step ends at its PTRACE_EVENT_VFORK_DONE
                     // stop, once the child exits or execs. Linux drops a signal
@@ -13300,6 +13527,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     Ok(Ok(ret))
                 }
                 Event::Exec(_new_pid) => {
+                    self.input_result(input, &Ok(0), true, seccomp_trapped)?;
                     // The callback that injected the exec never resumes, so
                     // the replacement image runs outside it
                     // (`handle_exec_event` ends its state).
@@ -13309,7 +13537,9 @@ impl<L: Tool + 'static> TracedTask<L> {
                 }
                 Event::Syscall => {
                     let regs = stopped.getregs()?;
-                    Ok(Errno::from_ret(regs.ret() as usize).map(|x| x as i64))
+                    let result = Errno::from_ret(regs.ret() as usize).map(|x| x as i64);
+                    self.input_result(input, &result, true, seccomp_trapped)?;
+                    Ok(result)
                 }
                 st => panic!("untraced_syscall returned unknown state: {:?}", st),
             },
@@ -13355,6 +13585,15 @@ impl<L: Tool + 'static> TracedTask<L> {
         nr: Sysno,
         args: SyscallArgs,
     ) -> Result<Result<i64, Errno>, TraceError> {
+        self.inner_inject_with_input(nr, args, None).await
+    }
+
+    async fn inner_inject_with_input(
+        &mut self,
+        nr: Sysno,
+        args: SyscallArgs,
+        input: Option<&NativeInputCall>,
+    ) -> Result<Result<i64, Errno>, TraceError> {
         // A Tool's own `rt_sigaction` of SIGTRAP may change whether it is
         // ignored (`sigtrap_ignored`), here or, run in place, on the resume.
         if self.global_state.keeps_sigtrap_state && sets_sigtrap_action(nr, &args) {
@@ -13363,7 +13602,16 @@ impl<L: Tool + 'static> TracedTask<L> {
         // A clone that may share this group's signal-action table marks it
         // shared before it runs, whether or not its child is traced
         // (`CLONE_UNTRACED` gives no new-child event).
-        if self.global_state.keeps_sigtrap_state && self.clone_may_share_signal_actions(nr, &args) {
+        if self.global_state.keeps_sigtrap_state
+            && matches!(nr, Sysno::clone | Sysno::clone3)
+            && input.map_or_else(
+                || self.clone_may_share_signal_actions(nr, &args),
+                |call| {
+                    call.future_flags(nr, &args)
+                        .is_none_or(|flags| flags & libc::CLONE_SIGHAND as u64 != 0)
+                },
+            )
+        {
             self.global_state
                 .sigtrap_tables
                 .lock()
@@ -13379,7 +13627,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.segv_new_task_seen = false;
         }
         let sets_segv = self.sets_segv_action(nr, &args);
-        let result = self.inner_inject_unobserved(nr, args).await?;
+        let result = self.inner_inject_unobserved(nr, args, input).await?;
         if checks_clone {
             self.note_segv_clone_result(&result);
         }
@@ -13396,8 +13644,9 @@ impl<L: Tool + 'static> TracedTask<L> {
         &mut self,
         nr: Sysno,
         args: SyscallArgs,
+        input: Option<&NativeInputCall>,
     ) -> Result<Result<i64, Errno>, TraceError> {
-        let task = self.assume_stopped();
+        let mut task = self.assume_stopped();
 
         tracing::debug!(
             "[tool] (tid {}) beginning inject of syscall: {}, args {:?}",
@@ -13409,7 +13658,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         if self.injected_syscall_frame.is_some() {
             let original = self.pending_syscall.take() == Some((nr, args));
             self.pending_syscall = None;
-            self.untraced_syscall_with(task, nr, args, original).await
+            self.untraced_syscall_with(task, nr, args, original, input)
+                .await
         } else {
             match self.pending_syscall.take() {
                 Some(original) if original == (nr, args) => {
@@ -13422,12 +13672,24 @@ impl<L: Tool + 'static> TracedTask<L> {
                         self.pre_syscall_for_test(&regs, PreSyscallPoint::Late)
                             .await;
                     }
+                    let oldregs = task.getregs()?;
+                    if let Err(error) = self.prepare_input_at_stop(&mut task, input) {
+                        return Err(self.recover_input_not_run(
+                            &task,
+                            oldregs,
+                            input.unwrap(),
+                            error,
+                        ));
+                    }
+                    self.issue_input(input)?;
                     let wait = self
-                        .syscall_stopped(task, None)?
+                        .syscall_stopped_input(task, None, input)?
                         .next_state_with_owner(&self.ptracer_waits)
                         .await?;
                     self.arm_liteinst_wait(&wait);
-                    let result = self.status_to_result(wait, None, None).await?;
+                    let result = self
+                        .status_to_result(wait, None, None, input, false)
+                        .await?;
                     // A clone run in place steps its parent once
                     // (`handle_new_task`); an ignored SIGTRAP its trap reset is
                     // put back before the Tool goes on.
@@ -13437,8 +13699,11 @@ impl<L: Tool + 'static> TracedTask<L> {
                     }
                     Ok(result)
                 }
-                Some(_) => self.private_inject(task, nr, args).await,
-                None => self.untraced_syscall(task, nr, args).await,
+                Some(_) => self.private_inject(task, nr, args, input).await,
+                None => {
+                    self.untraced_syscall_with(task, nr, args, false, input)
+                        .await
+                }
             }
         }
     }
@@ -13524,7 +13789,9 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         if self.injected_syscall_frame.is_some() {
             let original = self.pending_syscall.take() == Some((nr, args));
-            let result = self.untraced_syscall_with(task, nr, args, original).await?;
+            let result = self
+                .untraced_syscall_with(task, nr, args, original, None)
+                .await?;
             // `handle_injected_syscall` owns the frame and applies this after
             // the callback is dropped, restarting the trap for a Linux restart
             // code instead of leaking it into the guest frame.
@@ -13534,7 +13801,7 @@ impl<L: Tool + 'static> TracedTask<L> {
 
         if is_liteinst_mapping_syscall(nr) && self.pending_syscall == Some((nr, args)) {
             self.pending_syscall = None;
-            let result = self.private_inject(task, nr, args).await?;
+            let result = self.private_inject(task, nr, args, None).await?;
             let task = self.assume_stopped();
             set_ret(
                 &task,
@@ -13551,7 +13818,7 @@ impl<L: Tool + 'static> TracedTask<L> {
                     .store(nr as u64 + 1, Ordering::SeqCst);
                 Ok(Ok(0))
             }
-            Some(_) => self.private_inject(task, nr, args).await,
+            Some(_) => self.private_inject(task, nr, args, None).await,
             None => self.untraced_syscall(task, nr, args).await,
         }
     }
@@ -14653,6 +14920,60 @@ impl<L: Tool + 'static> Guest<L> for TracedTask<L> {
                 self.inject(syscall).await.map_err(reverie::Error::from)
             }
         }
+    }
+
+    fn reserved_input_control(&self) -> Option<reverie::reserved_input::ReservedInputControl> {
+        self.input_control()
+    }
+
+    fn reserved_input_task(&self) -> Option<reverie::reserved_input::InputTaskId> {
+        self.reserved_input_task
+    }
+
+    fn reserved_input_descriptors(
+        &self,
+    ) -> Result<
+        reverie::reserved_input::InputDescriptorSnapshot,
+        reverie::reserved_input::InputUnavailable,
+    > {
+        self.inspect_input_descriptors()
+    }
+
+    fn reserved_input_process_exit_signal(
+        &self,
+    ) -> Result<i32, reverie::reserved_input::InputUnavailable> {
+        self.inspect_process_exit_signal()
+    }
+
+    fn reserved_input_descriptor(
+        &self,
+        fd: i32,
+    ) -> Result<
+        reverie::reserved_input::PinnedInputDescriptor,
+        reverie::reserved_input::InputUnavailable,
+    > {
+        self.inspect_reserved_input_descriptor(fd)
+    }
+
+    async fn inject_observed<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        receipt: reverie::reserved_input::PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, reverie::reserved_input::InputInjectionError> {
+        let (nr, args) = syscall.into_parts();
+        self.do_input_inject(nr, args, None, receipt).await
+    }
+
+    async fn inject_staged_input<S: SyscallInfo>(
+        &mut self,
+        syscall: S,
+        scope: &reverie::reserved_input::InputOperationScope,
+        image: reverie::reserved_input::ReservedInputImage,
+        receipt: reverie::reserved_input::PhysicalInjectionReceipt,
+    ) -> Result<Result<i64, Errno>, reverie::reserved_input::InputInjectionError> {
+        let (nr, args) = syscall.into_parts();
+        self.do_input_inject(nr, args, Some((scope, image)), receipt)
+            .await
     }
 
     async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {

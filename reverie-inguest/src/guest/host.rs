@@ -3112,6 +3112,12 @@ impl MemoryAccess for GuestMemory<'_> {
 
 #[reverie::tool]
 impl<'a, T: Tool, R: HostRuntime> Guest<T> for InGuest<'a, T, R> {
+    // This backend has no stopped-generation private input implementation.
+    // The typed default injection methods refuse without issuing a native call.
+    fn reserved_input_control(&self) -> Option<reverie::reserved_input::ReservedInputControl> {
+        None
+    }
+
     type Memory = GuestMemory<'a>;
     type Stack = LocalStack;
 
