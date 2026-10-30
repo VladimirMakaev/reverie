@@ -3397,7 +3397,7 @@ mod tests {
         assert!(source.contains("reverie_dbt_runtime_background_init_v3("));
     }
 
-    fn check_native_internal_exits(source: &str) {
+    fn check_native_internal_exits(source: &str, capture: &str) {
         let failure_marker = source
             .split_once("static void mark_backend_failure(void) {")
             .unwrap()
@@ -3453,7 +3453,13 @@ mod tests {
             );
         }
         assert!(source.contains("#include \"mapping_capture.h\""));
-        let capture = include_str!("../native/mapping_capture.h");
+        let terminal_with_status = capture
+            .split_once("static void mapping_capture_terminal_with_status(int status) {")
+            .unwrap()
+            .1
+            .split_once("static void mapping_capture_terminal(void) {")
+            .unwrap()
+            .0;
         let terminal = capture
             .split_once("static void mapping_capture_terminal(void) {")
             .unwrap()
@@ -3461,8 +3467,46 @@ mod tests {
             .split_once("static void mapping_capture_withdraw(void) {")
             .unwrap()
             .0;
-        assert!(
-            terminal.contains("dr_mapping_capture_control(DR_MAPPING_CAPTURE_EXIT, 125, 0, 0);")
+        // Both capture exits share one no-cleanup leaf. Require executable
+        // statements, not a diagnostic or an occurrence in an unrelated helper.
+        assert_eq!(
+            terminal.trim(),
+            "mapping_capture_terminal_with_status(125);\n}"
+        );
+        let statements: Vec<_> = terminal_with_status
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .collect();
+        assert_eq!(
+            statements,
+            [
+                "if (mapping_capture_slot != NULL)",
+                "atomic_store_explicit(&mapping_capture_slot->state, MAPPING_FAILED, memory_order_release);",
+                "dr_mapping_capture_control(DR_MAPPING_CAPTURE_EXIT, status, 0, 0);",
+                "for (;;)",
+                "__asm__ volatile(\"pause\" ::: \"memory\");",
+                "}",
+            ],
+            "capture must record failure before raw exit and never resume cleanup"
+        );
+        // The withdrawn-capture failure is consumed only after the actual
+        // callback returns and leaves evidence; retain its distinct status 101.
+        let callback_return = source
+            .split_once("mapping_capture_begin_callback(counters);")
+            .unwrap()
+            .1
+            .split_once("DR_ASSERT(evidence_callback_depth == 0);")
+            .unwrap()
+            .0;
+        assert!(callback_return.trim_end().ends_with(
+            "evidence_callback_leave();\n  counters->caller_syscall_callback = false;\n  if (mapping_capture_take_fatal_refusal(counters, (uintptr_t)drcontext, action))\n    mapping_capture_terminal_with_status(101);"
+        ));
+        assert_eq!(
+            source
+                .matches("mapping_capture_terminal_with_status(101);")
+                .count(),
+            1
         );
         for forbidden in [
             "dr_exit_process(",
@@ -3472,10 +3516,12 @@ mod tests {
             "evidence_flush(",
             "dr_fprintf(",
         ] {
-            assert!(
-                !terminal.contains(forbidden),
-                "capture terminal calls {forbidden}"
-            );
+            for entry in [terminal, terminal_with_status] {
+                assert!(
+                    !entry.contains(forbidden),
+                    "capture terminal calls {forbidden}"
+                );
+            }
         }
         assert!(
             terminate_runtime_tree
@@ -3585,7 +3631,67 @@ mod tests {
 
     #[test]
     fn native_internal_exits_mark_the_final_outcome() {
-        check_native_internal_exits(include_str!("../native/client.c"));
+        check_native_internal_exits(
+            include_str!("../native/client.c"),
+            include_str!("../native/mapping_capture.h"),
+        );
+    }
+
+    #[test]
+    fn native_exit_guard_rejects_broken_capture_terminal_routes() {
+        let source = include_str!("../native/client.c");
+        let capture = include_str!("../native/mapping_capture.h");
+        // A broken positive checker must not make every mutation look useful.
+        check_native_internal_exits(source, capture);
+        let failure = "atomic_store_explicit(&mapping_capture_slot->state, MAPPING_FAILED, memory_order_release);";
+        let raw_exit = "dr_mapping_capture_control(DR_MAPPING_CAPTURE_EXIT, status, 0, 0);";
+        let active_exit = "mapping_capture_terminal_with_status(125);";
+        let fatal_exit = "mapping_capture_terminal_with_status(101);";
+        assert_eq!(capture.matches(failure).count(), 1);
+        assert_eq!(capture.matches(raw_exit).count(), 1);
+        assert_eq!(capture.matches(active_exit).count(), 1);
+        assert_eq!(source.matches(fatal_exit).count(), 1);
+
+        for (name, changed) in [
+            ("missing failure mark", capture.replacen(failure, "", 1)),
+            (
+                "failure mark after raw exit",
+                capture.replacen(failure, "", 1).replacen(
+                    raw_exit,
+                    &format!("{raw_exit}\n  {failure}"),
+                    1,
+                ),
+            ),
+            (
+                "missing active helper call",
+                capture.replacen(active_exit, "", 1),
+            ),
+            (
+                "wrong active status",
+                capture.replacen(active_exit, fatal_exit, 1),
+            ),
+            ("missing raw exit", capture.replacen(raw_exit, "", 1)),
+            (
+                "discarded fatal status",
+                capture.replacen(
+                    raw_exit,
+                    "dr_mapping_capture_control(DR_MAPPING_CAPTURE_EXIT, 125, 0, 0);",
+                    1,
+                ),
+            ),
+        ] {
+            assert_ne!(changed, capture, "mutation did not change source: {name}");
+            assert!(
+                std::panic::catch_unwind(|| check_native_internal_exits(source, &changed)).is_err(),
+                "guard accepted {name}"
+            );
+        }
+        let changed = source.replacen(fatal_exit, "", 1);
+        assert_ne!(changed, source);
+        assert!(
+            std::panic::catch_unwind(|| check_native_internal_exits(&changed, capture)).is_err(),
+            "guard accepted missing fatal helper call"
+        );
     }
 
     #[test]
@@ -3595,7 +3701,13 @@ mod tests {
             "static void retire_private_memory_for_exec(void) {\n  dr_exit_process(101);",
             1,
         );
-        assert!(std::panic::catch_unwind(|| check_native_internal_exits(&source)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| check_native_internal_exits(
+                &source,
+                include_str!("../native/mapping_capture.h"),
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -3616,7 +3728,13 @@ mod tests {
         // This mutation preserves all seven exits and all four earlier option
         // refusals. A first-match ABI check would incorrectly accept it.
         assert_eq!(source.matches("dr_exit_process(").count(), 7);
-        assert!(std::panic::catch_unwind(|| check_native_internal_exits(&source)).is_err());
+        assert!(
+            std::panic::catch_unwind(|| check_native_internal_exits(
+                &source,
+                include_str!("../native/mapping_capture.h"),
+            ))
+            .is_err()
+        );
     }
 
     #[test]
