@@ -195,6 +195,9 @@ impl<T: Tool> CallerRuntime<T> {
                 <T::GlobalState as GlobalTool>::Config,
             >(std::path::Path::new(&path))
             .map_err(|error| error.to_string())?;
+            // Admit the concrete Tool before readiness or selected state is
+            // published. The coordinator cannot recover an erased Tool role.
+            T::facility_admission(&config).map_err(|error| error.to_string())?;
             let selected = ToolConfiguration::<T>::select(Arc::new(config));
             self.configuration
                 .set(Configuration { selected, digest })

@@ -768,8 +768,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 82] = [
     ),
     (
         "reverie-inguest/src/guest/tool_install.rs",
-        21485,
-        "d0463fe0b7c1144e38f4668585347e1df4c9a3f961081772b4c8329002bd0448",
+        21776,
+        "667035ae4658d12fa1cbdb47df284a0d9b3fe8002c102d97fc14412fb4a3e838",
     ),
     (
         "reverie-inguest/src/signal.rs",
@@ -1145,8 +1145,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 82] = [
     ),
     (
         "reverie/src/reserved_input/registry.rs",
-        106949,
-        "7296e15301b5640702546144f4e0eeeee655bc32a6204f05b16eab62f59c40fe",
+        112423,
+        "a345a0f79ff904aa032b16753ec7260b5448e92ca53f1b0af7e572ef70db10b3",
     ),
     (
         "reverie/src/tool.rs",

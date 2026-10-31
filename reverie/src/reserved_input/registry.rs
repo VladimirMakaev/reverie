@@ -894,6 +894,30 @@ impl ReservedInputControl {
         Self::add_exposure_locked(&mut state, exposure)
     }
 
+    /// Backend-only: retain an unclassified effect before its continuation.
+    /// Unlike a retrospective exposure, this must not cross a page transaction
+    /// that already passed its final access scan. Check and publication share
+    /// the same leaf lock: Preparing still has the old complete page and its
+    /// final scan will see this cause; later phases are an ownership conflict.
+    /// The caller must fail before the effect on error. This does not classify
+    /// Linux behavior, acquire a grant, retire an owner, or wait for a writer.
+    pub fn backend_expose_before_continuation(
+        &self,
+        task: InputTaskId,
+        exposure: InputExposure,
+    ) -> Result<(), InputUnavailable> {
+        let mut state = self.state.lock().unwrap();
+        state.live(task)?;
+        state.validate_access(&InputAccess {
+            target: exposure.target,
+            span: InputSpan::Unknown,
+            direction: InputAccessDirection::ReadWrite,
+            lifetime: InputAccessLifetime::Persistent,
+            cause: exposure.cause.clone(),
+        })?;
+        Self::add_exposure_locked(&mut state, exposure)
+    }
+
     fn add_exposure_locked(
         state: &mut State,
         exposure: InputExposure,
@@ -2779,6 +2803,109 @@ mod tests {
                 .reason(),
             "input-transaction-busy"
         );
+    }
+
+    #[test]
+    fn unclassified_continuation_cannot_cross_another_regions_staged_transaction() {
+        for phase in [
+            InputTransactionPhase::Preparing,
+            InputTransactionPhase::PreparedStopped,
+            InputTransactionPhase::Initializing,
+            InputTransactionPhase::Normalizing,
+            InputTransactionPhase::Ready,
+            InputTransactionPhase::Launched,
+        ] {
+            let (control, writer) = root();
+            let signal_target = control
+                .backend_register_child(writer.task, 11, 11, Some(false), Some(false))
+                .unwrap();
+            assert_ne!(writer.region, signal_target.region);
+            let target_grant = control
+                .grant(signal_target.task, InputGrantKind::Ordinary)
+                .unwrap();
+            let (scope, receipt, image) = call(&control, writer.task);
+            let id = receipt.id();
+            control
+                .backend_begin_preparation(&receipt, &scope, image.clone())
+                .unwrap();
+            if phase != InputTransactionPhase::Preparing {
+                control.backend_prepared_stopped(id).unwrap();
+            }
+            if matches!(
+                phase,
+                InputTransactionPhase::Initializing
+                    | InputTransactionPhase::Normalizing
+                    | InputTransactionPhase::Ready
+                    | InputTransactionPhase::Launched
+            ) {
+                control.backend_initializing(id).unwrap();
+            }
+            if phase == InputTransactionPhase::Normalizing {
+                control.backend_normalizing(id).unwrap();
+            }
+            if matches!(
+                phase,
+                InputTransactionPhase::Ready | InputTransactionPhase::Launched
+            ) {
+                control.backend_verified_image(id, image.bytes()).unwrap();
+            }
+            if phase == InputTransactionPhase::Launched {
+                control.backend_issued(id).unwrap();
+            }
+            assert_eq!(
+                control.state.lock().unwrap().injections[&id].phase,
+                Some(phase)
+            );
+            // A guard for the resuming task's own region alone cannot see this
+            // writer. Exercise the actual cross-region publication boundary.
+            control
+                .backend_continuation(signal_target.task, None)
+                .unwrap();
+            let before = format!("{:?}", *control.state.lock().unwrap());
+            let exposure = InputExposure {
+                target: InputTarget::Unknown,
+                cause: "unclassified-signal-forward".into(),
+            };
+            let result =
+                control.backend_expose_before_continuation(signal_target.task, exposure.clone());
+            if phase == InputTransactionPhase::Preparing {
+                result.unwrap();
+                assert_eq!(
+                    control.backend_prepared_stopped(id).unwrap_err().reason(),
+                    "unclassified-signal-forward"
+                );
+                assert_eq!(
+                    control.state.lock().unwrap().injections[&id].phase,
+                    Some(phase)
+                );
+                assert_eq!(
+                    control.injection_observation(id).unwrap().verified_image,
+                    None
+                );
+                drop(receipt);
+                drop(scope);
+                let state = control.state.lock().unwrap();
+                assert_eq!(state.global_exposures, [exposure]);
+                assert_eq!(state.regions[&writer.region].transaction, Some(id));
+                assert!(state.accesses.is_empty());
+            } else {
+                assert_eq!(result.unwrap_err().reason(), "input-transaction-busy");
+                assert_eq!(
+                    format!("{:?}", *control.state.lock().unwrap()),
+                    before,
+                    "a conflicting attempt must neither publish a cause nor alter ownership"
+                );
+            }
+            assert_eq!(
+                control.current_grant(signal_target.task),
+                Some(target_grant)
+            );
+            assert_eq!(
+                control.failure(),
+                None,
+                "the caller owns infrastructure failure"
+            );
+        }
     }
 
     #[test]

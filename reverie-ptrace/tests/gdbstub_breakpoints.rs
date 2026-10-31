@@ -61,6 +61,9 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
+#[path = "gdbstub_breakpoints/reserved_input_signals.rs"]
+mod reserved_input_signals;
+
 #[derive(Default)]
 struct NoopTool;
 

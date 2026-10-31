@@ -7700,6 +7700,26 @@ impl<L: Tool + 'static> TracedTask<L> {
                         GdbSignalResume::Continue(chosen) => (chosen, false),
                         GdbSignalResume::Step(chosen) => (chosen, true),
                     };
+                    // The completed Tool verdict covers `delivered`, not a
+                    // different signal selected by the debugger. Retain the
+                    // generic uncertainty before the stopped task can resume;
+                    // Linux disposition policy remains in the Tool. Suppression
+                    // creates no new delivery and cannot erase an older cause.
+                    if signal.is_some()
+                        && signal != Some(delivered)
+                        && let Some(control) = self.input_control()
+                    {
+                        control
+                            .backend_expose_before_continuation(
+                                self.reserved_input_task
+                                    .ok_or_else(|| self.input_failure("input-task-unavailable"))?,
+                                reverie::reserved_input::InputExposure {
+                                    target: reverie::reserved_input::InputTarget::Unknown,
+                                    cause: "unclassified-signal-forward".into(),
+                                },
+                            )
+                            .map_err(|error| self.input_failure(error))?;
+                    }
                 }
                 let resume = SignalResume {
                     signal,

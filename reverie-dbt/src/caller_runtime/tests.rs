@@ -1368,3 +1368,5 @@ fn caller_runtime_protocol() {
         assert_eq!(stdout.matches(&format!("{WITNESS}:{case}")).count(), 1);
     }
 }
+
+mod facility_admission;
