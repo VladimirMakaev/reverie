@@ -209,6 +209,15 @@ enum ExpectedGdbResume {
     StepOnly,
 }
 
+/// Native stop provenance, not the event label presented to GDB. Only these
+/// unchanged ptrace event stops discard their resume signal in the kernel.
+#[derive(Clone, Copy)]
+enum GdbResumeSignalOrigin {
+    Unclassified,
+    NewChildEvent,
+    VforkDoneEvent,
+}
+
 /// Whether the timer observed a breakpoint stop (`Timer::observe_event`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum BreakpointStop {
@@ -5972,6 +5981,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         )
         .await;
         self.unpark(parked);
+        let result = result?;
         let cpuid = self
             .ordinary_callback_errno("ptrace cpuid callback", result)
             .await?;
@@ -5998,6 +6008,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         )
         .await;
         self.unpark(parked);
+        let result = result?;
         let retval = self
             .ordinary_callback_errno("ptrace rdtsc callback", result)
             .await?;
@@ -6268,12 +6279,13 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.apply_sigtrap_repair(task).await?
         };
         let mut parked = self.park_for_gdb();
-        ParkedForGdb::hold(
+        let result = ParkedForGdb::hold(
             &mut parked,
             self.process_state.clone().handle_timer_event(self),
         )
         .await;
         self.unpark(parked);
+        result?;
         self.ordinary_trace_continuation()?;
         self.timer.finalize_requests();
         Ok((true, task))
@@ -6562,6 +6574,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             .await;
             self.unpark(parked);
             self.in_syscall_callback = false;
+            let retval = retval?;
 
             let retval = match retval {
                 Some(Err(error)) => match error.into_errno() {
@@ -6776,7 +6789,11 @@ impl<L: Tool + 'static> TracedTask<L> {
             ))
             .await?;
             let running = self
-                .await_gdb_resume(task, ExpectedGdbResume::Resume)
+                .await_gdb_resume(
+                    task,
+                    ExpectedGdbResume::Resume,
+                    GdbResumeSignalOrigin::Unclassified,
+                )
                 .await?;
             HandleSignalResult::SignalSuppressed(
                 running.next_state_with_owner(&self.ptracer_waits).await?,
@@ -6822,7 +6839,11 @@ impl<L: Tool + 'static> TracedTask<L> {
         ))
         .await?;
         let running = self
-            .await_gdb_resume(task, ExpectedGdbResume::Resume)
+            .await_gdb_resume(
+                task,
+                ExpectedGdbResume::Resume,
+                GdbResumeSignalOrigin::Unclassified,
+            )
             .await?;
         Ok(HandleSignalResult::SignalSuppressed(
             running.next_state_with_owner(&self.ptracer_waits).await?,
@@ -7499,7 +7520,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             // `tail_inject` cancels it. On main the guest's handler took the
             // signal when it made the exec, and the replacement resumed with
             // none.
-            result.unwrap_or(Ok((!execed).then_some(sig)))
+            result.map(|result| result.unwrap_or(Ok((!execed).then_some(sig))))
         } else {
             ParkedForGdb::hold(&mut parked, self.tool_signal_verdict(sig)).await
         };
@@ -7512,6 +7533,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         self.in_held_signal_callback = outer_held;
         self.signal_callback_replaced_restart_block = outer_replaced;
         self.signal_callback_guest_restart_block = outer_guest_block;
+        let result = result?;
         let signal = self
             .ordinary_callback_errno("ptrace signal callback", result)
             .await?;
@@ -8056,7 +8078,11 @@ impl<L: Tool + 'static> TracedTask<L> {
                     .await;
             }
             let running = self
-                .await_gdb_resume(task, ExpectedGdbResume::Resume)
+                .await_gdb_resume(
+                    task,
+                    ExpectedGdbResume::Resume,
+                    GdbResumeSignalOrigin::Unclassified,
+                )
                 .await?;
             Ok(running.next_state_with_owner(&self.ptracer_waits).await?)
         } else {
@@ -8346,6 +8372,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             self.unpark(parked);
             self.in_syscall_callback = false;
             self.native_callback = None;
+            let retval = retval?;
             let mut deferred_native = self.deferred_native_call.take();
             if deferred_native
                 .as_ref()
@@ -9060,7 +9087,11 @@ impl<L: Tool + 'static> TracedTask<L> {
             .await?;
             // We just reported a new event, wait for gdb resume.
             let running = self
-                .await_gdb_resume(parent, ExpectedGdbResume::StepOnly)
+                .await_gdb_resume(
+                    parent,
+                    ExpectedGdbResume::StepOnly,
+                    GdbResumeSignalOrigin::NewChildEvent,
+                )
                 .await?;
             // NB: We could potentially hit a breakpoint after above resume,
             // make sure we don't miss the breakpoint and await for gdb
@@ -9156,7 +9187,13 @@ impl<L: Tool + 'static> TracedTask<L> {
             // sees its registers but may not change them.
             let shown = CoreRegs::from_parts(regs, parent.getfpregs()?);
             let (resume, released_by_session) = self.serve_gdb_stop(Some(&shown)).await?;
-            self.apply_resume_from_gdb_stop(resume, released_by_session, parent.pid(), true);
+            let signal = self.prepare_gdb_resume_signal(resume)?;
+            self.apply_resume_from_gdb_stop(
+                resume,
+                released_by_session,
+                parent.pid(),
+                Some(signal),
+            );
         }
         Ok(())
     }
@@ -9177,7 +9214,11 @@ impl<L: Tool + 'static> TracedTask<L> {
             ))
             .await?;
             let running = self
-                .await_gdb_resume(stopped, ExpectedGdbResume::Resume)
+                .await_gdb_resume(
+                    stopped,
+                    ExpectedGdbResume::Resume,
+                    GdbResumeSignalOrigin::VforkDoneEvent,
+                )
                 .await?;
             return running.next_state_with_owner(&self.ptracer_waits).await;
         }
@@ -9324,7 +9365,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         )
         .await;
         self.unpark(parked);
-        match started {
+        match started? {
             Some(Ok(())) => self.observe_ready_thread_state()?,
             Some(Err(err)) => {
                 if !matches!(err, reverie::Error::Errno(_)) {
@@ -9348,7 +9389,11 @@ impl<L: Tool + 'static> TracedTask<L> {
         //
         // NB: await_gdb_resume == resume if not attached_by_gdb.
         let running = self
-            .await_gdb_resume(task, ExpectedGdbResume::Resume)
+            .await_gdb_resume(
+                task,
+                ExpectedGdbResume::Resume,
+                GdbResumeSignalOrigin::Unclassified,
+            )
             .await
             .tracee_context(self.tid(), "initial tracee resume")?;
 
@@ -14168,6 +14213,8 @@ impl<L: Tool + 'static> TracedTask<L> {
             core_regs,
             breakpoints: self.breakpoints.clone(),
             reserved_input: self.input_control().zip(self.reserved_input_task),
+            fatal_session: self.global_state.fatal_session.clone(),
+            input_task: self.reserved_input_task,
             view: self.gdb_view.clone(),
             ports: self.gdb_ports.clone(),
             stop_tx: self.gdb_stop_tx.clone(),
@@ -14188,7 +14235,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         if let Some(parked) = parked
             && let Some((resume, released_by_session)) = parked.resumed
         {
-            self.apply_resume_from_gdb_stop(resume, released_by_session, parked.tid, false);
+            self.apply_resume_from_gdb_stop(resume, released_by_session, parked.tid, None);
         }
     }
 
@@ -14261,25 +14308,53 @@ impl<L: Tool + 'static> TracedTask<L> {
         let resumed = match stopped {
             Ok(()) => {
                 self.freeze_all().await?;
-                let resumed = self.serve_gdb_stop(Some(&shown)).await;
+                let (resume, released_by_session) = match self.serve_gdb_stop(Some(&shown)).await {
+                    Ok(resumed) => resumed,
+                    Err(error) => {
+                        // Preserve legacy serve-error cleanup. In contrast,
+                        // a failed exposure below publishes a fatal ownership
+                        // error and must not thaw any callback.
+                        self.thaw_all().await?;
+                        if !was_suspended {
+                            self.suspended.store(false, Ordering::SeqCst);
+                        }
+                        return Err(error);
+                    }
+                };
+                // A direct signal can affect a different process sharing this
+                // MM. Publish before waking any suspended callback, not merely
+                // before the eventual tgkill after thaw.
+                let signal = self.prepare_gdb_resume_signal(resume)?;
                 self.thaw_all().await?;
-                resumed
+                Ok((resume, released_by_session, signal))
             }
             Err(error) => Err(error),
         };
         if !was_suspended {
             self.suspended.store(false, Ordering::SeqCst);
         }
-        let (resume, released_by_session) = resumed?;
-        self.apply_resume_from_gdb_stop(resume, released_by_session, task.pid(), true);
+        let (resume, released_by_session, signal) = resumed?;
+        self.apply_resume_from_gdb_stop(resume, released_by_session, task.pid(), Some(signal));
         Ok(())
+    }
+
+    fn prepare_gdb_resume_signal(
+        &self,
+        resume: Option<ResumeInferior>,
+    ) -> Result<gdb_stop::PreparedResumeSignal, TraceError> {
+        gdb_stop::prepare_resume_signal(
+            self.input_control().as_ref(),
+            self.reserved_input_task,
+            resume,
+        )
+        .map_err(|error| self.input_failure(error))
     }
 
     /// Applies gdb's resume from a stop made before the thread's stop was
     /// handled, or inside a Tool callback (`stop_for_gdb_at`,
     /// `ParkedForGdb`). The thread goes on with what it was doing, so a step
     /// ends at its next stop (`gdb_step_pending`). The signal gdb resumed it
-    /// with is sent to it here if `send` (a park sends it itself, as soon as
+    /// with is sent to it here if authorized (a park sends it itself, as soon as
     /// gdb resumes it), and its delivery is not reported to gdb again
     /// (`SentSignal`).
     fn apply_resume_from_gdb_stop(
@@ -14287,7 +14362,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         resume: Option<ResumeInferior>,
         released_by_session: bool,
         tid: Pid,
-        send: bool,
+        signal: Option<gdb_stop::PreparedResumeSignal>,
     ) {
         let stepped = resume
             .is_some_and(|resume| !resume.detach && matches!(resume.action, ResumeAction::Step(_)));
@@ -14301,9 +14376,8 @@ impl<L: Tool + 'static> TracedTask<L> {
         });
         self.note_gdb_resume(recorded, released_by_session);
         self.gdb_step_pending = stepped && self.attached_by_gdb;
-        if send && let Some(sig) = gdb_stop::signal_after_interrupt(resume) {
-            gdb_stop::send_signal(self.pid(), tid, sig);
-            self.gdb_sent_signal.set(sig);
+        if let Some(signal) = signal {
+            signal.send(self.pid(), tid, &self.gdb_sent_signal);
         }
     }
 
@@ -14354,7 +14428,23 @@ impl<L: Tool + 'static> TracedTask<L> {
         resume: Option<ResumeInferior>,
         task: Stopped,
         resume_action: ExpectedGdbResume,
+        signal_origin: GdbResumeSignalOrigin,
     ) -> Result<(Running, Option<ResumeInferior>), TraceError> {
+        if matches!(signal_origin, GdbResumeSignalOrigin::Unclassified) {
+            // Breakpoints, step traps and guest SIGTRAP stops have no Tool
+            // verdict. Post-exec/start callbacks may also have changed the
+            // physical stop, regardless of the label GDB was shown.
+            let signal = resume.and_then(|resume| match resume.action {
+                ResumeAction::Continue(signal) | ResumeAction::Step(signal) => signal,
+                ResumeAction::Stop | ResumeAction::StepUntil(..) => None,
+            });
+            let _authorized = gdb_stop::prepare_signal(
+                self.input_control().as_ref(),
+                self.reserved_input_task,
+                signal,
+            )
+            .map_err(|error| self.input_failure(error))?;
+        }
         match resume {
             None => Ok((self.resume_stopped(task, None)?, None)),
             Some(resume) => {
@@ -14398,12 +14488,15 @@ impl<L: Tool + 'static> TracedTask<L> {
         &mut self,
         task: Stopped,
         resume_action: ExpectedGdbResume,
+        signal_origin: GdbResumeSignalOrigin,
     ) -> Result<Running, TraceError> {
         if !self.attached_by_gdb {
             return self.resume_stopped(task, None);
         }
         let (resume, released_by_session) = self.wait_for_gdb_resume().await?;
-        let (running, resumed) = self.handle_gdb_resume(resume, task, resume_action).await?;
+        let (running, resumed) = self
+            .handle_gdb_resume(resume, task, resume_action, signal_origin)
+            .await?;
         self.note_gdb_resume(resumed, released_by_session);
         Ok(running)
     }
@@ -14818,7 +14911,9 @@ impl<L: Tool + 'static> TracedTask<L> {
         } else {
             task
         };
-        let (running, _) = self.handle_gdb_resume(resume, task, expected).await?;
+        let (running, _) = self
+            .handle_gdb_resume(resume, task, expected, GdbResumeSignalOrigin::Unclassified)
+            .await?;
         Ok(running)
     }
 

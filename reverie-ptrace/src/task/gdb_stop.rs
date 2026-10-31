@@ -34,6 +34,7 @@ use safeptrace::Error as TraceError;
 use safeptrace::Stopped;
 use tokio::sync::mpsc;
 
+use super::FatalSession;
 use super::breakpoint_inserted;
 use super::breakpoint_removed;
 use crate::gdbstub::BreakpointType;
@@ -165,7 +166,7 @@ pub(super) fn signal_after_interrupt(resume: Option<ResumeInferior>) -> Option<A
 }
 
 /// Sends `sig` to thread `tid` of process `pid`.
-pub(super) fn send_signal(pid: Pid, tid: Pid, sig: AnySignal) {
+fn send_signal(pid: Pid, tid: Pid, sig: AnySignal) {
     // SAFETY: a plain syscall with integer arguments.
     let sent = Errno::result(unsafe {
         libc::syscall(libc::SYS_tgkill, pid.as_raw(), tid.as_raw(), sig.raw())
@@ -173,6 +174,55 @@ pub(super) fn send_signal(pid: Pid, tid: Pid, sig: AnySignal) {
     if let Err(errno) = sent {
         tracing::debug!(%pid, %tid, %sig, %errno, "signal gdb resumed an interrupt with not sent");
     }
+}
+
+/// A direct debugger send whose exposure was published before any associated
+/// thaw or callback release. Construction does not send a signal.
+pub(super) struct PreparedResumeSignal(Option<AnySignal>);
+
+impl PreparedResumeSignal {
+    pub(super) fn send(self, pid: Pid, tid: Pid, sent_signal: &SentSignal) {
+        if let Some(signal) = self.0 {
+            send_signal(pid, tid, signal);
+            sent_signal.set(signal);
+        }
+    }
+}
+
+pub(super) fn prepare_resume_signal(
+    control: Option<&reverie::reserved_input::ReservedInputControl>,
+    task: Option<reverie::reserved_input::InputTaskId>,
+    resume: Option<ResumeInferior>,
+) -> Result<PreparedResumeSignal, reverie::reserved_input::InputUnavailable> {
+    prepare_signal(control, task, signal_after_interrupt(resume))
+}
+
+/// Authorize the exact signal the caller will physically pass. Only the direct
+/// interrupt-send wrapper above applies `signal_after_interrupt` selection.
+pub(super) fn prepare_signal(
+    control: Option<&reverie::reserved_input::ReservedInputControl>,
+    task: Option<reverie::reserved_input::InputTaskId>,
+    signal: Option<AnySignal>,
+) -> Result<PreparedResumeSignal, reverie::reserved_input::InputUnavailable> {
+    use reverie::reserved_input::InputExposure;
+    use reverie::reserved_input::InputTarget;
+    use reverie::reserved_input::InputUnavailable;
+
+    if signal.is_some()
+        && let Some(control) = control
+    {
+        // These unclassified resumes have no completed Tool signal verdict.
+        // In particular, the SIGINT shown by an interrupt's T02 is synthetic.
+        let task = task.ok_or_else(|| InputUnavailable::new("input-task-unavailable"))?;
+        control.backend_expose_before_continuation(
+            task,
+            InputExposure {
+                target: InputTarget::Unknown,
+                cause: "unclassified-signal-forward".into(),
+            },
+        )?;
+    }
+    Ok(PreparedResumeSignal(signal))
 }
 
 /// What gdb's requests act on: a stopped thread's tracee and the software
@@ -415,6 +465,10 @@ pub(super) struct ParkedForGdb {
         reverie::reserved_input::ReservedInputControl,
         reverie::reserved_input::InputTaskId,
     )>,
+    // Keep facility presence separate from task identity: zip(None) must not
+    // turn a missing owner under an installed facility into ordinary execution.
+    pub(super) fatal_session: Arc<FatalSession>,
+    pub(super) input_task: Option<reverie::reserved_input::InputTaskId>,
     pub(super) view: ThreadView,
     pub(super) ports: GdbPorts,
     pub(super) stop_tx: Option<mpsc::Sender<StoppedInferior>>,
@@ -444,11 +498,14 @@ impl ParkedForGdb {
     /// (`Interrupt::allow_in_place`); and once it has returned, before the
     /// thread resumes. While another thread is stopped for the interrupt, the
     /// thread holds at the first and last of these.
-    pub(super) async fn hold<F: Future>(parked: &mut Option<Self>, callback: F) -> F::Output {
+    pub(super) async fn hold<F: Future>(
+        parked: &mut Option<Self>,
+        callback: F,
+    ) -> Result<F::Output, TraceError> {
         let Some(parked) = parked.as_mut().filter(|parked| parked.sequentialized) else {
-            return callback.await;
+            return Ok(callback.await);
         };
-        parked.interrupt_point("before the callback").await;
+        parked.interrupt_point("before the callback").await?;
         let interrupt = parked.interrupt.clone();
         let output = {
             let mut callback = std::pin::pin!(callback);
@@ -464,7 +521,7 @@ impl ParkedForGdb {
                                 tid = %parked.tid,
                                 "gdb's interrupt taken where the thread waits in a Tool callback"
                             );
-                            parked.stop_for_interrupt().await;
+                            parked.stop_for_interrupt().await?;
                         } else {
                             // The request is still pending but this thread
                             // cannot take it now (its ports are busy). Wait
@@ -493,20 +550,21 @@ impl ParkedForGdb {
                 }
             }
         };
-        parked.interrupt_point("after the callback").await;
-        output
+        parked.interrupt_point("after the callback").await?;
+        Ok(output)
     }
 
     /// Takes a pending interrupt and stops for it, or, while another thread
     /// is stopped for one, holds until gdb resumes the guest.
-    async fn interrupt_point(&mut self, point: &'static str) {
+    async fn interrupt_point(&mut self, point: &'static str) -> Result<(), TraceError> {
         if self.interrupt.is_requested() && self.can_stop() && self.interrupt.take(self.tid) {
             tracing::debug!(tid = %self.tid, point, "gdb's interrupt taken in a Tool callback");
-            self.stop_for_interrupt().await;
+            self.stop_for_interrupt().await?;
         } else if self.interrupt.is_taken() {
             tracing::debug!(tid = %self.tid, point, "holding in a Tool callback for gdb's interrupt");
             self.interrupt.released().await;
         }
+        Ok(())
     }
 
     /// Whether the thread can serve a gdb stop: it has its channels, which a
@@ -523,7 +581,7 @@ impl ParkedForGdb {
     /// shown where it entered the callback. Then sends the thread the signal
     /// gdb resumed it with, if any, at once: a kill cannot wait for the
     /// callback, which may never return. Called only if `can_stop`.
-    async fn stop_for_interrupt(&mut self) {
+    async fn stop_for_interrupt(&mut self) -> Result<(), TraceError> {
         if let (Some(stop_tx), Some(request_tx), Some(resume_tx), Some(mut ports)) = (
             self.stop_tx.clone(),
             self.request_tx.clone(),
@@ -556,12 +614,153 @@ impl ParkedForGdb {
                 serve_gdb_stop(&mut ports, Some(stop_tx), |request| tracee.answer(request)).await;
             drop(answering);
             self.ports.put(ports);
-            if let Some(sig) = signal_after_interrupt(resumed.0) {
-                send_signal(self.pid, self.tid, sig);
-                self.sent_signal.set(sig);
-            }
+            let signal = prepare_resume_signal(
+                self.fatal_session.reserved_input.as_ref(),
+                self.input_task,
+                resumed.0,
+            )
+            .map_err(|error| {
+                // Publish before releasing the interrupt or returning to the
+                // callback select. Its future may never otherwise complete.
+                if let Some(control) = &self.fatal_session.reserved_input {
+                    control.backend_fail(error.to_string());
+                }
+                self.fatal_session.fail_at(
+                    reverie::BackendFailure {
+                        pid: self.pid,
+                        tid: self.tid,
+                        phase: "ptrace debugger interrupt input",
+                    },
+                    reverie::Error::Tool(anyhow::anyhow!(error)),
+                );
+                self.interrupt.release();
+                TraceError::Errno(Errno::ECANCELED)
+            })?;
+            signal.send(self.pid, self.tid, &self.sent_signal);
             self.resumed = Some(resumed);
         }
         self.interrupt.release();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reverie::reserved_input::*;
+
+    use super::*;
+
+    fn resume(action: ResumeAction) -> Option<ResumeInferior> {
+        Some(ResumeInferior {
+            action,
+            detach: false,
+        })
+    }
+
+    #[test]
+    fn direct_resume_signal_requires_the_installed_facilitys_exact_owner() {
+        let control = ReservedInputControl::new_backend().unwrap();
+        let kill = resume(ResumeAction::Continue(Some(Signal::SIGKILL.into())));
+        assert_eq!(
+            prepare_resume_signal(Some(&control), None, kill)
+                .err()
+                .unwrap()
+                .reason(),
+            "input-task-unavailable"
+        );
+        assert!(
+            prepare_resume_signal(None, None, kill).is_ok(),
+            "no-facility behavior is unchanged"
+        );
+        for action in [ResumeAction::Continue(None), ResumeAction::Step(None)] {
+            assert!(
+                prepare_resume_signal(Some(&control), None, resume(action)).is_ok(),
+                "no new direct effect exists to authorize"
+            );
+        }
+        let task = control.backend_register_root(10, 10).unwrap();
+        control.backend_terminal(task.task).unwrap();
+        assert!(
+            prepare_resume_signal(Some(&control), Some(task.task), kill).is_err(),
+            "a retained but dead task is not current continuation authority"
+        );
+    }
+
+    #[test]
+    fn direct_resume_authorization_preserves_a_conflicting_transaction() {
+        let control = ReservedInputControl::new_backend().unwrap();
+        let writer = control.backend_register_root(10, 10).unwrap();
+        let target = control
+            .backend_register_child(writer.task, 11, 11, Some(false), Some(false))
+            .unwrap();
+        let layout = ReservedInputLayout {
+            base: RESERVED_INPUT_BASE,
+            page_bytes: 4096,
+            abi: InputAbi::X86_64,
+        };
+        control.backend_set_layout(writer.task, layout).unwrap();
+        control
+            .grant(writer.task, InputGrantKind::Ordinary)
+            .unwrap();
+        let scope = control.begin_operation(writer.task, 1).unwrap();
+        let receipt = control
+            .prepare_injection(
+                &scope,
+                PhysicalInjectionDescription {
+                    number: 0,
+                    args: [0; 6],
+                    input: InputCallInput::Registers,
+                    expected_sharing: InputExpectedSharing::default(),
+                    transient: vec![],
+                    prospective: vec![],
+                    unknown_lifecycle: None,
+                },
+            )
+            .unwrap();
+        let image = ReservedInputImage::new(layout, &[]).unwrap();
+        control
+            .backend_begin_preparation(&receipt, &scope, image.clone())
+            .unwrap();
+        control.backend_prepared_stopped(receipt.id()).unwrap();
+        let before = control.injection_observation(receipt.id()).unwrap();
+        for action in [
+            ResumeAction::Continue(Some(Signal::SIGKILL.into())),
+            ResumeAction::Step(Some(Signal::SIGUSR1.into())),
+        ] {
+            assert_eq!(
+                prepare_resume_signal(Some(&control), Some(target.task), resume(action))
+                    .err()
+                    .unwrap()
+                    .reason(),
+                "input-transaction-busy"
+            );
+            assert_eq!(control.injection_observation(receipt.id()).unwrap(), before);
+        }
+        for action in [ResumeAction::Continue(None), ResumeAction::Step(None)] {
+            assert!(
+                prepare_resume_signal(Some(&control), Some(target.task), resume(action)).is_ok()
+            );
+            assert_eq!(control.injection_observation(receipt.id()).unwrap(), before);
+        }
+        assert_eq!(
+            control.failure(),
+            None,
+            "caller must publish infrastructure failure"
+        );
+        // The failed authorization cannot construct PreparedResumeSignal, the
+        // only route to the direct send. Receipt/scope Drop grants no cleanup.
+        drop((receipt, scope));
+        assert_eq!(
+            prepare_resume_signal(
+                Some(&control),
+                Some(target.task),
+                resume(ResumeAction::Continue(Some(Signal::SIGKILL.into()))),
+            )
+            .err()
+            .unwrap()
+            .reason(),
+            "input-transaction-busy",
+            "dropping the callback's handles must not clear the transaction"
+        );
     }
 }

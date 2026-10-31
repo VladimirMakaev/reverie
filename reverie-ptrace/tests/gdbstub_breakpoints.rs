@@ -64,6 +64,9 @@ use tokio::net::UnixStream;
 #[path = "gdbstub_breakpoints/reserved_input_signals.rs"]
 mod reserved_input_signals;
 
+#[path = "gdbstub_breakpoints/reserved_input_interrupts.rs"]
+mod reserved_input_interrupts;
+
 #[derive(Default)]
 struct NoopTool;
 
