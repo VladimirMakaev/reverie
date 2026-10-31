@@ -27,8 +27,18 @@ use tokio::sync::Semaphore;
 
 use super::*;
 
+struct StagedEvidence {
+    result: Result<Result<i64, Errno>, InputInjectionError>,
+    observation: PhysicalInjectionObservation,
+    before: Vec<u8>,
+    after: Option<Vec<u8>>,
+    image: ReservedInputImage,
+    pid: Pid,
+}
+
 struct Evidence {
     registrations: Mutex<Vec<InputTaskRegistration>>,
+    staged: Mutex<Vec<StagedEvidence>>,
     events: Mutex<Vec<u8>>,
     parent_ready: Semaphore,
     parked_ready: Semaphore,
@@ -46,6 +56,7 @@ impl Default for Evidence {
     fn default() -> Self {
         Self {
             registrations: Mutex::new(Vec::new()),
+            staged: Mutex::new(Vec::new()),
             events: Mutex::new(Vec::new()),
             parent_ready: Semaphore::new(0),
             parked_ready: Semaphore::new(0),
@@ -346,20 +357,24 @@ impl Tool for InterruptTool {
                     .inject_staged_input(submitted, &scope, image.clone(), receipt)
                     .await;
                 let observation = control.injection_observation(id).unwrap();
-                if (*guest.config() & 7) >= 2 {
-                    let Err(InputInjectionError::Unavailable(error)) = result else {
-                        panic!("expected unclassified-signal-forward, got {result:?}");
-                    };
-                    assert_eq!(error.reason(), "unclassified-signal-forward");
-                    assert_eq!(observation.state, PhysicalInjectionState::ProvedNoChild);
-                    assert_eq!(observation.verified_image, None);
+                let after = if (*guest.config() & 7) >= 2 {
                     let mut after = vec![0; layout.page_bytes];
                     guest.memory().read_exact(address, &mut after)?;
-                    assert_eq!(after, before);
+                    Some(after)
                 } else {
-                    assert_eq!(result.unwrap().unwrap(), i64::from(guest.pid().as_raw()));
-                    assert_eq!(observation.verified_image.as_ref(), Some(&image));
-                }
+                    None
+                };
+                // Retain the live pre-cleanup evidence. Assertions in this
+                // descendant callback invoke the production fatal-panic exit,
+                // so the outer test checks it after the native tree joins.
+                evidence().staged.lock().unwrap().push(StagedEvidence {
+                    result,
+                    observation,
+                    before,
+                    after,
+                    image,
+                    pid: guest.pid(),
+                });
                 control.finish_operation(scope).unwrap();
                 guest.send_rpc(3).await;
                 Ok(0)
@@ -508,6 +523,36 @@ async fn interrupt_and_trap_resumes_publish_before_a_shared_mm_survivor_stages()
                     .await
                     .expect("the exact case finishes");
             let _ = std::fs::remove_file(&socket);
+            // wait() above returned after native task-tree completion. Move the
+            // snapshots out of the lock before any assertion can unwind.
+            let mut staged = std::mem::take(&mut *evidence.staged.lock().unwrap()).into_iter();
+            let StagedEvidence {
+                result,
+                observation,
+                before,
+                after,
+                image,
+                pid,
+            } = staged
+                .next()
+                .expect("the survivor recorded its live staging result");
+            assert!(
+                staged.next().is_none(),
+                "exactly one survivor staging attempt"
+            );
+            if (case & 7) >= 2 {
+                let Err(InputInjectionError::Unavailable(error)) = result else {
+                    panic!("expected unclassified-signal-forward, got {result:?}");
+                };
+                assert_eq!(error.reason(), "unclassified-signal-forward");
+                assert_eq!(observation.state, PhysicalInjectionState::ProvedNoChild);
+                assert_eq!(observation.verified_image, None);
+                let after = after.expect("the stopped survivor's complete post-call page");
+                assert_eq!(after, before);
+            } else {
+                assert_eq!(result.unwrap().unwrap(), i64::from(pid.as_raw()));
+                assert_eq!(observation.verified_image.as_ref(), Some(&image));
+            }
             if matches!(action, 2 | 3) {
                 assert!(
                     matches!(status, ExitStatus::Signaled(Signal::SIGKILL, _)),
