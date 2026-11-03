@@ -276,6 +276,10 @@ fn descriptor_facts(
 }
 
 fn descriptors(tid: i32) -> Result<Vec<PinnedInputDescriptor>, InputNativeError> {
+    // One transient open spans the snapshot, bounded by the table's size: the
+    // pidfd, the `/proc/<tid>/fd` listing and each descriptor's facts. The
+    // pins it returns outlive it, as descriptors held beyond one call do.
+    let _open = crate::launch_window::TransientOpen::begin();
     // PIDFD_THREAD (O_EXCL) selects this exact task's table, including a
     // nonleader that unshared its files. Failure is uncertainty, not a fallback
     // to the group leader's potentially different descriptor table.
@@ -334,7 +338,7 @@ fn native_facts(
         realtime: native_limit(tid, libc::RLIMIT_RTTIME),
         rseq: native_rseq(task),
         descriptors: descriptors(tid),
-        mountinfo: std::fs::read(format!("/proc/{tid}/mountinfo"))
+        mountinfo: crate::launch_window::read(format!("/proc/{tid}/mountinfo"))
             .map_err(|error| io_error("mountinfo", error)),
         mount_namespace: inode(&format!("/proc/{tid}/ns/mnt")),
         root: inode(&format!("/proc/{tid}/root")),
@@ -712,7 +716,7 @@ impl<L: Tool + 'static> TracedTask<L> {
             .map_err(|_| InputUnavailable::new("input-stop-unavailable"))?;
         let entries = descriptors(self.tid.as_raw())
             .map_err(|e| InputUnavailable::new(format!("input-native-descriptors:{e:?}")))?;
-        let mountinfo = std::fs::read(format!("/proc/{}/mountinfo", self.tid))
+        let mountinfo = crate::launch_window::read(format!("/proc/{}/mountinfo", self.tid))
             .map_err(|e| io_error("mountinfo", e));
         task.getregs()
             .map_err(|_| InputUnavailable::new("input-stop-unavailable"))?;
@@ -735,7 +739,7 @@ impl<L: Tool + 'static> TracedTask<L> {
         let registered = control
             .registration(identity)
             .ok_or_else(|| InputUnavailable::new("input-task-unavailable"))?;
-        let status = std::fs::read_to_string(format!("/proc/{}/status", self.tid))
+        let status = crate::launch_window::read_to_string(format!("/proc/{}/status", self.tid))
             .map_err(|_| InputUnavailable::new("input-native-group-unavailable"))?;
         let group = status
             .lines()
@@ -744,8 +748,9 @@ impl<L: Tool + 'static> TracedTask<L> {
         if group != Some(registered.native_pid) {
             return Err(InputUnavailable::new("input-native-group-mismatch"));
         }
-        let stat = std::fs::read_to_string(format!("/proc/{}/stat", registered.native_pid))
-            .map_err(|_| InputUnavailable::new("input-native-exit-signal-unavailable"))?;
+        let stat =
+            crate::launch_window::read_to_string(format!("/proc/{}/stat", registered.native_pid))
+                .map_err(|_| InputUnavailable::new("input-native-exit-signal-unavailable"))?;
         let value = stat
             .rsplit_once(") ")
             .and_then(|(_, fields)| fields.split_whitespace().nth(35))
@@ -800,17 +805,24 @@ impl<L: Tool + 'static> TracedTask<L> {
         stopped
             .getregs()
             .map_err(|_| InputUnavailable::new("input-stop-unavailable"))?;
-        let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, self.tid.as_raw(), libc::O_EXCL) };
-        if pidfd < 0 {
-            return Err(InputUnavailable::new(format!(
-                "input-pidfd-unavailable: {:?}",
-                native_error("pidfd_open-thread")
-            )));
-        }
-        let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
-        let facts = descriptor_facts(self.tid.as_raw(), &pidfd, fd).map_err(|error| {
-            InputUnavailable::new(format!("input-descriptor-unproved: {error:?}"))
-        })?;
+        let facts = {
+            // One transient open spans the pidfd and the descriptor's facts.
+            // The pin it returns outlives it, as descriptors held beyond one
+            // call do.
+            let _open = crate::launch_window::TransientOpen::begin();
+            let pidfd =
+                unsafe { libc::syscall(libc::SYS_pidfd_open, self.tid.as_raw(), libc::O_EXCL) };
+            if pidfd < 0 {
+                return Err(InputUnavailable::new(format!(
+                    "input-pidfd-unavailable: {:?}",
+                    native_error("pidfd_open-thread")
+                )));
+            }
+            let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as i32) };
+            descriptor_facts(self.tid.as_raw(), &pidfd, fd).map_err(|error| {
+                InputUnavailable::new(format!("input-descriptor-unproved: {error:?}"))
+            })?
+        };
         stopped
             .getregs()
             .map_err(|_| InputUnavailable::new("input-stop-unavailable"))?;
@@ -934,7 +946,7 @@ fn authenticate_mapping(
 ) -> Result<(), InputUnavailable> {
     task.getregs()
         .map_err(|_| InputUnavailable::new("input-stop-unavailable"))?;
-    let maps = std::fs::read_to_string(format!("/proc/{}/maps", task.pid()))
+    let maps = crate::launch_window::read_to_string(format!("/proc/{}/maps", task.pid()))
         .map_err(|_| InputUnavailable::new("input-maps-unreadable"))?;
     let expected_end = layout.base + layout.page_bytes as u64;
     let mut found = false;
@@ -959,7 +971,7 @@ fn authenticate_mapping(
             found = true;
         }
     }
-    let smaps = std::fs::read_to_string(format!("/proc/{}/smaps", task.pid()))
+    let smaps = crate::launch_window::read_to_string(format!("/proc/{}/smaps", task.pid()))
         .map_err(|_| InputUnavailable::new("input-smaps-unreadable"))?;
     let header = format!("{:x}-{:x}", layout.base, expected_end);
     let mut ours = false;
@@ -1130,8 +1142,9 @@ impl FatalSession {
             let parent_task = control
                 .task_identity(parent.as_raw())
                 .ok_or_else(|| InputUnavailable::new("input-parent-not-retained"))?;
-            let status = std::fs::read_to_string(format!("/proc/{}/status", child.pid()))
-                .map_err(|_| InputUnavailable::new("input-child-native-group-unavailable"))?;
+            let status =
+                crate::launch_window::read_to_string(format!("/proc/{}/status", child.pid()))
+                    .map_err(|_| InputUnavailable::new("input-child-native-group-unavailable"))?;
             let pid = status
                 .lines()
                 .find_map(|line| line.strip_prefix("Tgid:"))

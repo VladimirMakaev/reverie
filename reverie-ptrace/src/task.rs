@@ -2045,6 +2045,9 @@ fn is_private_step_trap(task: &Stopped, after_syscall: u64) -> Result<bool, Trac
 /// has not been reaped (state `Z` or `X`) does not. Anything that cannot be
 /// read counts as another thread.
 fn group_has_other_live_threads(pid: Pid, tid: Pid) -> bool {
+    // One transient open spans the listing and each thread's `stat` read,
+    // bounded by the group's thread count.
+    let _open = crate::launch_window::TransientOpen::begin();
     let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
         return true;
     };
@@ -2856,7 +2859,8 @@ const PF_SIGNALED: u64 = 0x400;
 /// The kernel's `task_struct::flags` for `tid`, field 9 of `/proc/<tid>/stat`.
 fn kernel_task_flags(tid: Pid) -> std::io::Result<u64> {
     // The name field may hold any bytes the thread named itself with.
-    let stat = String::from_utf8_lossy(&std::fs::read(format!("/proc/{tid}/stat"))?).into_owned();
+    let stat = String::from_utf8_lossy(&crate::launch_window::read(format!("/proc/{tid}/stat"))?)
+        .into_owned();
     let invalid = |what| std::io::Error::new(std::io::ErrorKind::InvalidData, what);
     stat.rsplit_once(") ")
         .ok_or_else(|| invalid("malformed stat"))?

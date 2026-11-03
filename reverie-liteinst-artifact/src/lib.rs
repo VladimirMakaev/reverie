@@ -1061,8 +1061,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie/src/pmu_config.rs",
-        44533,
-        "516e9fd43e74a4aca895f83e78cfa106a685336b3a1f3b1d4e56416c5d518ada",
+        44702,
+        "894d6ca2f80a7ad4411eb9a37c472e38cb878634067e7f73c2bdd66543086f28",
     ),
     (
         "reverie/src/in_guest_rcb.rs",
@@ -1096,8 +1096,8 @@ const CONTENT_REVERIE_CATALOG: [(&str, u64, &str); 83] = [
     ),
     (
         "reverie/src/pidfd_self.rs",
-        21903,
-        "dd5e46c1ae38714c99dc146a95099787b6f9b92f1dfeac0d5f1c8e385a76b764",
+        22063,
+        "d1a586f47ebceac588ef8214d5e2b5ed3c3aa8644ad688a44d94fe4f232a88de",
     ),
     // Shared process ownership, callback outcomes and the reserved RPC protocol.
     (

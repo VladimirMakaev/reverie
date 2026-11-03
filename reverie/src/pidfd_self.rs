@@ -180,9 +180,11 @@ pub const fn probe_args(pidfd: i32) -> [usize; 6] {
 /// thread and the threads it then creates, and `/proc/self/status` reports
 /// the thread group leader's. Call this on the thread that executes the probe.
 /// Anything unreadable or unrecognised is `false`, so a backend that cannot
-/// tell what stands between its leaf and the kernel does not qualify.
+/// tell what stands between its leaf and the kernel does not qualify. The
+/// read is one transient open ([`crate::process::launch_window`]), so its
+/// descriptor stays out of another thread's guest launch.
 pub fn thread_has_exactly_seccomp_filters(expected: u64) -> bool {
-    match std::fs::read_to_string("/proc/thread-self/status") {
+    match crate::process::launch_window::read_to_string("/proc/thread-self/status") {
         Ok(status) => status_has_exactly_seccomp_filters(&status, expected),
         Err(_) => false,
     }

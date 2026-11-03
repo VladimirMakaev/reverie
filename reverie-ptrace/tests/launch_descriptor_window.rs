@@ -11,10 +11,12 @@
 //! (https://github.com/rrnewton/reverie/issues/912, rows 25 and 26 of
 //! https://github.com/rrnewton/reverie/issues/845).
 //!
-//! Tracer A runs a guest that takes a signal. At its signal-delivery stop the
-//! tracer reads `/proc/thread-self/status` (`thread_may_be_seccomp_filtered`).
-//! This binary interposes `open64` and holds that one descriptor open while
-//! tracer B launches a guest with `spawn_fn_with_config`. Descriptors 3 to 255
+//! Tracer A runs a guest that takes a signal. Its tracer thread reads
+//! `/proc/thread-self/status` more than once: as it sets up the guest's first
+//! task (`TracedTask::new`), and at the guest's signal-delivery stop
+//! (`thread_may_be_seccomp_filtered`). This binary interposes `open64` and
+//! holds the first of those reads open while tracer B launches a guest with
+//! `spawn_fn_with_config`. Descriptors 3 to 255
 //! are filled first, so the status descriptor is numbered 256 or above, which
 //! the no-exec guest does not close. Without mutual exclusion between the two:
 //!
@@ -22,6 +24,21 @@
 //! - F-2: under a soft `RLIMIT_NOFILE` that fits exactly the launch's four pipe
 //!   descriptors, the status descriptor takes one of their numbers and the
 //!   launch fails with EMFILE.
+//!
+//! F-2 also covers A's next status read after the release, which follows the
+//! held one within microseconds (<https://github.com/rrnewton/reverie/issues/1197>).
+//! It is held too, from the moment B holds the launch lock until B's pipes
+//! have run. A read that bypasses the exclusion opens inside B's launch
+//! without the lock word counting it, which the test checks and fails on. It
+//! can also take one of B's four numbers, an EMFILE the launch does not
+//! retry, because no counted open is outstanding; whether it does depends on
+//! whether another thread closes a descriptor in time, so the count is the
+//! check. A read through the exclusion waits for B's launch, for at most
+//! `OPEN_WAIT_LIMIT`, and is counted; B's pipe that it starves is retried once
+//! it closes, and succeeds. If that read begins before B takes the lock, B
+//! waits for it instead, and it is not held. The hooks record anything that
+//! kept a run from forcing the read (no lock word, no launch, B piping before
+//! the read opened, the read never released), and F-2 fails on it.
 //!
 //! With the exclusion, B's launch waits until A closes the descriptor. The
 //! test releases A only when B's launch has returned (which, while A is held,
@@ -130,6 +147,40 @@ const PIPE_NOT_YET: u8 = 0;
 const PIPE_BEFORE_RELEASE: u8 = 1;
 const PIPE_AFTER_RELEASE: u8 = 2;
 
+/// Set for an F-2 run, in which A's next status read after the release is
+/// held across B's pipes (see the module documentation).
+static HOLD_REREAD: AtomicBool = AtomicBool::new(false);
+/// Set until A's next status read after the release has begun.
+static REREAD_ARMED: AtomicBool = AtomicBool::new(false);
+/// Set once that read has its descriptor, or goes ahead without being held.
+static REREAD_OPENED: AtomicBool = AtomicBool::new(false);
+/// Set once B's pipes under the tightened limit have run, or one has failed.
+static PIPES_DONE: AtomicBool = AtomicBool::new(false);
+/// Set if that read opened inside B's launch without the exclusion counting
+/// it: a read that bypasses the exclusion.
+static REREAD_BYPASSED: AtomicBool = AtomicBool::new(false);
+/// What kept an F-2 run from forcing that read into B's launch, as
+/// `REREAD_*` bits. The hooks record it, since a panic there would abort the
+/// process, and the test fails on it.
+static REREAD_FAULTS: AtomicU8 = AtomicU8::new(0);
+/// The launch lock's futex word could not be read.
+const REREAD_NO_LOCK: u8 = 1;
+/// No transient open was counted, and B did not take the launch lock within
+/// `REREAD_WAIT`.
+const REREAD_NO_LAUNCH: u8 = 2;
+/// B's pipes ran before A's next status read had opened.
+const REREAD_NOT_OPENED: u8 = 4;
+/// A's held read was not released by B's pipes within `BOUND`.
+const REREAD_NOT_RELEASED: u8 = 8;
+/// Tracer A's thread, the one whose status read is held.
+static A_TID: AtomicI32 = AtomicI32::new(0);
+/// How long B, holding the launch lock, waits for A's next status read to
+/// open: longer than a read through the exclusion waits for a launch.
+const REREAD_WAIT: Duration = Duration::from_secs(2);
+/// The launch bit of the launch lock's futex word
+/// (`reverie_process::launch_window`); the other bits count transient opens.
+const LAUNCHING: u32 = 1 << 31;
+
 thread_local! {
     /// Set on B's launching thread to record its first pipe in `FIRST_PIPE`.
     static RECORD_FIRST_PIPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -167,16 +218,84 @@ pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mode: libc::m
     let real_open64: unsafe extern "C" fn(*const c_char, c_int, libc::mode_t) -> c_int =
         // SAFETY: `real` returns libc's `open64`.
         unsafe { std::mem::transmute(real(&REAL_OPEN64, c"open64")) };
+    // SAFETY: `path` is the caller's C string.
+    let status = unsafe { CStr::from_ptr(path) } == STATUS_PATH;
+    let held_reread = status && reread_held();
     // SAFETY: the caller's arguments, passed through.
     let fd = unsafe { real_open64(path, flags, mode) };
-    // SAFETY: `path` is the caller's C string.
-    if fd >= 0
-        && unsafe { CStr::from_ptr(path) } == STATUS_PATH
-        && HOLD_NEXT_STATUS_OPEN.swap(false, Ordering::SeqCst)
-    {
+    if fd >= 0 && status && HOLD_NEXT_STATUS_OPEN.swap(false, Ordering::SeqCst) {
         hold(fd);
+    } else if held_reread {
+        // Opened while B holds the launch: the exclusion counts a read
+        // through it, which waited out `OPEN_WAIT_LIMIT`, and no other.
+        if lock_state().is_some_and(|state| state == LAUNCHING) {
+            REREAD_BYPASSED.store(true, Ordering::SeqCst);
+        }
+        REREAD_OPENED.store(true, Ordering::SeqCst);
+        if fd >= 0 && !wait_for(&PIPES_DONE, BOUND) {
+            REREAD_FAULTS.fetch_or(REREAD_NOT_RELEASED, Ordering::SeqCst);
+        }
     }
     fd
+}
+
+/// Whether this status open is A's next one after the release in an F-2 run,
+/// to be held across B's pipes. With no transient open counted, it waits for
+/// B to hold the launch lock, so that a read that bypasses the exclusion
+/// opens inside B's launch. A read the exclusion counts while no launch is
+/// held is one B waits for, so it is not held.
+fn reread_held() -> bool {
+    // SAFETY: gettid has no preconditions.
+    if !RELEASED.load(Ordering::SeqCst)
+        || unsafe { libc::gettid() } != A_TID.load(Ordering::SeqCst)
+        || !REREAD_ARMED.swap(false, Ordering::SeqCst)
+    {
+        return false;
+    }
+    let start = Instant::now();
+    let held = loop {
+        let Some(state) = lock_state() else {
+            REREAD_FAULTS.fetch_or(REREAD_NO_LOCK, Ordering::SeqCst);
+            break false;
+        };
+        if state & LAUNCHING != 0 {
+            break true;
+        }
+        if state != 0 {
+            break false;
+        }
+        if start.elapsed() > REREAD_WAIT {
+            REREAD_FAULTS.fetch_or(REREAD_NO_LAUNCH, Ordering::SeqCst);
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    if !held {
+        REREAD_OPENED.store(true, Ordering::SeqCst);
+    }
+    held
+}
+
+/// The launch lock's futex word: [`LAUNCHING`] and the count of transient
+/// opens, or `None` without the lock's symbol.
+fn lock_state() -> Option<u32> {
+    let lock = launch_lock_address()?;
+    // SAFETY: the launch lock's futex word, a static `u32` of this process
+    // that is only ever accessed atomically.
+    let state = unsafe { &*(lock as *const std::sync::atomic::AtomicU32) };
+    Some(state.load(Ordering::SeqCst))
+}
+
+/// Waits until `flag` is set, for at most `limit`; returns whether it was.
+fn wait_for(flag: &AtomicBool, limit: Duration) -> bool {
+    let start = Instant::now();
+    while !flag.load(Ordering::SeqCst) {
+        if start.elapsed() > limit {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
 }
 
 /// Interposes libc's `pipe`, which `nix::unistd::pipe` calls.
@@ -205,6 +324,9 @@ pub unsafe extern "C" fn pipe(fds: *mut c_int) -> c_int {
         .unwrap_or(false)
     {
         TIGHTENED.with(|t| t.set(Some((0, tighten_nofile()))));
+        if HOLD_REREAD.load(Ordering::SeqCst) && !wait_for(&REREAD_OPENED, REREAD_WAIT) {
+            REREAD_FAULTS.fetch_or(REREAD_NOT_OPENED, Ordering::SeqCst);
+        }
     }
     // SAFETY: the caller's argument, passed through.
     let rc = unsafe { real_pipe(fds) };
@@ -213,6 +335,7 @@ pub unsafe extern "C" fn pipe(fds: *mut c_int) -> c_int {
             TIGHTENED.with(|t| t.set(None));
             // SAFETY: `saved` is the limit read before tightening.
             assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &saved) }, 0);
+            PIPES_DONE.store(true, Ordering::SeqCst);
         } else {
             TIGHTENED.with(|t| t.set(Some((seen + 1, saved))));
         }
@@ -222,6 +345,8 @@ pub unsafe extern "C" fn pipe(fds: *mut c_int) -> c_int {
 
 /// Records `fd` as held and blocks until the test releases it.
 fn hold(fd: c_int) {
+    // SAFETY: gettid has no preconditions.
+    A_TID.store(unsafe { libc::gettid() }, Ordering::SeqCst);
     HELD_FD.store(fd, Ordering::SeqCst);
     *HELD_TARGET.lock().unwrap() = Some(fd_target(fd).expect("held descriptor has no target"));
     let mut hold = HOLD.lock().unwrap();
@@ -480,6 +605,12 @@ fn launch_during_status_read(guest: fn(), tighten_nofile: bool) -> Outcome {
     *HELD_TARGET.lock().unwrap() = None;
     RELEASED.store(false, Ordering::SeqCst);
     FIRST_PIPE.store(PIPE_NOT_YET, Ordering::SeqCst);
+    HOLD_REREAD.store(tighten_nofile, Ordering::SeqCst);
+    REREAD_ARMED.store(tighten_nofile, Ordering::SeqCst);
+    REREAD_OPENED.store(false, Ordering::SeqCst);
+    REREAD_BYPASSED.store(false, Ordering::SeqCst);
+    REREAD_FAULTS.store(0, Ordering::SeqCst);
+    PIPES_DONE.store(false, Ordering::SeqCst);
     HOLD_NEXT_STATUS_OPEN.store(true, Ordering::SeqCst);
 
     let tracer_a = std::thread::spawn(|| {
@@ -566,6 +697,8 @@ fn launch_during_status_read(guest: fn(), tighten_nofile: bool) -> Outcome {
 
     let launch = tracer_b.join().unwrap();
     let a = tracer_a.join().unwrap();
+    HOLD_REREAD.store(false, Ordering::SeqCst);
+    REREAD_ARMED.store(false, Ordering::SeqCst);
     assert_eq!(a.map(|(status, ())| status).unwrap(), ExitStatus::Exited(0));
     Outcome {
         launch,
@@ -586,10 +719,26 @@ fn a_launch_does_not_inherit_another_threads_transient_descriptor() {
     outcome.assert_launch_waited();
 }
 
-/// F-2: B's launch must not lose a pipe descriptor to A's transient one.
+/// F-2: B's launch must not lose a pipe descriptor to A's transient one, and
+/// A's next status read must not open inside B's launch without the
+/// exclusion.
 #[test]
 fn a_launch_does_not_run_out_of_descriptors_to_another_threads_transient_one() {
+    assert!(
+        launch_lock_address().is_some(),
+        "the launch lock's futex word must resolve, or the re-read check cannot fire"
+    );
     let outcome = launch_during_status_read(|| {}, true);
+    assert_eq!(
+        REREAD_FAULTS.load(Ordering::SeqCst),
+        0,
+        "the run did not force A's next status read into B's launch \
+         (1: no lock word, 2: no launch, 4: B piped first, 8: never released)"
+    );
+    assert!(
+        !REREAD_BYPASSED.load(Ordering::SeqCst),
+        "A's next status read opened inside B's launch without the exclusion"
+    );
     assert_eq!(outcome.launch, Ok(ExitStatus::Exited(0)));
     outcome.assert_launch_waited();
 }

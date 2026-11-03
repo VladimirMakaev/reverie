@@ -1242,7 +1242,7 @@ impl Session {
 
 /// The name of thread `tid` of process `pid`, as `/proc` reports it.
 fn thread_name(pid: i32, tid: i32) -> Option<String> {
-    let comm = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/comm")).ok()?;
+    let comm = crate::launch_window::read_to_string(format!("/proc/{pid}/task/{tid}/comm")).ok()?;
     Some(comm.trim_end_matches('\n').to_owned())
 }
 

@@ -798,6 +798,9 @@ pub fn host_pmu_profile() -> Result<(), PmuValidationError> {
 /// online later is not seen. A big.LITTLE host lists more than one part.
 #[cfg(target_arch = "aarch64")]
 fn host_midrs() -> Vec<Option<u64>> {
+    // One transient open spans the listing and each CPU's read, bounded by
+    // the CPU count.
+    let _open = crate::process::launch_window::TransientOpen::begin();
     let Ok(cpus) = std::fs::read_dir("/sys/devices/system/cpu") else {
         return Vec::new();
     };
